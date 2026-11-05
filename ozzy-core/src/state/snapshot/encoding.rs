@@ -194,6 +194,7 @@ fn header(
     header.put_u32::<104>(usize_to_u32(counts[3])?);
     header.put_u64::<108>(usize_to_u64(state.group_member_count)?);
     header.put_u64::<116>(usize_to_u64(state.group_target_count)?);
+    header.put_u64::<124>(state.operation_floor);
 
     Ok(())
 }

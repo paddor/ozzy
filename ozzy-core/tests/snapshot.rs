@@ -156,6 +156,8 @@ fn populated_state() -> CanonicalState {
             partition,
             expected_floor: Offset::ZERO,
             new_floor: Offset::new(1),
+            expected_operation_floor: 0,
+            new_operation_floor: 0,
             operation_id: OperationId::from_bytes([0x53; 16]),
         }),
     );

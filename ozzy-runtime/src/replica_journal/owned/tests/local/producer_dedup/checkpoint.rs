@@ -32,7 +32,7 @@ fn trim(controller: &mut Controller, journal: &mut OwnedJournal, driver: &mut Dr
         .retention_proposal(
             partition(),
             Offset::new(3),
-            0,
+            active_operation(journal),
             OperationId::from_bytes([81; 16]),
         )
         .unwrap()

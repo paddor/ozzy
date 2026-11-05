@@ -63,7 +63,7 @@ fn donors(controller: &mut Controller, io: &Local) -> (Replica, Replica) {
         .retention_proposal(
             PartitionIncarnation::from_bytes([11; 16]),
             Offset::new(4),
-            0,
+            active_operation(&primary.journal),
             OperationId::from_bytes([81; 16]),
         )
         .unwrap()

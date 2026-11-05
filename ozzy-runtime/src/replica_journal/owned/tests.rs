@@ -543,6 +543,39 @@ async fn owned_journals_share_real_backend_and_close_independently() {
     pool.shutdown().await;
 }
 
+/// The active segment's first operation: an operation floor below which
+/// every sealed segment may retire.
+fn active_operation(journal: &OwnedJournal) -> u64 {
+    let manifest = journal.journal.ready().unwrap().manifest();
+    manifest
+        .segments
+        .last()
+        .unwrap()
+        .first_chain
+        .next_op_number()
+}
+
+/// An encoded `Trim` that keeps the record floor and raises the operation
+/// floor to the active segment, for tests that retire history without a
+/// retention plan.
+fn operation_floor_trim(
+    journal: &OwnedJournal,
+    id: u8,
+) -> (ozzy_journal::operation::OperationKind, Vec<u8>) {
+    let committed = journal.images().unwrap().committed();
+    let (partition, state) = committed.partitions().next().unwrap();
+    let body = ozzy_journal::operation::OperationBody::Trim(ozzy_journal::operation::Trim {
+        partition,
+        expected_floor: state.retained_from,
+        new_floor: state.retained_from,
+        expected_operation_floor: committed.operation_floor(),
+        new_operation_floor: active_operation(journal),
+        operation_id: ozzy_proto::OperationId::from_bytes([id; 16]),
+    });
+    let bytes = ozzy_journal::operation::encode_operation_body(&body, journal.limits.operations);
+    (body.kind(), bytes.unwrap())
+}
+
 fn payload_owner(bytes: usize) -> crate::memory::Owner {
     crate::memory::Domain::new(None, bytes)
         .unwrap()

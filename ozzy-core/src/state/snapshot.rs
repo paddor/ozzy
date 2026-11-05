@@ -39,7 +39,7 @@ pub const STATE_SNAPSHOT_HEADER_BYTES: usize = 256;
 pub const RETRY_SPAN_SNAPSHOT_BYTES: usize = 40;
 
 const SNAPSHOT_MAGIC: &[u8; 8] = b"OZYSTA01";
-const SNAPSHOT_VERSION: u16 = 6;
+const SNAPSHOT_VERSION: u16 = 7;
 const PROGRESS_BYTES: usize = 48;
 const ASSIGNMENT_BYTES: usize = 80;
 const SNAPSHOT_DIGEST_START: usize = 56;
@@ -47,7 +47,7 @@ const SNAPSHOT_DIGEST_END: usize = 88;
 const SNAPSHOT_HASH_CONTEXT: &str = "ozzy canonical state snapshot v1";
 const SNAPSHOT_SCHEMA_CONTEXT: &str = "ozzy canonical state snapshot schema";
 const SNAPSHOT_SCHEMA: &[u8] =
-    b"OZYSTA01:256:partition176-dedup-time-and-window-retired-epoch-delay-release-cursor-and-held-totals+names+producer80+retry-span40-stored-proof-or-schedule-op:progress48:assignment80-plan-and-resume:coordinator-group-plan:network-order";
+    b"OZYSTA01:256-operation-floor:partition176-dedup-time-and-window-retired-epoch-delay-release-cursor-and-held-totals+names+producer80+retry-span40-stored-proof-or-schedule-op:progress48:assignment80-plan-and-resume:coordinator-group-plan:network-order";
 const RETENTION_MAX_AGE: u32 = 1 << 0;
 const RETENTION_MAX_BYTES: u32 = 1 << 1;
 
@@ -403,6 +403,9 @@ pub enum StateSnapshotError {
     #[error("canonical state retention policy is invalid")]
     /// A decoded retention policy is invalid.
     InvalidRetention,
+    #[error("canonical state operation floor lies beyond its revision")]
+    /// The operation floor names an operation after the image.
+    InvalidOperationFloor,
     #[error("canonical state entries are unsorted or duplicated")]
     /// Canonical entries are out of order or repeat a key.
     UnsortedOrDuplicate,

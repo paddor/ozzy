@@ -7,7 +7,7 @@ use smallvec::SmallVec;
 use super::{
     AppendCursor, AssignmentKey, AssignmentState, CanonicalPartition, CanonicalProducer,
     CanonicalState, IdentityIndex, Mutation, PreparedProducerResults, ProgressKey, StateError,
-    TransitionPlan,
+    TransitionPlan, TrimFloors,
 };
 
 impl CanonicalState {
@@ -89,10 +89,7 @@ impl CanonicalState {
                 self.progress.insert(key, value);
             }
             Mutation::Assign { key, value } => self.install_assignment(key, value),
-            Mutation::Trim {
-                partition,
-                retained_from,
-            } => self.partition_mut(partition)?.retained_from = retained_from,
+            Mutation::Trim(floors) => self.install_trim(floors)?,
             Mutation::Policy {
                 partition,
                 revision,
@@ -113,6 +110,12 @@ impl CanonicalState {
             Mutation::Delay(prepared) => self.install_delay(prepared)?,
             Mutation::Barrier => {}
         }
+        Ok(())
+    }
+
+    fn install_trim(&mut self, floors: TrimFloors) -> Result<(), StateError> {
+        self.partition_mut(floors.partition)?.retained_from = floors.retained_from;
+        self.operation_floor = floors.operation_floor;
         Ok(())
     }
 

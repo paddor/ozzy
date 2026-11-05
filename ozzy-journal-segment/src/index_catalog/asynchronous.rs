@@ -389,30 +389,40 @@ impl Catalog {
         id: OperationId,
         through: u64,
     ) -> Result<Option<IndexedOperationLocation>, Error> {
+        // An identity retried after the operation floor forgot it has one
+        // claim per retry, so a hit in a hot older source still checks the
+        // newer ones. Newer misses mostly skip through resident IDs.
         let hot = self.hot_sources(through);
+        let mut newest: Option<IndexedOperationLocation> = None;
         for source in hot
             .iter()
             .chain(self.sources.iter().rev().filter(|s| !hot.contains(s)))
         {
             if source.first_op_number > through
+                || newest.is_some_and(|found| found.source.segment_id >= source.segment_id)
                 || self
                     .position(*source)
                     .is_some_and(|at| self.cache.borrow().lacks(at, id))
             {
                 continue;
             }
-            if let Some(entry) = self
-                .with_source(*source, |index| Ok(index.find_operation(id)))
+            // An index that holds the ID at all stays hot, as for an operation
+            // replayed against its own segment, whose claim lies past `through`.
+            if let Some(Some(entry)) = self
+                .with_source(*source, |index| {
+                    Ok(index
+                        .find_operation(id, u64::MAX)
+                        .map(|_| index.find_operation(id, through)))
+                })
                 .await?
-                && entry.location.op_number <= through
             {
-                return Ok(Some(IndexedOperationLocation {
+                newest = Some(IndexedOperationLocation {
                     source: *source,
                     entry,
-                }));
+                });
             }
         }
-        Ok(None)
+        Ok(newest)
     }
 
     pub(crate) async fn find_operation_number(

@@ -375,8 +375,7 @@ impl Snapshot {
             });
         }
         if let Some(active) = &self.active
-            && let Some(entry) = active.find_operation(id)
-            && entry.location.op_number <= through
+            && let Some(entry) = active.find_operation(id, through)
         {
             return Ok(Some(IndexedOperationLocation {
                 source: active.source(),

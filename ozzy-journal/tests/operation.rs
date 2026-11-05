@@ -84,6 +84,7 @@ const FIXTURES: [&str; 13] = [
     concat!(
         "10101010101010101010101010101010",
         "00000000000000020000000000000004",
+        "0000000000000003000000000000000b",
         "33333333333333333333333333333333",
     ),
     concat!(
@@ -215,6 +216,8 @@ fn bodies() -> Vec<OperationBody<'static>> {
             partition,
             expected_floor: Offset::new(2),
             new_floor: Offset::new(4),
+            expected_operation_floor: 3,
+            new_operation_floor: 11,
             operation_id: OperationId::from_bytes([0x33; 16]),
         }),
         OperationBody::PartitionPolicy(PartitionPolicy {

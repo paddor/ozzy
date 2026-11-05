@@ -11,7 +11,7 @@ use ozzy_core::state::{
 };
 use ozzy_journal::operation::{
     Append, AppendBatch, AppendRecord, Barrier, CreatePartition, OpenProducer, OperationBody,
-    Progress, ProgressOwner, RetentionPolicy, encode_operation_body,
+    Progress, ProgressOwner, RetentionPolicy, Trim, encode_operation_body,
 };
 use ozzy_proto::{
     CheckpointId, MessageId, Offset, OperationId, OwnerEpoch, PartitionId, PartitionIncarnation,
@@ -106,6 +106,73 @@ fn apply(
         .prepare(state.revision() + 1, body, identities)
         .unwrap();
     state.apply(plan, identities).unwrap();
+}
+
+fn floor_trim(expected: u64, new: u64, id: u8) -> OperationBody<'static> {
+    OperationBody::Trim(Trim {
+        partition: partition(),
+        expected_floor: Offset::ZERO,
+        new_floor: Offset::ZERO,
+        expected_operation_floor: expected,
+        new_operation_floor: new,
+        operation_id: OperationId::from_bytes([id; 16]),
+    })
+}
+
+/// A copy that kept the original's segment holds a claim of a retried
+/// identity on each side of the operation floor, in one segment or two.
+/// Lookups find the newest claim at their bound, and replay accepts it.
+#[test]
+fn a_retry_past_the_operation_floor_keeps_each_claim_and_replays() {
+    let (mut controller, mut journal) = empty_journal();
+    let bodies = [
+        create(),
+        barrier(7),
+        floor_trim(0, 3, 8),
+        barrier(7),
+        floor_trim(3, 5, 9),
+        barrier(7),
+    ];
+    for (number, body) in (1_u64..).zip(&bodies) {
+        drive(&mut controller, write(&mut journal, body));
+        if number == 4 || number == 6 {
+            drive(&mut controller, journal.roll_active(32768, 4)).unwrap();
+        }
+    }
+    drive(&mut controller, confirm(&mut journal));
+    let snapshot = drive(
+        &mut controller,
+        journal.build_index_snapshot(
+            crate::JournalIndexBoundary::Committed,
+            super::indexes::build_limits(),
+        ),
+    )
+    .unwrap();
+    let key = IdentityKey::operation(OperationId::from_bytes([7; 16]));
+    // The older segment answers first and warms its index; the newer
+    // segment's claim still wins.
+    for (through, claim) in [(1, None), (3, Some(2)), (5, Some(4)), (6, Some(6))] {
+        let found = drive(
+            &mut controller,
+            snapshot.identity_claim_through(key, through),
+        )
+        .unwrap();
+        assert_eq!(
+            found.map(|claim| claim.op_number),
+            claim,
+            "through {through}"
+        );
+    }
+    let found = drive(&mut controller, snapshot.identity_claim(key)).unwrap();
+    assert_eq!(found.unwrap().op_number, 6);
+    drop(snapshot);
+    let images = drive(
+        &mut controller,
+        journal.recover_canonical_images(recovery_limits()),
+    )
+    .unwrap();
+    assert_eq!(images.committed().revision(), 6);
+    assert_eq!(images.committed().operation_floor(), 5);
 }
 
 #[test]

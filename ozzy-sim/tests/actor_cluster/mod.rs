@@ -773,6 +773,9 @@ fn regression_seeds() {
     // A retirement's file work ended inside a visit, and nothing asked for
     // the next round: the safety sweep started the due retention turn.
     checked(23, "none", "retention");
+    // A leader retired the segment of a barrier, then took its resend as
+    // new. A follower that retired later still held the claim and faulted.
+    checked(7, "heavy", "retention");
 }
 
 /// Process-wide state would leak from one run into the next one.

@@ -4,6 +4,11 @@
 
 ### Breaking
 
+- Journals and checkpoints from earlier builds no longer open: `Trim`
+  operations carry an operation floor, and checkpoint state is snapshot
+  version 7. Format stores again. `ozzy_journal::operation::Trim` has the
+  two floor fields, and `find_operation` on segment index views and
+  builders takes the last operation to search.
 - `ozzy_runtime::replica_journal::ClockReading` has a new `monotonic` field.
   The leader's deduplication time advances by it instead of by tokio's
   clock, so a broker on simulated time measures dedup windows on that time.
@@ -23,6 +28,12 @@
   the last dedup checkpoint, or all of them on a topic without retention, and
   read each one with about three disk jobs. On a slow disk that kept the copy
   out of the view for minutes. It now reads them in runs from each segment.
+- A follower no longer faults when a client retries a control request, such
+  as a producer open or a group assignment, after retention removed the
+  original from the leader but not yet from the follower. The leader took
+  the retry as new, and the follower refused it as a duplicate. Every copy
+  now forgets an operation ID at the same operation, the operation floor a
+  `Trim` raises, and no copy retires history past it.
 
 ## [0.10.0] - 2026-11-05
 

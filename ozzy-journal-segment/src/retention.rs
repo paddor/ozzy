@@ -81,7 +81,8 @@ impl RetentionFloors {
         self
     }
 
-    /// Derive every committed partition floor from one canonical state image.
+    /// Derive every committed partition floor and the operation floor from
+    /// one canonical state image.
     /// Held scheduled records live in segment indexes; the owner adds their
     /// floor with `protect_from`.
     pub fn from_canonical_state(
@@ -93,10 +94,13 @@ impl RetentionFloors {
                 .map(|(partition, value)| (partition, value.retained_from))
                 .collect(),
         )?;
+        // Identities claimed at or after the operation floor stay
+        // resolvable on every copy, so their history stays too.
         floors.protected_operation = state
             .partitions()
             .flat_map(|(_, partition)| partition.producers())
             .filter_map(|(_, producer)| producer.result_operation_floor())
+            .chain([state.operation_floor()])
             .min();
         Ok(floors)
     }

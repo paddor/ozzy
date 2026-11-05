@@ -1,5 +1,8 @@
 use super::replay::persist;
-use super::writeback::{Replica, admit, confirm, finish, prepare, replica, settle};
+use super::writeback::{
+    Replica, admit, confirm, create_partition, finish, prepare, raise_operation_floor, replica,
+    settle,
+};
 use super::*;
 use crate::replica_journal::PinnedRecovery;
 use ozzy_proto::RequestId;
@@ -12,6 +15,7 @@ fn unsent_donor_snapshot_before_retirement_cannot_describe_a_newer_checkpoint() 
     let mut witness = replica(&mut controller, io, 1, 8192);
     let nonce = RequestId::from_bytes([97; 16]);
     let mut candidate = None;
+    create_partition(&mut controller, &mut donor, &mut witness);
     for number in 1..=3 {
         persist(&mut controller, &mut donor);
         persist(&mut controller, &mut witness);
@@ -33,8 +37,9 @@ fn unsent_donor_snapshot_before_retirement_cannot_describe_a_newer_checkpoint() 
         }
     }
     let candidate = candidate.unwrap();
-    assert_eq!(candidate.primary.unwrap().accepted.op.0, 3);
-    assert_eq!(candidate.primary.unwrap().committed.op.0, 2);
+    assert_eq!(candidate.primary.unwrap().accepted.op.0, 5);
+    assert_eq!(candidate.primary.unwrap().committed.op.0, 4);
+    raise_operation_floor(&mut controller, &mut donor, &mut witness, 99);
     let retired = drive(
         &mut controller,
         donor.journal.retire_confirmed_history(
@@ -72,7 +77,7 @@ fn unsent_donor_snapshot_before_retirement_cannot_describe_a_newer_checkpoint() 
     )
     .unwrap();
     let log = pin.response().primary.unwrap();
-    assert_eq!(log.committed.op.0, 3);
+    assert_eq!(log.committed.op.0, 6);
     assert_eq!(log.checkpoint.unwrap().position, log.committed);
     donor.journal.release_recovery(pin).unwrap();
     drive(&mut controller, donor.journal.shutdown()).unwrap();

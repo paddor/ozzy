@@ -32,6 +32,8 @@ mod dedup_policy;
 mod group;
 #[path = "state/images.rs"]
 mod images;
+#[path = "state/operation_floor.rs"]
+mod operation_floor;
 #[path = "state/progress.rs"]
 mod progress;
 #[path = "state/resolved.rs"]
@@ -301,6 +303,8 @@ fn apply_control_operations(
             partition: partition(),
             expected_floor: Offset::ZERO,
             new_floor: Offset::new(1),
+            expected_operation_floor: 0,
+            new_operation_floor: 0,
             operation_id: operation(0x33),
         }),
     );
@@ -438,6 +442,8 @@ fn producer_result_floor_gates_trim_and_resets_at_session_fence() {
         partition: partition(),
         expected_floor: Offset::ZERO,
         new_floor: Offset::new(1),
+        expected_operation_floor: 0,
+        new_operation_floor: 0,
         operation_id: operation(0x38),
     });
     assert_eq!(

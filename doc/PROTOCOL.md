@@ -255,7 +255,9 @@ OPEN_PRODUCER:
   `producer_idle_secs`, retry results included. Its later requests fail with
   code 6, like a fenced session's.
 - Retries keep the operation ID. The latest transition identity survives
-  checkpoints and history retirement. The reply follows confirmation.
+  checkpoints and history retirement; an older one lasts until the
+  [operation floor](STORAGE.md#record-identity-and-deduplication) passes
+  it. The reply follows confirmation.
 - The retry floor (at most the next sequence) is the exclusive sequence below
   which exact retry results are gone. Newer epochs fence old ones.
 

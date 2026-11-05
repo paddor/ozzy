@@ -127,7 +127,7 @@ fn cooperative_index_open_preserves_every_lookup_and_yields_within_each_table() 
             assert!(found.is_some());
             assert_eq!(found, image.find_message(partition, message.message_id));
             assert_eq!(
-                view.find_operation(operation.operation_id),
+                view.find_operation(operation.operation_id, u64::MAX),
                 Some(*operation)
             );
         }
@@ -184,7 +184,7 @@ fn cooperative_index_open_refuses_late_table_corruption_even_with_a_valid_checks
         (
             operation_start,
             OPERATION_INDEX_ENTRY_BYTES,
-            16,
+            24,
             "operation",
         ),
     ] {

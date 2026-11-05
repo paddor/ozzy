@@ -1,7 +1,7 @@
 use super::*;
 use crate::replica_journal::owned::tests::{
     replay::persist,
-    writeback::{Replica, confirm, replica},
+    writeback::{Replica, confirm, create_partition, raise_operation_floor, replica},
 };
 
 #[test]
@@ -9,6 +9,7 @@ fn repeated_retirement_preserves_disk_quorum_and_the_retained_chain() {
     let (mut controller, io) = setup();
     let mut primary = replica(&mut controller, io.clone(), 0, 8192);
     let mut backup = replica(&mut controller, io, 2, 8192);
+    create_partition(&mut controller, &mut primary, &mut backup);
     let mut prefixes = Vec::new();
     for at in 0..3 {
         prefixes.push(persist(&mut controller, &mut primary));
@@ -18,6 +19,7 @@ fn repeated_retirement_preserves_disk_quorum_and_the_retained_chain() {
             roll(&mut controller, &mut primary.journal);
         }
     }
+    let floor = raise_operation_floor(&mut controller, &mut primary, &mut backup, 90);
     let ticket = primary.driver.begin_validation().unwrap();
     let before = primary.driver.normal().unwrap().snapshot();
     let owner = primary.journal.append_memory.clone().unwrap();
@@ -82,11 +84,12 @@ fn repeated_retirement_preserves_disk_quorum_and_the_retained_chain() {
         primary.journal.fetch_history(request, buffer),
     )
     .unwrap();
-    assert_eq!(fetched.end(), prefixes[2]);
+    // The last barrier, then the trim that raised the operation floor.
+    assert_eq!(fetched.end(), floor);
     let operations = fetched.buffer().operations().collect::<Vec<_>>();
-    assert_eq!(operations.len(), 1);
+    assert_eq!(operations.len(), 2);
     assert_eq!(operations[0].previous_digest, prefixes[1].digest);
-    assert_eq!(operations[0].body, &[3; 16]);
+    assert_eq!(operations[0].body, &[prefixes[2].op.0 as u8; 16]);
     drop(fetched);
     drive(&mut controller, primary.journal.shutdown()).unwrap();
     drive(&mut controller, backup.journal.shutdown()).unwrap();

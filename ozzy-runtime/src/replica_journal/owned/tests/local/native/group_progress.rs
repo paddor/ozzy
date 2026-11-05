@@ -138,6 +138,8 @@ fn fixture_with(
                 partition: current.partition,
                 expected_floor: Offset::ZERO,
                 new_floor: Offset::new(3),
+                expected_operation_floor: 0,
+                new_operation_floor: 0,
                 operation_id: OperationId::from_bytes([65; 16]),
             }),
         ]);

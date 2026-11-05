@@ -221,20 +221,20 @@ impl OwnedJournal {
         })
     }
 
-    /// Whether the plan's record floor or a producer's retry floor must
-    /// advance before its prefix can retire.
+    /// Whether the plan's record floor, the operation floor, or a producer's
+    /// retry floor must advance before its prefix can retire.
     fn floors_pending(
         &self,
         partition: PartitionIncarnation,
         plan: &Plan,
     ) -> Result<bool, JournalError> {
-        let state = self
-            .images()?
-            .committed()
+        let committed = self.images()?.committed();
+        let state = committed
             .partition(partition)
             .ok_or(JournalError::Configuration)?;
         let floor = plan.record_floor.max(state.retained_from);
         Ok(plan.record_floor > state.retained_from
+            || plan.operation_floor > committed.operation_floor()
             || state.producers().any(|(_, producer)| {
                 plan::raised_retry_floor(producer, floor, plan.operation_floor).is_some()
             }))

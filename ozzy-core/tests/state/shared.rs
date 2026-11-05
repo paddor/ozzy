@@ -229,6 +229,8 @@ fn retention_cannot_destroy_another_writers_retry_evidence() {
         partition: partition(),
         expected_floor: Offset::ZERO,
         new_floor: Offset::new(2),
+        expected_operation_floor: 0,
+        new_operation_floor: 0,
         operation_id: operation(0x54),
     });
     assert_eq!(

@@ -482,7 +482,7 @@ fn retirement_restores_independent_retry_floors_for_interleaved_producers() {
         .retention_proposal(
             partition(),
             Offset::new(3),
-            0,
+            active_operation(&journal),
             OperationId::from_bytes([94; 16]),
         )
         .unwrap()

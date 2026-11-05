@@ -188,6 +188,8 @@ fn expire_retry(
             encode_operation_body(&body, config.limits.operations).unwrap(),
         ),
     );
+    let trim = operation_floor_trim(journal, 97);
+    commit(controller, journal, driver, &trim);
     assert_eq!(retire(controller, journal, driver, 96), [2]);
     drive(
         controller,

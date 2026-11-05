@@ -113,21 +113,21 @@ fn canonical_snapshot_encoding_bytes_fixture() {
             0,
             0,
             10861,
-            0x4b33_a66b_c329_d6ba_76c8_6050_2d37_45dc_u128,
+            0x752f_add8_09ff_3901_8d1a_b75d_1a19_98da_u128,
         ),
         (
             2,
             130,
             130,
             27661,
-            0xc1bd_4d3d_20a5_7f36_5d7c_aae6_1521_11b9_u128,
+            0x1e46_adf4_4f16_8502_15c9_ed0d_1dbf_a02d_u128,
         ),
         (
             2,
             6000,
             130,
             497_261,
-            0x3d6b_b14f_2dce_fe71_189c_889e_3ad8_193d_u128,
+            0x9070_a31c_0e79_2e70_c303_a511_d579_36b4_u128,
         ),
     ] {
         let state = state(writers, spans, metadata);
@@ -382,4 +382,35 @@ fn cooperative_state_snapshot_refuses_late_semantic_errors_and_resource_limits()
         yield_step,
     ));
     assert_eq!(result.unwrap_err(), StateSnapshotError::DigestMismatch);
+}
+
+#[test]
+fn state_snapshot_keeps_the_operation_floor_and_refuses_one_past_its_revision() {
+    let mut state = state(1, 1, 0);
+    state.revision = 9;
+    state.operation_floor = 9;
+    let bytes = state
+        .encode_snapshot(StateSnapshotLimits::default())
+        .unwrap();
+    let decoded = CanonicalState::decode_snapshot(
+        &bytes,
+        StateLimits::default(),
+        StateSnapshotLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(decoded.operation_floor(), 9);
+    assert_eq!(decoded, state);
+    let mut bytes = bytes;
+    bytes[124..132].copy_from_slice(&10u64.to_be_bytes());
+    let digest = snapshot_digest(&bytes).unwrap();
+    bytes[SNAPSHOT_DIGEST_START..SNAPSHOT_DIGEST_END].copy_from_slice(digest.as_bytes());
+    assert_eq!(
+        CanonicalState::decode_snapshot(
+            &bytes,
+            StateLimits::default(),
+            StateSnapshotLimits::default()
+        )
+        .unwrap_err(),
+        StateSnapshotError::InvalidOperationFloor
+    );
 }
