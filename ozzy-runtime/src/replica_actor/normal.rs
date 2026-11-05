@@ -372,7 +372,10 @@ impl ReplicaActor {
         if !self.work.needs_sync {
             self.schedule_donor(true)?;
         }
-        if !hold && self.work.proposals.is_idle() {
+        // A queued maintenance proposal goes first, and its room comes from
+        // journal progress. Queued ingress cannot move before it, so asking
+        // for another round would spin.
+        if !hold && self.work.proposals.is_idle() && self.work.proposals.maintenance().is_none() {
             self.ingress.resume();
         }
         Ok(())

@@ -3,6 +3,11 @@ use crate::replica_journal::{AppendAdmissionError, DelayLimits};
 use ozzy_core::state::ProducerResultSource;
 use ozzy_journal::operation::{OperationKind, OperationLimits, decode_operation_body};
 use ozzy_proto::{ProducerSequence, append::AppendDisposition};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+use std::task::{Context, Wake, Waker};
 
 mod release;
 
@@ -520,8 +525,13 @@ fn local_actor_holds_a_due_release_until_the_pipeline_has_room() {
         full
     });
     // The release comes due on a full pipeline. It waits instead of
-    // failing the actor.
+    // failing the actor, ahead of a record queued behind it.
     clock.set(NOW + 10);
+    let mut buffer = actor.lease_proposal_buffer().unwrap();
+    buffer
+        .prepare_append(request(30, stored.len() as u64, 1))
+        .unwrap();
+    stored.push(Box::pin(lane.try_submit(buffer).unwrap()));
     let offset = |actor: &crate::replica_actor::LocalActor| {
         actor.facts(partition()).map(|facts| facts.next_offset)
     };
@@ -532,6 +542,19 @@ fn local_actor_holds_a_due_release_until_the_pipeline_has_room() {
         rounds == 100
     });
     assert_eq!(offset(&actor), before);
+    // Waiting asks for no further round: only journal progress makes room.
+    let counted = Arc::new(Wakes::default());
+    let waker = Waker::from(counted.clone());
+    assert!(
+        actor
+            .poll_progress(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    assert_eq!(
+        counted.0.load(Ordering::Relaxed),
+        0,
+        "the waiting actor woke itself"
+    );
     let total = stored.len() as u64 + 1;
     run_until(&mut controller, &mut actor, |actor| {
         offset(actor) == Some(Offset::new(total))
@@ -614,4 +637,17 @@ fn local_actor_charges_the_schedule_trailer_before_admission() {
         });
     }
     super::actor::close(&mut controller, actor);
+}
+
+#[derive(Default)]
+struct Wakes(AtomicUsize);
+
+impl Wake for Wakes {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
 }

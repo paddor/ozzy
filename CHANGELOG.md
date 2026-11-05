@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- A partition on a delay topic no longer busy-loops its shard thread while a
+  due release waits for room. With the pipeline full and records queued behind
+  the release, the partition asked for another turn at once, again and again,
+  until the pipeline drained.
+
 ## [0.10.0] - 2026-11-05
 
 ### Breaking
