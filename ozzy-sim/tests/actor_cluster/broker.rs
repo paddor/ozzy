@@ -5,20 +5,27 @@
 //! shard waker stays quiet.
 
 use crate::{
+    check::leads,
     clock::Clock,
+    consumer,
     disk::{Disk, Flag},
     network::{BROKERS, Inbox, Network, node, opcode},
+    records::{self, PARTITION},
     seeds::Trace,
 };
 use bytes::Bytes;
 use omq_tokio::Message;
 use ozzy_io::Local;
+use ozzy_journal::operation::{CreatePartition, RetentionPolicy};
 use ozzy_journal_segment::{
     BodyEncoding, CanonicalRecoveryLimits, CheckpointLimits, DecodeLimits, GroupIdentity,
     IndexBuildLimits, JournalLimits, MetadataLimits, PartitionReadLimits, SegmentOptions,
     SegmentWriteMode,
 };
-use ozzy_proto::{EnvelopeLimits, GroupId, LinkSessionId, Opcode, StoreId, VolumeId};
+use ozzy_proto::{
+    EnvelopeLimits, GroupId, LinkSessionId, Opcode, OwnerEpoch, PartitionId, StoreId, VolumeId,
+    append::Policy,
+};
 use ozzy_replication::{
     ConfigurationRecord, ConfiguredVoter, Digest, JournalGeneration, PipelineLimits,
     driver::Timing,
@@ -26,10 +33,12 @@ use ozzy_replication::{
     wire::{CompactState, WireLimits, flow_state_route},
 };
 use ozzy_runtime::{
+    frontend::Links,
     replica_actor::{
-        ActorConfig, ActorIds, ActorStatus, PartitionActor, PartitionActors, PartitionStatus,
-        ProposalSubmitter, ReceiptHandles, ReplicaActor, ScheduledReplica, SessionReplacement,
-        SyncBatchTarget,
+        ActorConfig, ActorIds, ActorStatus, NativeAccess, NativeIntake, NativeIntakeConfig,
+        NativeReceive, PartitionActor, PartitionActors, PartitionStatus, PendingProposal,
+        ProposalOutcome, ProposalSubmitter, ReceiptHandles, ReplicaActor, ScheduledReplica,
+        SessionReplacement, SharedReaderConfig, SyncBatchTarget,
     },
     replica_journal::{
         InstallationConfig, JournalStartup, OwnedConfig, OwnedJournal, ProposalBuffer,
@@ -38,6 +47,8 @@ use ozzy_runtime::{
     replica_transport::QueueLimits,
 };
 use std::{
+    collections::VecDeque,
+    pin::Pin,
     sync::Arc,
     task::{Context, Poll, Waker},
     time::Duration,
@@ -71,6 +82,17 @@ const LIMITS: EnvelopeLimits = EnvelopeLimits {
     max_payload_bytes: 1024 * 1024,
 };
 
+/// The lane that creates the partition once its broker leads, as the
+/// broker's bootstrap does at every startup
+/// (`ozzy-broker/src/serving/shard/scheduler.rs` `poll_bootstrap`).
+#[derive(Debug)]
+struct Bootstrap {
+    submitter: ProposalSubmitter,
+    buffer: Option<ProposalBuffer>,
+    pending: Option<Pin<Box<PendingProposal>>>,
+    done: bool,
+}
+
 /// One proposal lane of a partition actor with its leased arena.
 #[derive(Debug)]
 pub(crate) struct Lane {
@@ -92,6 +114,15 @@ pub(crate) struct Broker {
     aliases: [Option<(u32, Channel)>; BROKERS],
     /// Compact receipts without a bound alias and refused alias bindings.
     pub unbound: u64,
+    bootstrap: Bootstrap,
+    /// Client links as the dispatcher publishes them.
+    links: Links,
+    /// Producer requests not yet taken by the partition.
+    pub requests: VecDeque<Message>,
+    /// Replies to clients, in send order.
+    pub replies: VecDeque<Message>,
+    /// Live reader publications, which no consumer follows yet.
+    pub publications: u64,
 }
 
 impl Broker {
@@ -118,13 +149,12 @@ impl Broker {
         )
     }
 
-    /// Lose power, or only the process without `power_loss`, then start
-    /// again over what the disk kept: reopen the journal under a fresh writer
-    /// generation and ID namespace. The new actor has no links until
-    /// `connect`.
+    /// Stop, let `loss` turn the disk into what survives, then start again
+    /// over it: reopen the journal under a fresh writer generation and ID
+    /// namespace. The new actor has no links until `connect`.
     pub(crate) fn restart(
         self,
-        power_loss: bool,
+        loss: impl FnOnce(Disk) -> (Disk, Local),
         clock: &Clock,
         clients: usize,
         shape: Shape,
@@ -138,11 +168,7 @@ impl Broker {
         } = self;
         drop(shard);
         let incarnation = incarnation + 1;
-        let (mut disk, io) = if power_loss {
-            disk.power_loss()
-        } else {
-            disk.process_crash()
-        };
+        let (mut disk, io) = loss(disk);
         let (owner, startup) = disk
             .drive(OwnedJournal::open(
                 journal_config(index, shape),
@@ -187,7 +213,7 @@ impl Broker {
         let mut actor = ReplicaActor::new_with_ids(
             journal,
             startup,
-            actor_config(sessions, shape.segment_bytes),
+            actor_config(sessions, shape.segment_bytes, clients),
             ids,
         )
         .map_err(|error| format!("broker {index}: actor: {error}"))?;
@@ -197,9 +223,15 @@ impl Broker {
         );
         actor.enable_publication();
         let lanes = lanes(&mut actor, clients)?;
-        let shard = PartitionActors::new(vec![actor], 1, TURN_ACTORS)
+        let (bootstrap, intake) = services(&mut actor, index)?;
+        let mut shard = PartitionActors::new(vec![actor], 1, TURN_ACTORS)
             .and_then(|shard| shard.with_safety_sweep(SAFETY_SWEEP))
             .map_err(|error| format!("broker {index}: shard: {error}"))?;
+        let links = Links::simulated();
+        shard
+            .install_native(intake, links.clone())
+            .and_then(|()| shard.install_readers(GROUP, readers(), links.clone(), None))
+            .map_err(|error| format!("broker {index}: client services: {error}"))?;
         let broker = Self {
             index,
             incarnation,
@@ -209,7 +241,13 @@ impl Broker {
             woken: Arc::new(Flag::default()),
             aliases: [None; BROKERS],
             unbound: 0,
+            bootstrap,
+            links,
+            requests: VecDeque::new(),
+            replies: VecDeque::new(),
+            publications: 0,
         };
+        broker.link_clients();
         Ok((broker, lanes))
     }
 
@@ -252,6 +290,21 @@ impl Broker {
             self.inbox.data.pop_front();
             input = true;
         }
+        let ready = self.client_ready();
+        while let Some(message) = self.requests.front() {
+            let received = if ready {
+                self.shard.receive_client(GROUP, message, now)
+            } else {
+                self.shard.defer_client(GROUP, message, now)
+            };
+            match received.map_err(failure)? {
+                // The partition retries a busy request after its next turn.
+                NativeReceive::Busy => break,
+                NativeReceive::Accepted | NativeReceive::Ignored => {}
+            }
+            self.requests.pop_front();
+            input = true;
+        }
         let due = self
             .shard
             .next_deadline()
@@ -265,7 +318,19 @@ impl Broker {
         let mut quiet = false;
         for _ in 0..POLL_BUDGET {
             self.woken.take();
+            self.poll_bootstrap(&mut cx)?;
+            let replies = &mut self.replies;
+            let publications = &mut self.publications;
             let progress = self.shard.poll_progress(&mut cx, now, |cx, message| {
+                if records::producer(&message).is_some() || consumer::consumer(&message).is_some() {
+                    replies.push_back(message);
+                    return Ok(());
+                }
+                // A partition's live reader topic: its group and incarnation.
+                if message.part_slice(0).is_some_and(|route| route.len() == 32) {
+                    *publications += 1;
+                    return Ok(());
+                }
                 network.submit(index, tick, cx, message, trace)
             });
             match progress {
@@ -293,9 +358,104 @@ impl Broker {
                 .map_err(failure)?
                 .ok_or_else(|| format!("broker {index}: unpublished recovery handoff"))?;
             actor.enable_publication();
-            replaced = Some(lanes(actor, clients)?);
+            let fresh = lanes(actor, clients)?;
+            let (bootstrap, intake) = services(actor, index)?;
+            self.shard
+                .install_native(intake, self.links.clone())
+                .map_err(failure)?;
+            self.shard
+                .install_readers(GROUP, readers(), self.links.clone(), None)
+                .map_err(failure)?;
+            self.bootstrap = bootstrap;
+            replaced = Some(fresh);
         }
         Ok(replaced)
+    }
+
+    /// Create the partition once this broker leads, until it committed.
+    fn poll_bootstrap(&mut self, cx: &mut Context<'_>) -> Result<(), String> {
+        let bootstrap = &mut self.bootstrap;
+        if let Some(pending) = &mut bootstrap.pending {
+            let Poll::Ready(reply) = pending.as_mut().poll(cx) else {
+                return Ok(());
+            };
+            bootstrap.pending = None;
+            // A stopped actor gave way to recovery, which brings a new lane.
+            let Ok(reply) = reply else {
+                return Ok(());
+            };
+            match reply.outcome {
+                ProposalOutcome::Committed { .. } => bootstrap.done = true,
+                ProposalOutcome::NotAdmitted | ProposalOutcome::Unknown => {
+                    bootstrap.buffer = Some(reply.buffer);
+                }
+                ProposalOutcome::Invalid(error) => {
+                    return Err(format!("broker {}: create partition: {error}", self.index));
+                }
+            }
+        }
+        if bootstrap.done
+            || !self.shard.status(GROUP).is_some_and(|status| match status {
+                PartitionStatus::Replicated(status) => leads(&status),
+                PartitionStatus::Local(_) => false,
+            })
+        {
+            return Ok(());
+        }
+        let bootstrap = &mut self.bootstrap;
+        if let Some(buffer) = bootstrap.buffer.take() {
+            match bootstrap.submitter.try_submit(buffer) {
+                Ok(pending) => {
+                    bootstrap.pending = Some(Box::pin(pending));
+                    cx.waker().wake_by_ref();
+                }
+                Err(refused) => bootstrap.buffer = Some(refused.buffer),
+            }
+        }
+        Ok(())
+    }
+
+    /// As the broker's `client_ready`: serve clients once this broker created
+    /// the partition, or while another broker leads it.
+    fn client_ready(&self) -> bool {
+        self.bootstrap.done
+            || self
+                .shard
+                .route_state(GROUP, PARTITION)
+                .and_then(|route| route.leader)
+                .is_some_and(|leader| leader != node(self.index))
+    }
+
+    /// The session of producer `index`'s link to this broker incarnation.
+    pub(crate) fn client_session(&self, index: usize) -> LinkSessionId {
+        let mut bytes = [0xd0 + index as u8; 16];
+        bytes[1] = self.index as u8;
+        bytes[8..].copy_from_slice(&self.incarnation.to_be_bytes());
+        LinkSessionId::from_bytes(bytes)
+    }
+
+    /// The session of consumer `index`'s link to this broker incarnation.
+    pub(crate) fn consumer_session(&self, index: usize) -> LinkSessionId {
+        let mut bytes = [0xf0 + index as u8; 16];
+        bytes[1] = self.index as u8;
+        bytes[8..].copy_from_slice(&self.incarnation.to_be_bytes());
+        LinkSessionId::from_bytes(bytes)
+    }
+
+    /// Publish every client's link to this broker incarnation.
+    pub(crate) fn link_clients(&self) {
+        for index in 0..records::PRODUCERS {
+            self.links.set(
+                records::client(index),
+                Some(records::link(index, self.client_session(index))),
+            );
+        }
+        for index in 0..consumer::CONSUMERS {
+            self.links.set(
+                consumer::client(index),
+                Some(consumer::link(index, self.consumer_session(index))),
+            );
+        }
     }
 
     /// The receiving frontend's part: bind receipt aliases from full flow
@@ -393,6 +553,70 @@ impl Broker {
     }
 }
 
+/// The bootstrap lane with its partition creation prepared, and native intake
+/// for the producers, as `ozzy-broker/src/serving/shard/build.rs` builds them.
+fn services(actor: &mut PartitionActor, index: usize) -> Result<(Bootstrap, NativeIntake), String> {
+    let failure = |error: &dyn std::fmt::Display| format!("broker {index}: services: {error}");
+    let mut buffer = actor
+        .lease_proposal_buffer_with_limits(PIPELINE)
+        .map_err(|error| failure(&error))?;
+    buffer
+        .prepare_partition(CreatePartition {
+            partition: PARTITION,
+            stream: "sim",
+            topic: "orders",
+            partition_id: PartitionId::ZERO,
+            owner_epoch: OwnerEpoch::INITIAL,
+            delay_max_millis: None,
+            dedup_window_millis: None,
+            retention: RetentionPolicy::default(),
+        })
+        .map_err(|error| failure(&error))?;
+    let bootstrap = Bootstrap {
+        submitter: actor.take_submitter().ok_or("missing bootstrap lane")?,
+        buffer: Some(buffer),
+        pending: None,
+        done: false,
+    };
+    let config = NativeIntakeConfig {
+        local: node(index),
+        group: GROUP,
+        partition: PARTITION,
+        policy: Policy::QuorumDurable,
+        access: NativeAccess::TrustedClients {
+            clients: records::PRODUCERS,
+            writers: records::PRODUCERS,
+        },
+        limits: records::LIMITS,
+        reserve_dedup_results: false,
+        requests_per_writer: 1,
+        progress_requests: 0,
+        progress_batch: 1,
+        turn_slots: 16,
+    };
+    let count = config.required_buffers().ok_or("native arena overflow")?;
+    let buffers = (0..count)
+        .map(|slot| {
+            let limits = config.buffer_limits(slot).ok_or("native arena layout")?;
+            actor
+                .lease_proposal_buffer_with_limits(limits)
+                .map_err(|error| failure(&error))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let submitter = actor.take_submitter().ok_or("missing native lane")?;
+    let intake = NativeIntake::new(config, submitter, buffers).map_err(|error| failure(&error))?;
+    Ok((bootstrap, intake))
+}
+
+/// Subscriptions for every consumer, and one more for a replacement.
+fn readers() -> SharedReaderConfig {
+    SharedReaderConfig {
+        partition: PARTITION,
+        limits: records::LIMITS,
+        subscriptions: consumer::CONSUMERS + 1,
+    }
+}
+
 fn lanes(actor: &mut PartitionActor, clients: usize) -> Result<Vec<Lane>, String> {
     (0..clients)
         .map(|_| {
@@ -427,7 +651,11 @@ fn generation(index: usize, incarnation: u64) -> JournalGeneration {
 
 /// Production timing, flow probes, and queue bounds from
 /// `ozzy-broker/src/actors.rs`, with a small pipeline.
-fn actor_config(sessions: [LinkSessionId; BROKERS], segment_bytes: u64) -> ActorConfig {
+fn actor_config(
+    sessions: [LinkSessionId; BROKERS],
+    segment_bytes: u64,
+    clients: usize,
+) -> ActorConfig {
     let message_bytes = WireLimits::for_transfer(PIPELINE.max_operations, PIPELINE.max_body_bytes)
         .and_then(WireLimits::message_bytes)
         .expect("replica packet bound");
@@ -450,7 +678,8 @@ fn actor_config(sessions: [LinkSessionId; BROKERS], segment_bytes: u64) -> Actor
         transfer: PIPELINE,
         sync_batch_target: SyncBatchTarget::half_window(PIPELINE),
         evidence_quiet: Duration::from_millis(20),
-        proposal_lanes: 3,
+        // Barrier clients, the bootstrap, and native intake.
+        proposal_lanes: clients + 2,
         proposal_capacity: PIPELINE.max_operations,
         control: QueueLimits {
             messages: 8,
@@ -521,7 +750,8 @@ fn journal_config(index: usize, shape: Shape) -> OwnedConfig {
             accepted_transitions: PIPELINE.backup().max_operations,
             ..CanonicalRecoveryLimits::default()
         },
-        append_buffers: 12,
+        // Native intake arenas, reader leases, and replication.
+        append_buffers: 32,
         delay: None,
         deduplication: None,
         append_limits: PIPELINE,

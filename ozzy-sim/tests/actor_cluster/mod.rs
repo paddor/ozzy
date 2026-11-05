@@ -18,8 +18,10 @@
 mod broker;
 mod check;
 mod clock;
+mod consumer;
 mod disk;
 mod network;
+mod records;
 mod seeds;
 mod sim;
 mod workload;
@@ -30,7 +32,7 @@ use sim::{
     Fault::{
         self, CrashAll, CrashAllMidWrite, CrashFollower, CrashLeader, DeafLeader, FailFollowerDisk,
         FailLeaderDisk, IsolateFollower, IsolateLeader, KillFollower, KillLeader, MuteLeader,
-        PauseLeader, Recrash, StallLeader,
+        PauseLeader, Recrash, Rewind, StallLeader,
     },
     Options, Report,
 };
@@ -47,6 +49,8 @@ struct Scenario {
     sparse: &'static [usize],
     /// Brokers whose disk takes 16 ms per job.
     slow: &'static [usize],
+    /// Producers append records beside the barrier clients.
+    records: bool,
     /// Caps the profile's floors for confirmed proposals and compared ops,
     /// where a full journal bounds them.
     max_floor: usize,
@@ -62,6 +66,7 @@ const RANDOM: Scenario = Scenario {
     segment_bytes: SEGMENT_BYTES,
     sparse: &[],
     slow: &[],
+    records: true,
     max_floor: usize::MAX,
     min_applied: 0,
     min_refused: 0,
@@ -124,14 +129,15 @@ fn scenario(name: &str) -> Option<Scenario> {
             ..RANDOM
         },
         // Packing gives sparse 32 KiB segments' operations dense ones, and
-        // four of the six stay free for followers that need more. Clients are
-        // refused after about 100 operations, then the full leader is lost.
+        // four of the six stay free for followers that need more. Clients and
+        // producers share the space and are refused after about 80
+        // operations, then the full leader is lost.
         "full" => Scenario {
             ticks: 3000,
             script: &[LOST_LEADER],
             max_segments: 6,
             segment_bytes: 32 * 1024,
-            max_floor: 20,
+            max_floor: 10,
             min_refused: 1,
             ..RANDOM
         },
@@ -156,7 +162,9 @@ fn scenario(name: &str) -> Option<Scenario> {
         // A sparse follower misses about 1300 operations, then rejoins just
         // as the leader is lost. The new view must fetch and install them in
         // 8-operation transfers, longer than any election timeout, and the
-        // install passes the 24-segment limit unless it packs.
+        // install passes the 24-segment limit unless it packs. Without
+        // records: they fill the leader, and a sparse copy of a full leader
+        // cannot fit, as a pack never merges segments over half full.
         "sparse-rejoin" => Scenario {
             ticks: 5100,
             script: &[
@@ -173,6 +181,7 @@ fn scenario(name: &str) -> Option<Scenario> {
             max_segments: 24,
             segment_bytes: 32 * 1024,
             sparse: &[1],
+            records: false,
             max_floor: 20,
             ..RANDOM
         },
@@ -231,6 +240,16 @@ fn scenario(name: &str) -> Option<Scenario> {
         "power-loss" => Scenario {
             ticks: 3000,
             script: &[CrashAll { at: 1500 }],
+            ..RANDOM
+        },
+        // Negative control: every disk loses the last 5 s it reported done.
+        // The run must fail.
+        "rewind" => Scenario {
+            ticks: 3000,
+            script: &[Rewind {
+                at: 1000,
+                ticks: 500,
+            }],
             ..RANDOM
         },
         // Power fails again while the brokers recover from the first loss, at a
@@ -309,6 +328,7 @@ fn options(profile: &str, scenario: &str) -> Options {
         segment_bytes: scenario.segment_bytes,
         sparse: scenario.sparse,
         slow: scenario.slow,
+        records: scenario.records,
         min_confirmed: floor,
         min_compared: floor as u64,
         min_applied: scenario.min_applied,
@@ -344,6 +364,20 @@ fn outcome(seed: u64, profile: &str, scenario: &str) -> Report {
             reproduce(seed, profile, scenario)
         )
     })
+}
+
+/// Run one seed that must fail; returns why.
+fn failure(seed: u64, profile: &str, scenario: &str) -> String {
+    let swarm = seeds::Seeds::derive(seed).swarm;
+    let parameters = Profile::named(profile, swarm).expect("known profile");
+    match sim::run(seed, parameters, options(profile, scenario)) {
+        Ok(report) => panic!(
+            "actor cluster seed {seed} profile {profile} scenario {scenario} passed: {report:?}\n\
+             reproduce: {}",
+            reproduce(seed, profile, scenario)
+        ),
+        Err(failure) => failure.reason,
+    }
 }
 
 /// Run one seed that must also clear its vacuity floors.
@@ -513,6 +547,20 @@ fn paused_leader_is_replaced_and_resumes_as_follower() {
 #[test]
 fn one_way_cut_leaders_are_replaced() {
     checked(1, "none", "one-way");
+}
+
+/// Negative control: every disk loses what it reported done in the last 5 s.
+/// The checks must notice the lost confirmed operations.
+#[test]
+fn rewound_disks_fail_the_run() {
+    for seed in [1, 2] {
+        let reason = failure(seed, "none", "rewind");
+        // A history check, not a startup or liveness failure.
+        assert!(
+            reason.contains("Confirmed reports digest") || reason.contains("past the converged op"),
+            "seed {seed}: {reason}"
+        );
+    }
 }
 
 /// Seeds that found bugs. Schedules move with the code, so each names what

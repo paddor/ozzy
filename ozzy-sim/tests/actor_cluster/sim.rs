@@ -4,12 +4,16 @@
 //! and submit. Checks run after every tick. `OZZY_ACTOR_SIM_TRACE` prints
 //! each broker's view and positions when they change.
 
+use ozzy_io::simulation::Image;
+
 use crate::{
     broker::{Broker, Lane, Shape, session},
     check::{Checker, converged, leader},
     clock::Clock,
+    consumer::{self, Consumers},
     disk::Disk,
     network::{BROKERS, Network, Profile, Stats},
+    records::{self, Ledger, Producers},
     seeds::{Rng, Seeds, Trace},
     workload::{Counts, Workload},
 };
@@ -39,6 +43,8 @@ pub(crate) struct Options {
     pub sparse: &'static [usize],
     /// Brokers whose disk takes `SLOW_DISK_MEAN` per job.
     pub slow: &'static [usize],
+    /// Producers append records beside the barrier clients.
+    pub records: bool,
     /// Vacuity floors: confirmed proposals, ops two brokers reported, the
     /// converged op, and proposals a full journal refused.
     pub min_confirmed: usize,
@@ -111,6 +117,22 @@ pub(crate) enum Fault {
     KillLeader { at: u64, ticks: u64 },
     /// As `CrashFollower`, but only the process dies.
     KillFollower { at: u64, ticks: u64 },
+    /// Negative control. From tick `at`, once a ready leader exists, every
+    /// disk keeps a copy of what it holds. After `ticks`, every broker loses
+    /// power and restarts over that copy, as if each disk had lied about
+    /// every flush since. Confirmed operations are lost.
+    Rewind { at: u64, ticks: u64 },
+}
+
+/// What survives a broker restart.
+#[derive(Debug)]
+enum Loss {
+    /// Only the process dies; the disk cache survives.
+    Process,
+    /// Power fails; what reached media survives.
+    Power,
+    /// What an earlier `Disk::snapshot` held survives.
+    Rewind(Image),
 }
 
 impl Fault {
@@ -129,6 +151,7 @@ impl Fault {
             | Self::FailFollowerDisk { at, ticks }
             | Self::KillLeader { at, ticks }
             | Self::KillFollower { at, ticks }
+            | Self::Rewind { at, ticks }
             | Self::CrashAllMidWrite { at, within: ticks } => (at, ticks),
             Self::CrashAll { at } => (at, 0),
             Self::Recrash { within } => (0, within),
@@ -211,6 +234,10 @@ struct Sim {
     executor: Rng,
     brokers: Vec<Broker>,
     workload: Workload,
+    producers: Producers,
+    consumers: Consumers,
+    /// Every confirmed and read record.
+    ledger: Ledger,
     checker: Checker,
     trace: Trace,
     options: Options,
@@ -223,6 +250,8 @@ struct Sim {
     /// The seeded tick of a scheduled whole-cluster power loss. It holds
     /// later faults.
     crash_due: Option<u64>,
+    /// Disk copies a scheduled power loss rewinds to.
+    snapshots: Option<Vec<Image>>,
 }
 
 pub(crate) fn run(seed: u64, profile: Profile, options: Options) -> Result<Report, Box<Failure>> {
@@ -259,6 +288,9 @@ pub(crate) fn run(seed: u64, profile: Profile, options: Options) -> Result<Repor
         executor: Rng::new(seeds.executor),
         brokers,
         workload: Workload::new(lanes, seeds.workload, options.batch),
+        producers: Producers::new(seeds.producers),
+        consumers: Consumers::new(),
+        ledger: Ledger::default(),
         checker: Checker::default(),
         trace: Trace::default(),
         options,
@@ -266,6 +298,7 @@ pub(crate) fn run(seed: u64, profile: Profile, options: Options) -> Result<Repor
         isolation: None,
         power_loss: None,
         crash_due: None,
+        snapshots: None,
     };
     let result = sim.run();
     let hash = sim.trace.value();
@@ -364,13 +397,16 @@ impl Sim {
             }
             if let Some(broker) = exited {
                 // The host stays up, so the cache does too.
-                self.crash(broker, tick, false)?;
+                self.crash(broker, tick, Loss::Process)?;
                 if let Some(isolation) = &mut self.isolation {
                     isolation.restarted = true;
                 }
             }
             self.workload
                 .step(tick, !draining, &mut self.checker, &mut self.trace)?;
+            if self.options.records {
+                self.clients(tick, !draining)?;
+            }
             for broker in &self.brokers {
                 let status = broker.status();
                 if std::env::var_os("OZZY_ACTOR_SIM_TRACE").is_some() {
@@ -406,6 +442,9 @@ impl Sim {
             }
             if draining
                 && self.workload.idle()
+                && self.producers.idle()
+                && (!self.options.records
+                    || log_end(&self.brokers).is_some_and(|end| self.consumers.caught_up(end)))
                 && let Some(applied) = converged(&self.brokers)
             {
                 return self.finish(applied);
@@ -415,6 +454,38 @@ impl Sim {
             "no convergence after {} drain ticks",
             self.options.drain
         ))
+    }
+
+    /// Hand every client its replies, then let producers and consumers send.
+    fn clients(&mut self, tick: u64, submit: bool) -> Result<(), String> {
+        for broker in 0..BROKERS {
+            while let Some(message) = self.brokers[broker].replies.pop_front() {
+                if let Some(index) = records::producer(&message) {
+                    self.producers.reply(
+                        index,
+                        broker,
+                        &message,
+                        tick,
+                        &mut self.ledger,
+                        &mut self.trace,
+                    )?;
+                } else if let Some(index) = consumer::consumer(&message) {
+                    self.consumers.reply(
+                        index,
+                        broker,
+                        &message,
+                        tick,
+                        &mut self.ledger,
+                        &self.producers,
+                    )?;
+                }
+            }
+        }
+        self.producers
+            .step(tick, submit, &mut self.brokers, &mut self.trace)?;
+        let end = log_end(&self.brokers);
+        self.consumers
+            .step(tick, &mut self.brokers, end, &mut self.trace)
     }
 
     /// End a due isolation, then start the next scripted fault once it is due
@@ -482,6 +553,16 @@ impl Sim {
             self.trace.word(tick);
             match fault {
                 Fault::CrashAll { .. } => return self.crash_all(tick),
+                Fault::Rewind { ticks, .. } => {
+                    self.snapshots = Some(
+                        self.brokers
+                            .iter()
+                            .map(|broker| broker.disk.snapshot())
+                            .collect(),
+                    );
+                    self.crash_due = Some(tick + ticks);
+                    return Ok(());
+                }
                 Fault::CrashAllMidWrite { within, .. } => {
                     for broker in &mut self.brokers {
                         broker.disk.stall(u64::MAX);
@@ -503,9 +584,13 @@ impl Sim {
             };
             match fault {
                 _ if fault.crash() => {
-                    let killed =
-                        matches!(fault, Fault::KillLeader { .. } | Fault::KillFollower { .. });
-                    self.crash(broker, tick, !killed)?;
+                    let loss =
+                        if matches!(fault, Fault::KillLeader { .. } | Fault::KillFollower { .. }) {
+                            Loss::Process
+                        } else {
+                            Loss::Power
+                        };
+                    self.crash(broker, tick, loss)?;
                 }
                 Fault::StallLeader { .. } => {
                     let until = (tick + fault.window().1) * DISK_STEPS;
@@ -534,10 +619,9 @@ impl Sim {
         Ok(())
     }
 
-    /// `broker` loses power, or only its process without `power_loss`, and
-    /// restarts over what its disk kept, cut off from both peers, which drop
-    /// their links to it.
-    fn crash(&mut self, broker: usize, tick: u64, power_loss: bool) -> Result<(), String> {
+    /// `broker` stops and restarts over what `loss` left of its disk, cut off
+    /// from both peers, which drop their links to it.
+    fn crash(&mut self, broker: usize, tick: u64, loss: Loss) -> Result<(), String> {
         let now = self.clock.now();
         self.network.crash(broker);
         for peer in (0..BROKERS).filter(|peer| *peer != broker) {
@@ -546,7 +630,11 @@ impl Sim {
         }
         let old = self.brokers.remove(broker);
         let (restarted, lanes) = old.restart(
-            power_loss,
+            |disk| match loss {
+                Loss::Process => disk.process_crash(),
+                Loss::Power => disk.power_loss(),
+                Loss::Rewind(snapshot) => disk.rewind(snapshot),
+            },
             &self.clock,
             self.options.clients,
             self.options.shape(broker),
@@ -561,8 +649,13 @@ impl Sim {
     /// links come back at once.
     fn crash_all(&mut self, tick: u64) -> Result<(), String> {
         self.power_loss = Some((tick, None));
+        let mut snapshots = self.snapshots.take().map(Vec::into_iter);
         for broker in 0..BROKERS {
-            self.crash(broker, tick, true)?;
+            let loss = snapshots
+                .as_mut()
+                .and_then(Iterator::next)
+                .map_or(Loss::Power, Loss::Rewind);
+            self.crash(broker, tick, loss)?;
         }
         self.network.rejoin();
         let now = self.clock.now();
@@ -595,6 +688,18 @@ impl Sim {
 
     /// The converged op, and whether the run was vacuous.
     fn finish(&self, applied: ozzy_replication::Prefix) -> Result<(u64, bool), String> {
+        for broker in &self.brokers {
+            let facts = broker
+                .shard
+                .facts(crate::broker::GROUP, records::PARTITION)
+                .ok_or_else(|| format!("broker {}: no partition facts", broker.index))?;
+            self.ledger.check_log(
+                broker.index,
+                facts.next_offset.get(),
+                self.consumers.read_through(),
+                &self.producers,
+            )?;
+        }
         for through in &self.workload.confirmed {
             if through.op > applied.op {
                 return Err(format!(
@@ -607,6 +712,7 @@ impl Sim {
             || self.workload.counts.full < self.options.min_refused
             || applied.op.0 < self.options.min_applied
             || self.workload.confirmed.len() < self.options.min_confirmed
+            || (self.options.records && self.ledger.len() < self.options.min_confirmed)
             || self.checker.compared < self.options.min_compared;
         Ok((applied.op.0, vacuous))
     }
@@ -616,13 +722,22 @@ impl Sim {
         let network: Stats = self.network.stats;
         let counts: Counts = self.workload.counts;
         let mut detail = format!(
-            "network {network:?}, {} queued\nworkload {counts:?}, {} confirmed, {} compared",
+            "network {network:?}, {} queued\nworkload {counts:?}, {} confirmed, {} compared\n\
+             producers {:?}, {} records confirmed\nconsumers {:?}, read through {}",
             self.network.queued(),
             self.workload.confirmed.len(),
             self.checker.compared,
+            self.producers.counts,
+            self.ledger.len(),
+            self.consumers.counts,
+            self.consumers.read_through(),
         );
         if let Some(isolation) = self.isolation {
             let _ = write!(detail, "\nisolation {isolation:?}");
+        }
+        // Process-wide, so a campaign may show other runs' entries too.
+        for entry in ozzy_runtime::profiling::recent_logs().iter().rev().take(8) {
+            let _ = write!(detail, "\nlog {entry:?}");
         }
         for broker in &self.brokers {
             let status = broker.status();
@@ -647,4 +762,13 @@ impl Sim {
         }
         detail
     }
+}
+
+/// The newest ready leader's log end, when it reports one.
+fn log_end(brokers: &[Broker]) -> Option<u64> {
+    let (index, _) = leader(brokers)?;
+    brokers[index]
+        .shard
+        .facts(crate::broker::GROUP, records::PARTITION)
+        .map(|facts| facts.next_offset.get())
 }

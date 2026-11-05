@@ -65,6 +65,8 @@ pub(crate) struct Seeds {
     pub executor: u64,
     /// Parameters of the `swarm` profile.
     pub swarm: u64,
+    /// Record producers.
+    pub producers: u64,
 }
 
 impl Seeds {
@@ -76,6 +78,7 @@ impl Seeds {
             workload: parent.next(),
             executor: parent.next(),
             swarm: parent.next(),
+            producers: parent.next(),
         }
     }
 }

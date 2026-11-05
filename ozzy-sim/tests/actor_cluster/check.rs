@@ -110,7 +110,7 @@ impl Checker {
 }
 
 /// A ready leader that admits proposals.
-fn leads(status: &ActorStatus) -> bool {
+pub(crate) fn leads(status: &ActorStatus) -> bool {
     status.application_ready
         && status
             .normal

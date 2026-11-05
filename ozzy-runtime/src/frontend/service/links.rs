@@ -77,3 +77,24 @@ impl Links {
         self.0.changed.changed_after(generation).await;
     }
 }
+
+#[cfg(feature = "simulation")]
+impl Links {
+    /// Observations a simulator publishes itself, standing in for the
+    /// dispatcher's handshakes. Starts with no peers.
+    pub fn simulated() -> Self {
+        Self(Arc::new(LinkState {
+            current: ArcSwap::from_pointee(BTreeMap::new()),
+            changed: StateSignal::default(),
+        }))
+    }
+
+    /// Publish `peer`'s established link, or close it with `None`, as the
+    /// dispatcher does after a handshake or a disconnect.
+    pub fn set(&self, peer: NodeId, link: Option<Link>) {
+        let mut current = BTreeMap::clone(&self.0.current.load());
+        current.insert(peer, link);
+        self.0.current.store(Arc::new(current));
+        self.0.changed.notify_changed();
+    }
+}

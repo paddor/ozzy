@@ -62,6 +62,22 @@ impl Disk {
         Self::with_image(seed, self.mean, image)
     }
 
+    /// What the disk holds now, for a later `rewind`.
+    pub(crate) fn snapshot(&self) -> Image {
+        self.controller.image().clone()
+    }
+
+    /// Negative control: lose power, then start over what had reached media
+    /// when `snapshot` was taken, as if the disk had lied about every flush
+    /// since.
+    pub(crate) fn rewind(mut self, snapshot: Image) -> (Self, Local) {
+        let seed = self.rng.next();
+        self.controller.crash(true).expect("simulated power loss");
+        let (controller, _) = Controller::new(config(), snapshot).expect("snapshot device");
+        let (image, _) = controller.crash(true).expect("snapshot power loss");
+        Self::with_image(seed, self.mean, image)
+    }
+
     /// Kill the process, then start a fresh device incarnation over the same
     /// cache. Each queued write may still run, as the kernel finishes it,
     /// unless the device is failing. Unsynchronized bytes stay cached.
@@ -92,33 +108,7 @@ impl Disk {
     }
 
     fn with_image(seed: u64, mean: f64, image: Image) -> (Self, Local) {
-        let (controller, mut clients) = Controller::new(
-            Config {
-                limits: Limits {
-                    shards: 1,
-                    data: Quota {
-                        operations: 8,
-                        bytes: 8 * 1024 * 1024,
-                    },
-                    progress: Quota {
-                        operations: 8,
-                        bytes: 8 * 1024 * 1024,
-                    },
-                },
-                handles: 96,
-                // Room for every segment the journal may select and its index.
-                image: ImageLimits {
-                    nodes: 2048,
-                    directory_entries: 4096,
-                    file_bytes: 1024 * 1024,
-                    total_bytes: 256 * 1024 * 1024,
-                },
-                // Drained every tick; one tick schedules far fewer events.
-                trace_events: 100_000,
-            },
-            image,
-        )
-        .expect("simulated device");
+        let (controller, mut clients) = Controller::new(config(), image).expect("simulated device");
         let disk = Self {
             controller,
             rng: Rng::new(seed),
@@ -233,6 +223,32 @@ impl Disk {
             }
         }
         panic!("startup storage stalled");
+    }
+}
+
+fn config() -> Config {
+    Config {
+        limits: Limits {
+            shards: 1,
+            data: Quota {
+                operations: 8,
+                bytes: 8 * 1024 * 1024,
+            },
+            progress: Quota {
+                operations: 8,
+                bytes: 8 * 1024 * 1024,
+            },
+        },
+        handles: 96,
+        // Room for every segment the journal may select and its index.
+        image: ImageLimits {
+            nodes: 2048,
+            directory_entries: 4096,
+            file_bytes: 1024 * 1024,
+            total_bytes: 256 * 1024 * 1024,
+        },
+        // Drained every tick; one tick schedules far fewer events.
+        trace_events: 100_000,
     }
 }
 
