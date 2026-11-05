@@ -62,7 +62,9 @@ impl ReplicaActor {
             Some(transfer) => transfer.deadlines(next),
             None => next,
         };
-        next.each(self.flow_probes()).get()
+        next.each(self.flow_probes())
+            .each(self.replay_waits())
+            .get()
     }
 
     /// While the role suspects stalled storage: whether the shard's storage

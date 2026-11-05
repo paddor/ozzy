@@ -226,8 +226,10 @@ A copy that needs retired history withdraws into recovery instead of voting
 across the gap.
 
 - A follower told `HISTORY_RETIRED` for its next needed operation closes
-  intake, quarantines itself, and recovers. Unlike `--quarantine`, full
-  transfer removes its old files first; sealed damage still goes to repair.
+  intake, quarantines itself, and recovers. The leader tells it again at
+  most once per retransmission interval, in case the notice was lost.
+  Unlike `--quarantine`, full transfer removes its old files first; sealed
+  damage still goes to repair.
 - A retained-topic restart probes the other brokers first. If both answer in
   one view and the primary's retained boundary is past the local accepted
   prefix, it persists a nonvoting marker and recovers.
