@@ -67,6 +67,8 @@ pub(crate) struct Seeds {
     pub swarm: u64,
     /// Record producers.
     pub producers: u64,
+    /// Random overlapping faults.
+    pub chaos: u64,
 }
 
 impl Seeds {
@@ -79,6 +81,7 @@ impl Seeds {
             executor: parent.next(),
             swarm: parent.next(),
             producers: parent.next(),
+            chaos: parent.next(),
         }
     }
 }

@@ -8,6 +8,7 @@ use ozzy_io::simulation::Image;
 
 use crate::{
     broker::{Broker, Lane, Shape, session},
+    chaos::{self, Chaos, Kind},
     check::{Checker, converged, leader},
     clock::Clock,
     consumer::{self, Consumers},
@@ -45,6 +46,8 @@ pub(crate) struct Options {
     pub slow: &'static [usize],
     /// Producers append records beside the barrier clients.
     pub records: bool,
+    /// Random overlapping faults beside the profile's and the script's.
+    pub chaos: bool,
     /// Vacuity floors: confirmed proposals, ops two brokers reported, the
     /// converged op, and proposals a full journal refused.
     pub min_confirmed: usize,
@@ -214,6 +217,10 @@ pub(crate) struct Report {
     pub refused: u64,
     /// Ticks from the last whole-cluster power loss until a leader serves.
     pub outage: Option<u64>,
+    /// Random overlapping faults started.
+    pub faults: u64,
+    /// Records confirmed and read.
+    pub records: usize,
     /// Below a vacuity floor, or a scripted fault never started: the run
     /// converged but proved little.
     pub vacuous: bool,
@@ -252,6 +259,12 @@ struct Sim {
     crash_due: Option<u64>,
     /// Disk copies a scheduled power loss rewinds to.
     snapshots: Option<Vec<Image>>,
+    chaos: Option<Chaos>,
+    /// Connections between brokers so far, by pair; each new one after a
+    /// drop gets a fresh session.
+    links: [[u64; BROKERS]; BROKERS],
+    /// Whether two brokers have a connection now.
+    connected: [[bool; BROKERS]; BROKERS],
 }
 
 pub(crate) fn run(seed: u64, profile: Profile, options: Options) -> Result<Report, Box<Failure>> {
@@ -299,6 +312,9 @@ pub(crate) fn run(seed: u64, profile: Profile, options: Options) -> Result<Repor
         power_loss: None,
         crash_due: None,
         snapshots: None,
+        chaos: options.chaos.then(|| Chaos::new(seeds.chaos)),
+        links: [[0; BROKERS]; BROKERS],
+        connected: [[true; BROKERS]; BROKERS],
     };
     let result = sim.run();
     let hash = sim.trace.value();
@@ -321,6 +337,8 @@ pub(crate) fn run(seed: u64, profile: Profile, options: Options) -> Result<Repor
             view,
             refused: sim.workload.counts.full,
             outage: sim.power_loss.and_then(|(_, outage)| outage),
+            faults: sim.chaos.as_ref().map_or(0, Chaos::total),
+            records: sim.ledger.len(),
             vacuous,
         })
         .map_err(|reason| {
@@ -348,6 +366,7 @@ impl Sim {
                 self.network.heal();
             }
             self.script(tick)?;
+            self.nemesis(tick, draining)?;
             self.network.step(tick);
             let mut order: [usize; BROKERS] = std::array::from_fn(|index| index);
             self.executor.shuffle(&mut order);
@@ -366,12 +385,16 @@ impl Sim {
             // A broker its injected disk error stopped restarts at the end of
             // the tick.
             let mut exited = None;
+            let held_paused: [bool; BROKERS] =
+                std::array::from_fn(|index| self.held(index, Kind::Pause));
+            let held_failing: [bool; BROKERS] =
+                std::array::from_fn(|index| self.held(index, Kind::FailDisk));
             for step in 0..DISK_STEPS {
                 let at = tick * DISK_STEPS + step;
                 for index in order {
                     let broker = &mut self.brokers[index];
                     broker.disk.step(at, index, &mut self.trace);
-                    if paused == Some(index) || exited == Some(index) {
+                    if paused == Some(index) || exited == Some(index) || held_paused[index] {
                         continue;
                     }
                     let turn = broker.turn(
@@ -385,9 +408,9 @@ impl Sim {
                         Ok(None) => {}
                         Err(_)
                             if broker.disk.failed()
-                                && self.isolation.is_some_and(|isolation| {
+                                && (self.isolation.is_some_and(|isolation| {
                                     isolation.broker == index && !isolation.restarted
-                                }) =>
+                                }) || held_failing[index]) =>
                         {
                             exited = Some(index);
                         }
@@ -395,7 +418,18 @@ impl Sim {
                     }
                 }
             }
-            if let Some(broker) = exited {
+            if let Some(broker) = exited
+                && let Some(chaos) = &mut self.chaos
+                && chaos.holds(broker, Kind::FailDisk)
+            {
+                // Its supervisor restarts it over the cache, healthy.
+                chaos
+                    .active
+                    .retain(|fault| (fault.broker, fault.kind) != (broker, Kind::FailDisk));
+                self.network.drop_links(broker);
+                self.restart(broker, tick, Loss::Process)?;
+                self.relink()?;
+            } else if let Some(broker) = exited {
                 // The host stays up, so the cache does too.
                 self.crash(broker, tick, Loss::Process)?;
                 if let Some(isolation) = &mut self.isolation {
@@ -622,11 +656,19 @@ impl Sim {
     /// `broker` stops and restarts over what `loss` left of its disk, cut off
     /// from both peers, which drop their links to it.
     fn crash(&mut self, broker: usize, tick: u64, loss: Loss) -> Result<(), String> {
-        let now = self.clock.now();
         self.network.crash(broker);
+        self.restart(broker, tick, loss)
+    }
+
+    /// `broker` stops and restarts over what `loss` left of its disk. Its
+    /// peers drop their links to it; the new process has none.
+    fn restart(&mut self, broker: usize, tick: u64, loss: Loss) -> Result<(), String> {
+        let now = self.clock.now();
         for peer in (0..BROKERS).filter(|peer| *peer != broker) {
             let session = session(peer, broker, self.epoch(peer, broker));
             self.brokers[peer].disconnect(broker, session, now)?;
+            self.connected[peer][broker] = false;
+            self.connected[broker][peer] = false;
         }
         let old = self.brokers.remove(broker);
         let (restarted, lanes) = old.restart(
@@ -658,12 +700,9 @@ impl Sim {
             self.crash(broker, tick, loss)?;
         }
         self.network.rejoin();
-        let now = self.clock.now();
         for left in 0..BROKERS {
             for right in left + 1..BROKERS {
-                let session = session(left, right, self.epoch(left, right));
-                self.brokers[left].connect(right, session, now)?;
-                self.brokers[right].connect(left, session, now)?;
+                self.connect(left, right)?;
             }
         }
         Ok(())
@@ -671,19 +710,153 @@ impl Sim {
 
     /// Establish fresh links between a restarted `broker` and its peers.
     fn reconnect(&mut self, broker: usize) -> Result<(), String> {
-        let now = self.clock.now();
         for peer in (0..BROKERS).filter(|peer| *peer != broker) {
-            let session = session(peer, broker, self.epoch(peer, broker));
-            self.brokers[peer].connect(broker, session, now)?;
-            self.brokers[broker].connect(peer, session, now)?;
+            self.connect(peer, broker)?;
         }
         Ok(())
     }
 
-    /// The link between two brokers, counted from zero: each restart of
-    /// either starts a new one.
+    /// A new connection between two brokers, under a fresh session.
+    fn connect(&mut self, left: usize, right: usize) -> Result<(), String> {
+        let now = self.clock.now();
+        self.links[left.min(right)][left.max(right)] += 1;
+        let session = session(left, right, self.epoch(left, right));
+        self.brokers[left].connect(right, session, now)?;
+        self.brokers[right].connect(left, session, now)?;
+        self.connected[left][right] = true;
+        self.connected[right][left] = true;
+        Ok(())
+    }
+
+    /// The current connection between two brokers, counted from zero.
     fn epoch(&self, left: usize, right: usize) -> u64 {
-        self.brokers[left].incarnation + self.brokers[right].incarnation
+        self.links[left.min(right)][left.max(right)]
+    }
+
+    /// Whether a random fault of `kind` holds `broker`.
+    fn held(&self, broker: usize, kind: Kind) -> bool {
+        self.chaos
+            .as_ref()
+            .is_some_and(|chaos| chaos.holds(broker, kind))
+    }
+
+    /// End due random faults, all of them once draining, then maybe start a
+    /// new one.
+    fn nemesis(&mut self, tick: u64, draining: bool) -> Result<(), String> {
+        let Some(chaos) = &mut self.chaos else {
+            return Ok(());
+        };
+        let ended = if draining {
+            chaos.end_all()
+        } else {
+            chaos.ended(tick)
+        };
+        let mut changed = !ended.is_empty();
+        for fault in ended {
+            match fault.kind {
+                Kind::Stall => self.brokers[fault.broker].disk.stall(0),
+                Kind::FailDisk => self.brokers[fault.broker].disk.heal_writes(),
+                _ => {}
+            }
+        }
+        let connected = self.connected;
+        let drawn = if draining {
+            None
+        } else {
+            self.chaos
+                .as_mut()
+                .and_then(|chaos| chaos.draw(tick, |left, right| connected[left][right]))
+        };
+        if let Some(fault) = drawn {
+            changed = true;
+            self.trace.word(tick);
+            self.trace.word(fault.kind as u64);
+            self.trace.word(fault.broker as u64);
+            self.start(fault, tick)?;
+        }
+        if changed {
+            self.apply_cuts();
+            self.relink()?;
+        }
+        Ok(())
+    }
+
+    fn start(&mut self, fault: chaos::Fault, tick: u64) -> Result<(), String> {
+        let broker = fault.broker;
+        match fault.kind {
+            Kind::PowerLoss | Kind::Kill => {
+                self.network.drop_links(broker);
+                let loss = if fault.kind == Kind::Kill {
+                    Loss::Process
+                } else {
+                    Loss::Power
+                };
+                self.restart(broker, tick, loss)?;
+            }
+            Kind::Stall => self.brokers[broker].disk.stall(fault.until * DISK_STEPS),
+            Kind::FailDisk => self.brokers[broker].disk.fail_writes(),
+            Kind::LinkReset => {
+                let now = self.clock.now();
+                let session = session(broker, fault.peer, self.epoch(broker, fault.peer));
+                self.network.drop_link(broker, fault.peer);
+                self.brokers[broker].disconnect(fault.peer, session, now)?;
+                self.brokers[fault.peer].disconnect(broker, session, now)?;
+                self.connected[broker][fault.peer] = false;
+                self.connected[fault.peer][broker] = false;
+            }
+            Kind::ClientReset => self.brokers[broker].reset_clients(),
+            Kind::Pause | Kind::Isolate | Kind::Deaf | Kind::Mute => {}
+        }
+        Ok(())
+    }
+
+    /// Cut each broker as its random faults say. A broker that restarted
+    /// stays cut off until its fault ends.
+    fn apply_cuts(&mut self) {
+        let mut cuts = [None; BROKERS];
+        if let Some(chaos) = &self.chaos {
+            for fault in &chaos.active {
+                let direction = match fault.kind {
+                    Kind::PowerLoss | Kind::Kill | Kind::Isolate => 0,
+                    Kind::Mute => 1,
+                    Kind::Deaf => 2,
+                    _ => continue,
+                };
+                let cut: &mut Option<u64> = &mut cuts[fault.broker];
+                *cut =
+                    Some(cut.map_or(direction, |old: u64| if old == direction { old } else { 0 }));
+            }
+        }
+        self.network.set_cuts(cuts);
+    }
+
+    /// Connect every pair without a connection unless a random fault keeps
+    /// it down: a restarted broker until its fault ends, a reset connection
+    /// until it comes back.
+    fn relink(&mut self) -> Result<(), String> {
+        let Some(chaos) = &self.chaos else {
+            return Ok(());
+        };
+        let down =
+            |broker: usize| chaos.holds(broker, Kind::PowerLoss) || chaos.holds(broker, Kind::Kill);
+        let reset = |left: usize, right: usize| {
+            chaos.active.iter().any(|fault| {
+                fault.kind == Kind::LinkReset
+                    && ((fault.broker, fault.peer) == (left, right)
+                        || (fault.broker, fault.peer) == (right, left))
+            })
+        };
+        let connected = &self.connected;
+        let pairs: Vec<(usize, usize)> = (0..BROKERS)
+            .flat_map(|left| (left + 1..BROKERS).map(move |right| (left, right)))
+            .filter(|&(left, right)| {
+                !connected[left][right] && !down(left) && !down(right) && !reset(left, right)
+            })
+            .collect();
+        for (left, right) in pairs {
+            self.connect(left, right)?;
+        }
+        Ok(())
     }
 
     /// The converged op, and whether the run was vacuous.
@@ -709,6 +882,7 @@ impl Sim {
             }
         }
         let vacuous = self.next_fault < self.options.script.len()
+            || self.chaos.as_ref().is_some_and(|chaos| chaos.total() < 5)
             || self.workload.counts.full < self.options.min_refused
             || applied.op.0 < self.options.min_applied
             || self.workload.confirmed.len() < self.options.min_confirmed
@@ -734,6 +908,14 @@ impl Sim {
         );
         if let Some(isolation) = self.isolation {
             let _ = write!(detail, "\nisolation {isolation:?}");
+        }
+        if let Some(chaos) = &self.chaos {
+            let _ = write!(
+                detail,
+                "\nchaos started {:?}\nchaos active {:?}",
+                chaos.summary(),
+                chaos.active
+            );
         }
         // Process-wide, so a campaign may show other runs' entries too.
         for entry in ozzy_runtime::profiling::recent_logs().iter().rev().take(8) {

@@ -134,6 +134,11 @@ impl Disk {
         self.failing = true;
     }
 
+    /// Writes and syncs succeed again, when no failure stopped the broker.
+    pub(crate) fn heal_writes(&mut self) {
+        self.failing = false;
+    }
+
     /// Whether an injected failure was delivered.
     pub(crate) fn failed(&self) -> bool {
         self.failed

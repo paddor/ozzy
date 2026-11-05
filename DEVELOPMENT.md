@@ -253,8 +253,12 @@ restarts see what the disks cached and queued writes may still land;
 with the queued writes in flight; `disk-stall`, where the leader's disk
 completes nothing for 15 s while its links stay up, and another broker must
 take over; `pause`, where the leader's process runs nothing for 15 s, then
-resumes into a newer view; and `one-way`, where the leader first hears
-nothing, then a later leader can send nothing. A power loss puts some queued
+resumes into a newer view; `one-way`, where the leader first hears
+nothing, then a later leader can send nothing; and `chaos`, where random
+overlapping faults hit any broker: power loss, kills, pauses, disk stalls
+and failures, cuts in either direction, and broker or client connection
+resets that drop queued frames. Up to two brokers are down at once, so only
+safety holds until the drain ends every fault. A power loss puts some queued
 writes in the cache unreported, even `O_DSYNC` ones, then lets a seeded share
 of cached 512-byte sectors reach media, so unsynced writes tear and land out
 of order. The power-loss fast test also bounds the outage, which grows when a

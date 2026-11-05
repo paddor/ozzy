@@ -165,6 +165,8 @@ pub(crate) struct Network {
     paths: Vec<Path>,
     /// Directed links a partition blocks.
     blocked: [[bool; BROKERS]; BROKERS],
+    /// Directed links random overlapping faults cut, apart from partitions.
+    cut: [[bool; BROKERS]; BROKERS],
     partitioned: bool,
     /// The broker of a scripted fault. Random partitions wait for it.
     isolated: Option<usize>,
@@ -184,6 +186,7 @@ impl Network {
                 .map(|_| Path::default())
                 .collect(),
             blocked: [[false; BROKERS]; BROKERS],
+            cut: [[false; BROKERS]; BROKERS],
             partitioned: false,
             isolated: None,
             healed: false,
@@ -332,20 +335,47 @@ impl Network {
     /// `broker` lost power: frames on its links are gone with them. It
     /// stays cut off until `rejoin`.
     pub(crate) fn crash(&mut self, broker: usize) {
+        self.drop_queued(|from, to| from == broker || to == broker);
+        self.isolate(broker);
+    }
+
+    /// The connections of `broker` dropped with their queued frames.
+    pub(crate) fn drop_links(&mut self, broker: usize) {
+        self.drop_queued(|from, to| from == broker || to == broker);
+    }
+
+    /// The connection between `left` and `right` dropped with its queued
+    /// frames.
+    pub(crate) fn drop_link(&mut self, left: usize, right: usize) {
+        self.drop_queued(|from, to| (from, to) == (left, right) || (from, to) == (right, left));
+    }
+
+    fn drop_queued(&mut self, dropped: impl Fn(usize, usize) -> bool) {
         for from in 0..BROKERS {
-            for to in (0..BROKERS).filter(|to| *to != from && (from == broker || *to == broker)) {
+            let mut cleared = false;
+            for to in (0..BROKERS).filter(|to| *to != from && dropped(from, *to)) {
                 for class in CLASSES {
                     self.paths[index(from, to, class)].queue.clear();
                 }
+                cleared = true;
             }
             // Senders refused on a cleared path may send again.
-            if let Some(waker) = self.refused[from].take()
-                && from != broker
-            {
+            if cleared && let Some(waker) = self.refused[from].take() {
                 waker.wake();
             }
         }
-        self.isolate(broker);
+    }
+
+    /// Cut each broker as `cuts` says: 0 both ways, 1 outbound only, 2
+    /// inbound only, `None` not at all. Partitions stay as they are.
+    pub(crate) fn set_cuts(&mut self, cuts: [Option<u64>; BROKERS]) {
+        for (from, row) in self.cut.iter_mut().enumerate() {
+            for (to, cut) in row.iter_mut().enumerate() {
+                let outbound = cuts[from].is_some_and(|direction| direction != 2);
+                let inbound = cuts[to].is_some_and(|direction| direction != 1);
+                *cut = from != to && (outbound || inbound);
+            }
+        }
     }
 
     pub(crate) fn rejoin(&mut self) {
@@ -371,7 +401,7 @@ impl Network {
     pub(crate) fn deliver(&mut self, to: usize, tick: u64, inbox: &mut Inbox, trace: &mut Trace) {
         for offset in 0..BROKERS {
             let from = (to + offset + tick as usize) % BROKERS;
-            if from == to || self.blocked[from][to] {
+            if from == to || self.blocked[from][to] || self.cut[from][to] {
                 continue;
             }
             let mut drained = false;

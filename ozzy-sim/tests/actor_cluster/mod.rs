@@ -16,6 +16,7 @@
 )]
 
 mod broker;
+mod chaos;
 mod check;
 mod clock;
 mod consumer;
@@ -51,6 +52,8 @@ struct Scenario {
     slow: &'static [usize],
     /// Producers append records beside the barrier clients.
     records: bool,
+    /// Random overlapping faults.
+    chaos: bool,
     /// Caps the profile's floors for confirmed proposals and compared ops,
     /// where a full journal bounds them.
     max_floor: usize,
@@ -67,6 +70,7 @@ const RANDOM: Scenario = Scenario {
     sparse: &[],
     slow: &[],
     records: true,
+    chaos: false,
     max_floor: usize::MAX,
     min_applied: 0,
     min_refused: 0,
@@ -242,6 +246,15 @@ fn scenario(name: &str) -> Option<Scenario> {
             script: &[CrashAll { at: 1500 }],
             ..RANDOM
         },
+        // Random overlapping faults on any broker: power loss, kills, pauses,
+        // disk stalls and failures, cuts, and connection resets. Two brokers
+        // may be down at once.
+        "chaos" => Scenario {
+            ticks: 5000,
+            chaos: true,
+            max_floor: 20,
+            ..RANDOM
+        },
         // Negative control: every disk loses the last 5 s it reported done.
         // The run must fail.
         "rewind" => Scenario {
@@ -329,6 +342,7 @@ fn options(profile: &str, scenario: &str) -> Options {
         sparse: scenario.sparse,
         slow: scenario.slow,
         records: scenario.records,
+        chaos: scenario.chaos,
         min_confirmed: floor,
         min_compared: floor as u64,
         min_applied: scenario.min_applied,
@@ -563,6 +577,17 @@ fn rewound_disks_fail_the_run() {
     }
 }
 
+/// Random overlapping faults, two brokers down at times, keep every
+/// confirmed record and converge once they end.
+#[test]
+fn random_overlapping_faults_keep_history_and_converge() {
+    for (seed, profile) in [(1, "none"), (2, "light")] {
+        let report = checked(seed, profile, "chaos");
+        assert!(report.faults >= 20, "{report:?}");
+        eprintln!("{report:?}");
+    }
+}
+
 /// Seeds that found bugs. Schedules move with the code, so each names what
 /// it found.
 #[test]
@@ -594,7 +619,7 @@ mod seeded {
         const PROFILES: [&str; 5] = ["none", "light", "heavy", "swarm", "slow"];
         /// Each scenario with its profiles. Heavy and swarm faults leave too
         /// little progress to fill a journal.
-        const SCENARIOS: [(&str, &[&str]); 15] = [
+        const SCENARIOS: [(&str, &[&str]); 16] = [
             ("random", &PROFILES),
             ("failover", &PROFILES),
             ("slow-follower", &PROFILES),
@@ -610,6 +635,7 @@ mod seeded {
             ("disk-stall", &PROFILES),
             ("pause", &PROFILES),
             ("one-way", &PROFILES),
+            ("chaos", &PROFILES),
         ];
 
         /// About 4800 operations in 75 segments before the leader is lost. A

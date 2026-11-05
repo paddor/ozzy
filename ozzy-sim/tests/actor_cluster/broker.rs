@@ -123,6 +123,8 @@ pub(crate) struct Broker {
     pub replies: VecDeque<Message>,
     /// Live reader publications, which no consumer follows yet.
     pub publications: u64,
+    /// Client connection resets so far; each starts fresh client sessions.
+    client_resets: u64,
 }
 
 impl Broker {
@@ -246,6 +248,7 @@ impl Broker {
             requests: VecDeque::new(),
             replies: VecDeque::new(),
             publications: 0,
+            client_resets: 0,
         };
         broker.link_clients();
         Ok((broker, lanes))
@@ -430,6 +433,7 @@ impl Broker {
     pub(crate) fn client_session(&self, index: usize) -> LinkSessionId {
         let mut bytes = [0xd0 + index as u8; 16];
         bytes[1] = self.index as u8;
+        bytes[2..8].copy_from_slice(&self.client_resets.to_be_bytes()[2..]);
         bytes[8..].copy_from_slice(&self.incarnation.to_be_bytes());
         LinkSessionId::from_bytes(bytes)
     }
@@ -438,8 +442,16 @@ impl Broker {
     pub(crate) fn consumer_session(&self, index: usize) -> LinkSessionId {
         let mut bytes = [0xf0 + index as u8; 16];
         bytes[1] = self.index as u8;
+        bytes[2..8].copy_from_slice(&self.client_resets.to_be_bytes()[2..]);
         bytes[8..].copy_from_slice(&self.incarnation.to_be_bytes());
         LinkSessionId::from_bytes(bytes)
+    }
+
+    /// Every client connection drops; clients reconnect at once under fresh
+    /// sessions. Requests on the old ones are fenced.
+    pub(crate) fn reset_clients(&mut self) {
+        self.client_resets += 1;
+        self.link_clients();
     }
 
     /// Publish every client's link to this broker incarnation.
