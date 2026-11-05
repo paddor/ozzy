@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Breaking
+
+- The re-exported `Context` and `Endpoint` come from the omq-tokio 0.34
+  release instead of 0.32.
+
 ## [0.9.0] - 2026-11-02
 
 ### Breaking

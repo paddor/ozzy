@@ -60,7 +60,7 @@ itoa = "1.0"
 libc = "0.2"
 lz4rip.workspace = true
 plotters = { version = "0.3", default-features = false, features = ["svg_backend", "line_series"] }
-iggy = { git = "https://github.com/apache/iggy.git", rev = "71f29618ba04917fded0ef5cd085c206fef0ee49", optional = true }
+iggy = { git = "https://github.com/apache/iggy.git", rev = "91e0206367aad2d30259f7d45203832b08ae84e7", optional = true }
 rdkafka = { version = "=0.38.0", optional = true }
 tracing-subscriber = { version = "0.3", optional = true, features = ["fmt"] }
 omq-tokio = { workspace = true, features = ["lz4", "zstd"] }

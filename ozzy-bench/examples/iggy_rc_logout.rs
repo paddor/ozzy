@@ -8,8 +8,8 @@ mod diagnostic {
     use futures::future::try_join_all;
     use iggy::prelude::{
         Client, Consumer, Durability, Identifier, IggyByteSize, IggyMessage, MessageClient,
-        Partitioning, PollingStrategy, StreamClient, TcpClient, TopicClient, TopicCreateOptions,
-        UserClient,
+        Partitioning, PollOptions, PollingStrategy, StreamClient, StreamCreateOptions, TcpClient,
+        TopicClient, TopicCreateOptions, UserClient,
     };
     use ozzy_bench::automation::{self, Result, isolation, server};
     use ozzy_bench::control::{self, Connection};
@@ -251,11 +251,15 @@ mod diagnostic {
                 .poll_messages(
                     &stream,
                     &topic,
-                    Some(lane as u32),
+                    lane as u32,
                     &Consumer::default(),
                     &PollingStrategy::offset(offset as u64),
-                    1024,
-                    false,
+                    PollOptions {
+                        count: 1024,
+                        // The 0.9 API sent no byte cap, so only the count and server limits apply.
+                        max_bytes: u32::MAX,
+                        ..PollOptions::default()
+                    },
                 )
                 .await?;
             for message in batch.messages {
@@ -283,7 +287,9 @@ mod diagnostic {
             println!("control logout requested");
             control.logout_user().await?;
         } else {
-            control.create_stream("logout-repro").await?;
+            control
+                .create_stream("logout-repro", &StreamCreateOptions::default())
+                .await?;
             control
                 .create_topic(
                     &Identifier::try_from("logout-repro")?,
