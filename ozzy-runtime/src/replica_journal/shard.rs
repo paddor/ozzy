@@ -403,6 +403,10 @@ impl ShardJournal {
         }
         if let Poll::Ready(Some(done)) = self.jobs.poll_next_unpin(cx) {
             self.completed.push_back(Completed::Job(done));
+            // A detached job settles no command the partition waits on, but
+            // its end can free held work, such as the next retention turn
+            // after a retirement. Ask the partition for another round.
+            cx.waker().wake_by_ref();
             progressed = true;
         }
         progressed
