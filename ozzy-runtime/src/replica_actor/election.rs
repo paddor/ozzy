@@ -69,10 +69,17 @@ impl ReplicaActor {
         let foreground_turn = std::mem::take(&mut self.maintenance.foreground_due);
         let Some(kind) = self
             .due_maintenance(now)
-            .filter(|_| !foreground_turn && self.application_ready())
+            .filter(|_| self.application_ready())
         else {
             return Ok(MaintenanceTurn::Continue);
         };
+        if foreground_turn {
+            // Writers go first this round. The due task is no timer any more,
+            // and a step that just finished leaves no command to complete, so
+            // ask for the next round now.
+            self.more_work = true;
+            return Ok(MaintenanceTurn::Continue);
+        }
         if self.pending_sync.is_some() || !self.pending_persistence.is_empty() {
             return Ok(MaintenanceTurn::Stop);
         }

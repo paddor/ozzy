@@ -715,6 +715,10 @@ fn regression_seeds() {
     // record queued behind it. The leader kept asking for another round, so
     // its shard woke itself for a whole turn.
     checked(8, "none", "sparse-followers");
+    // A dedup partition's retention turn left identity expiry owed, due at
+    // once. Writers took the next round, and nothing asked for another one:
+    // the safety sweep started the turn.
+    checked(2, "none", "failover");
 }
 
 /// Process-wide state would leak from one run into the next one.
