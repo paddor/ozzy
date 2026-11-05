@@ -291,6 +291,9 @@ part. General descriptors use:
   identities are never evicted.
 - Expiry follows committed logical time only. A discarded `DedupWatermark`
   changes nothing. Followers apply confirmed time before admitting new IDs.
+- A leader's logical time is the accepted time when its view began, plus the
+  monotonic time since, as its journal clock reads it. Wall clock steps never
+  move it.
 - Both modes keep live IDs after their payloads retire.
 
 ## Consumer progress and groups

@@ -125,15 +125,16 @@ pub(super) fn journal_clock(
 ) -> impl Fn() -> ClockReading + 'static {
     let (host, trust) = (host.clone(), trust.cloned());
     move || {
-        let wall_millis = host.wall_millis();
+        let (wall_millis, monotonic) = (host.wall_millis(), host.now());
         ClockReading {
             wall_millis,
             trusted: trust.as_ref().is_none_or(|trust| {
                 trust.trusted(|| ClockNow {
                     wall_millis,
-                    monotonic: host.now(),
+                    monotonic,
                 })
             }),
+            monotonic,
         }
     }
 }

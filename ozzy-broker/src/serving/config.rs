@@ -213,12 +213,14 @@ impl Config {
         );
         move || {
             let wall_millis = time.timestamp();
+            let monotonic = timer.elapsed();
             ClockReading {
                 wall_millis,
                 trusted: clock.trusted(|| frontend::ClockNow {
                     wall_millis,
-                    monotonic: timer.elapsed(),
+                    monotonic,
                 }),
+                monotonic,
             }
         }
     }

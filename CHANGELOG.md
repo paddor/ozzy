@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Breaking
+
+- `ozzy_runtime::replica_journal::ClockReading` has a new `monotonic` field.
+  The leader's deduplication time advances by it instead of by tokio's
+  clock, so a broker on simulated time measures dedup windows on that time.
+
 ### Fixed
 
 - A partition on a delay topic no longer busy-loops its shard thread while a

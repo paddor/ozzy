@@ -13,7 +13,7 @@ fn retention_turn(
         controller,
         journal.retention_turn(
             driver.begin_validation().unwrap(),
-            Some(NOW),
+            NOW.into(),
             ozzy_proto::OperationId::from_bytes([seed; 16]),
             true,
         ),

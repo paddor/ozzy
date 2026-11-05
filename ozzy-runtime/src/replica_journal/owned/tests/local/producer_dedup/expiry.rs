@@ -21,7 +21,7 @@ fn retention(
         controller,
         journal.retention_turn(
             driver.begin_validation().unwrap(),
-            Some(u64::MAX),
+            u64::MAX.into(),
             OperationId::from_bytes([71; 16]),
             leader,
         ),
@@ -311,7 +311,11 @@ async fn identity_expiry_steps_run_without_a_settled_journal() {
     assert_eq!(deferred.expired_identities, 0);
     assert!(!deferred.more_work);
     let step = journal
-        .retain_identities_turn(driver.begin_validation().unwrap(), true)
+        .retain_identities_turn(
+            driver.begin_validation().unwrap(),
+            true,
+            crate::replica_journal::ClockReading::from(0).monotonic,
+        )
         .unwrap();
     assert_eq!(step.expired, remaining);
     assert!(!step.more_work);

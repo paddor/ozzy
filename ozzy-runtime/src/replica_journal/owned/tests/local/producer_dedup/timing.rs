@@ -160,7 +160,7 @@ async fn small_appends_and_expiry_fit_a_small_owner_with_a_large_identity_capaci
             &mut controller,
             journal.retention_turn(
                 driver.begin_validation().unwrap(),
-                Some(0),
+                0.into(),
                 OperationId::new(),
                 true,
             ),
@@ -177,6 +177,57 @@ async fn small_appends_and_expiry_fit_a_small_owner_with_a_large_identity_capaci
         assert!(memory.allocated_bytes() <= 32 * 1024);
     }
     assert_eq!(stored_end(&journal), Offset::new(32));
+    drive(&mut controller, journal.shutdown()).unwrap();
+}
+
+/// The window runs on the monotonic time the journal clock reads, not on a
+/// clock of its own: tokio time stands still here, so a simulated shard
+/// replays the window exactly.
+#[tokio::test(start_paused = true)]
+async fn window_follows_the_journal_clock() {
+    let (mut controller, io) = setup();
+    let mut config = local_config();
+    config.deduplication = Some(limits());
+    let (mut journal, mut driver) = drive(
+        &mut controller,
+        OwnedJournal::format_local(config, io, JournalGeneration(1), 32768),
+    )
+    .unwrap();
+    initialize(&mut controller, &mut journal, &mut driver);
+    let at = |millis| crate::replica_journal::ClockReading {
+        wall_millis: 0,
+        trusted: true,
+        monotonic: Duration::from_millis(millis),
+    };
+    let first = ready(produce_at(
+        &mut controller,
+        &mut journal,
+        &driver,
+        [request(12, 0, 1)],
+        at(0),
+    ));
+    assert_eq!(outcomes(&first), [vec![stored(0)]]);
+    accept(&mut controller, &mut journal, &mut driver, first);
+    let inside = ready(produce_at(
+        &mut controller,
+        &mut journal,
+        &driver,
+        [request(30, 0, 1)],
+        at(9),
+    ));
+    assert_eq!(outcomes(&inside), [vec![duplicate(0)]]);
+    accept(&mut controller, &mut journal, &mut driver, inside);
+    let mut repeated = request(12, 1, 1);
+    repeated.records[0].message_id = MessageId::from_bytes([1; 16]);
+    let after = ready(produce_at(
+        &mut controller,
+        &mut journal,
+        &driver,
+        [repeated],
+        at(10),
+    ));
+    assert_eq!(outcomes(&after), [vec![stored(1)]]);
+    accept(&mut controller, &mut journal, &mut driver, after);
     drive(&mut controller, journal.shutdown()).unwrap();
 }
 

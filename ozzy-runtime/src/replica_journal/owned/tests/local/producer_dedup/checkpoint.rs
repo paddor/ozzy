@@ -234,7 +234,7 @@ async fn empty_identity_checkpoint_keeps_the_confirmed_clock_and_record_end() {
         &mut controller,
         journal.retention_turn(
             driver.begin_validation().unwrap(),
-            Some(0),
+            0.into(),
             OperationId::from_bytes([85; 16]),
             true,
         ),

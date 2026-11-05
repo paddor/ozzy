@@ -101,10 +101,11 @@ impl OwnedJournal {
     pub(in crate::replica_journal) async fn retention_turn(
         &mut self,
         ticket: ValidationTicket,
-        now_millis: Option<u64>,
+        clock: crate::replica_journal::ClockReading,
         seed: OperationId,
         leader: bool,
     ) -> Result<RetentionTurn, JournalError> {
+        let now_millis = clock.decision();
         self.healthy()?;
         self.validate_image(ticket)?;
         if ticket.accepted() != ticket.applied() || ticket.committed() != ticket.applied() {
@@ -119,7 +120,7 @@ impl OwnedJournal {
         // Under steady load expiry always has more work, so waiting for it
         // would starve record retention. A turn carries one proposal.
         let owed = std::mem::take(&mut self.retention.records_owed);
-        let identities = self.retain_identities(ticket, leader && !owed)?;
+        let identities = self.retain_identities(ticket, leader && !owed, clock.monotonic)?;
         if identities.proposal.is_some() {
             self.retention.records_owed = true;
             return Ok(RetentionTurn {

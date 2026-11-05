@@ -2,6 +2,7 @@ use super::{JournalError, OwnedJournal, producer::Clock};
 use crate::replica_journal::ProposalBuffer;
 use ozzy_journal::operation::{DedupWatermark, OperationBody, encode_operation_body};
 use ozzy_replication::driver::ValidationTicket;
+use std::time::Duration;
 
 /// One bounded identity-expiry step. It needs no settled journal: expiry
 /// touches only confirmed rows, and the owner serializes it with validation.
@@ -22,16 +23,20 @@ impl OwnedJournal {
         &mut self,
         ticket: ValidationTicket,
         leader: bool,
+        now: Duration,
     ) -> Result<IdentityRetention, JournalError> {
         self.healthy()?;
         self.validate_image(ticket)?;
-        self.retain_identities(ticket, leader)
+        self.retain_identities(ticket, leader, now)
     }
 
+    /// As `retain_identities_turn`; a leader advances idle logical time by
+    /// monotonic time `now`.
     pub(in crate::replica_journal::owned) fn retain_identities(
         &mut self,
         ticket: ValidationTicket,
         leader: bool,
+        now: Duration,
     ) -> Result<IdentityRetention, JournalError> {
         let Some(_) = self.dedup.limits else {
             return Ok(IdentityRetention::default());
@@ -53,7 +58,7 @@ impl OwnedJournal {
         if !leader || deadline.is_none_or(|at| image.time >= at) {
             return Ok(turn);
         }
-        let time = Clock::time(&mut self.dedup.clock, ticket, image.time)?;
+        let time = Clock::time(&mut self.dedup.clock, ticket, image.time, now)?;
         if deadline.is_none_or(|at| time < at) {
             return Ok(turn);
         }
