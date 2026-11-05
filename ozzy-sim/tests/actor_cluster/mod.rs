@@ -719,6 +719,9 @@ fn regression_seeds() {
     // once. Writers took the next round, and nothing asked for another one:
     // the safety sweep started the turn.
     checked(2, "none", "failover");
+    // A stalled disk completed a job for one partition's visit. The other
+    // partition's leader kept suspecting storage until the safety sweep.
+    checked(6, "slow", "chaos");
 }
 
 /// Process-wide state would leak from one run into the next one.

@@ -117,9 +117,18 @@ fn setup() -> (Controller, Local) {
 }
 
 fn setup_image(image: Image) -> (Controller, Local) {
-    let (controller, mut clients) = Controller::new(
+    let (controller, mut lanes) = setup_lanes(image, 1);
+    (controller, lanes.remove(0))
+}
+
+/// One storage lane per shard on one device.
+fn setup_lanes(image: Image, shards: usize) -> (Controller, Vec<Local>) {
+    let (controller, clients) = Controller::new(
         simulation::Config {
-            limits: device_limits(),
+            limits: ozzy_io::Limits {
+                shards,
+                ..device_limits()
+            },
             handles: 96,
             image: ImageLimits {
                 nodes: 512,
@@ -132,7 +141,7 @@ fn setup_image(image: Image) -> (Controller, Local) {
         image,
     )
     .unwrap();
-    (controller, Local::new(clients.remove(0)))
+    (controller, clients.into_iter().map(Local::new).collect())
 }
 
 fn poll<T>(future: Pin<&mut impl Future<Output = T>>) -> Poll<T> {

@@ -1,4 +1,5 @@
-//! The earliest future instant among a partition's timers.
+//! The earliest future instant among a partition's timers, and the storage
+//! progress a suspicious role waits for.
 
 use super::{PartitionActor, ReplicaActor};
 use std::time::Duration;
@@ -64,6 +65,15 @@ impl ReplicaActor {
         next.each(self.flow_probes()).get()
     }
 
+    /// While the role suspects stalled storage: whether the shard's storage
+    /// lane completed a job since the last visit looked. Any job counts,
+    /// another partition's too, and none of those wakes this one.
+    pub(super) fn storage_moved(&self) -> Option<bool> {
+        self.driver
+            .storage_stalled()
+            .then(|| self.journal.completed_jobs() != self.storage_jobs)
+    }
+
     /// Probe times of the peers a primary polls for receipt status.
     fn flow_probes(&self) -> impl Iterator<Item = Duration> + '_ {
         let primary = self.driver.normal().is_some_and(|normal| {
@@ -86,6 +96,15 @@ impl PartitionActor {
             Self::Local(actor) => actor.next_deadline(now),
             Self::Replicated(actor) => actor.next_deadline(now),
             Self::Recovering(recovery) => recovery.next_deadline(now),
+        }
+    }
+
+    /// While the role suspects stalled storage: whether the storage lane
+    /// completed a job since the last visit. `None` otherwise.
+    pub(super) fn storage_moved(&self) -> Option<bool> {
+        match self {
+            Self::Replicated(actor) => actor.storage_moved(),
+            Self::Local(_) | Self::Recovering(_) => None,
         }
     }
 }

@@ -451,6 +451,154 @@ fn quiet_partitions_are_visited_at_their_own_timers_between_sweeps() {
     }
 }
 
+/// Broker 0 leads groups 0 and 3 on one shard, with its own storage lane.
+/// Its device stalls until both primaries suspect it. One job then
+/// completes, for one group, and wakes only that partition. The other
+/// partition's suspicion of storage must end at the same instant.
+#[test]
+fn a_job_completed_for_one_partition_ends_another_partitions_storage_stall() {
+    let (mut controller, lanes) = setup_lanes(Image::default(), 2);
+    let mut assigned: [Vec<_>; 3] = std::array::from_fn(|_| Vec::new());
+    let mut first = Vec::new();
+    let mut later = Vec::new();
+    for group in [0, 3] {
+        for broker in 0..3 {
+            let lane = &lanes[usize::from(broker != 0)];
+            let mut actor = unstarted_actor(&mut controller, lane, group, broker, 64);
+            if broker == 0 {
+                let mut submitter = actor.take_submitter().unwrap();
+                let proposal = |byte: u8| {
+                    let mut buffer = actor.lease_proposal_buffer().unwrap();
+                    buffer
+                        .push(ozzy_journal::operation::OperationKind::Barrier, &[byte; 16])
+                        .unwrap();
+                    buffer
+                };
+                let (now, next) = (proposal(group + 1), proposal(group + 2));
+                first.push(Box::pin(submitter.try_submit(now).unwrap()));
+                later.push((submitter, next));
+            }
+            assigned[usize::from(broker)]
+                .push(PartitionActor::Replicated(Scheduled::new(actor).unwrap()));
+        }
+    }
+    let groups: [_; 2] = std::array::from_fn(|slot| assigned[0][slot].group());
+    let mut shards = assigned.map(|actors| {
+        PartitionActors::new(actors, 2, 2)
+            .unwrap()
+            .with_safety_sweep(Duration::from_secs(1))
+            .unwrap()
+    });
+    let mut routes = StepRoutes::default();
+    let mut held = Vec::new();
+    let mut millis = 0;
+    let mut confirmed = [false; 2];
+    while confirmed != [true; 2] {
+        assert!(millis < 4000, "the groups never confirmed a proposal");
+        held_step(&mut shards, &mut routes, &mut controller, None, millis);
+        for (reply, done) in first.iter_mut().zip(&mut confirmed) {
+            *done |= poll(reply.as_mut()).is_ready();
+        }
+        millis += 1;
+    }
+    let _pending: Vec<_> = later
+        .into_iter()
+        .map(|(mut submitter, buffer)| submitter.try_submit(buffer).unwrap())
+        .collect();
+    // Hold every job broker 0 submits until the primary timeout of busy
+    // storage passes for both primaries.
+    let stalled =
+        |shard: &PartitionActors| groups.map(|group| shard.storage_stalled(group).unwrap());
+    while stalled(&shards[0]) != [true; 2] {
+        assert!(millis < 8000, "busy storage raised no suspicion");
+        held_step(
+            &mut shards,
+            &mut routes,
+            &mut controller,
+            Some(&mut held),
+            millis,
+        );
+        millis += 1;
+    }
+    // Time stands still from here, so no timer or sweep visits a partition.
+    for _ in 0..10 {
+        held_step(
+            &mut shards,
+            &mut routes,
+            &mut controller,
+            Some(&mut held),
+            millis,
+        );
+    }
+    assert_eq!(stalled(&shards[0]), [true; 2]);
+    let job = held.remove(0);
+    controller.execute(job, Effect::Normal).unwrap();
+    controller.deliver(job).unwrap();
+    for _ in 0..10 {
+        held_step(
+            &mut shards,
+            &mut routes,
+            &mut controller,
+            Some(&mut held),
+            millis,
+        );
+    }
+    assert_eq!(
+        stalled(&shards[0]),
+        [false; 2],
+        "a primary kept suspecting storage"
+    );
+    for shard in shards {
+        close_set(&mut controller, shard);
+    }
+}
+
+/// Poll each shard and deliver its messages at one instant, then settle
+/// storage. With `held`, every job broker 0 submits stays held.
+fn held_step(
+    shards: &mut [PartitionActors],
+    routes: &mut StepRoutes,
+    controller: &mut Controller,
+    mut held: Option<&mut Vec<JobId>>,
+    millis: u64,
+) {
+    let now = Duration::from_millis(millis);
+    let jobs = |controller: &mut Controller| {
+        controller
+            .jobs()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>()
+    };
+    let mut messages = Vec::new();
+    for (broker, shard) in shards.iter_mut().enumerate() {
+        let before = jobs(controller);
+        let mut cx = Context::from_waker(Waker::noop());
+        let result = shard.poll_progress(&mut cx, now, |_, mut message| {
+            let group = routes.group(broker, &message, None);
+            let to = usize::from(message.pop_front().unwrap()[0] - 1);
+            let message =
+                Message::with_prefix(bytes::Bytes::from(vec![broker as u8 + 1; 16]), message);
+            messages.push((to, group, message));
+            Ok(())
+        });
+        assert!(result.is_pending(), "scheduler stopped: {result:?}");
+        if broker == 0
+            && let Some(held) = held.as_deref_mut()
+        {
+            held.extend(
+                jobs(controller)
+                    .into_iter()
+                    .filter(|id| !before.contains(id)),
+            );
+        }
+    }
+    for (to, group, message) in messages {
+        shards[to].receive(group, &message, now).unwrap();
+    }
+    settle(controller, held.as_deref().map_or(&[], Vec::as_slice));
+}
+
 fn close_set(controller: &mut Controller, actors: PartitionActors) {
     let mut closing = std::pin::pin!(actors.shutdown());
     for _ in 0..10000 {

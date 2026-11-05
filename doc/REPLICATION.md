@@ -104,10 +104,11 @@ progress times out. Storage stalls when an admitted write stays undurable,
 or when a journal command, such as a sync or maintenance step, is pending
 and the shard's storage lane completes no job for the primary timeout; such
 a command can hold new writes back. A long command whose jobs complete is
-not a stall. A suspicious leader stops heartbeats. In an election, a
-nonvoting recovery request from the view's primary is suspicion too: that
-primary cannot install its view. A restart's retained-history probe still
-votes and is not suspicion.
+not a stall, nor is one that completes a job after the timeout passed. A
+suspicious leader stops heartbeats. In an election, a nonvoting recovery
+request from the view's primary is suspicion too: that primary cannot
+install its view. A restart's retained-history probe still votes and is
+not suspicion.
 
 | Step | Gate |
 | --- | --- |

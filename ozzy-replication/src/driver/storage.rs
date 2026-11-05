@@ -23,6 +23,17 @@ impl ReplicaDriver {
         Ok(())
     }
 
+    /// Busy storage completed nothing for the primary timeout, so the normal
+    /// role suspects it. The next completed job changes what `poll` does.
+    pub fn storage_stalled(&self) -> bool {
+        matches!(self.role, Role::Normal(_)) && self.storage_timed_out()
+    }
+
+    pub(super) fn storage_timed_out(&self) -> bool {
+        self.storage_busy_since
+            .is_some_and(|since| self.now >= since.saturating_add(self.timing.primary_timeout))
+    }
+
     /// Observe actual durable publication of the exact outstanding promise.
     pub fn complete_promise(&mut self, ticket: PromiseTicket) -> Result<(), DriverError> {
         self.changing()?.complete_promise(ticket)?;

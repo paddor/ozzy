@@ -445,4 +445,7 @@ impl ScheduledReplica {
     pub(super) fn next_deadline(&self, now: Duration) -> Option<Duration> {
         self.actor.next_deadline(now)
     }
+    pub(super) fn storage_moved(&self) -> Option<bool> {
+        self.actor.storage_moved()
+    }
 }

@@ -1,7 +1,8 @@
 //! Which partitions a shard visits: the one wake path of each partition.
 //! Storage results, submitted proposals, and input wake their own partition;
-//! each visit reports the partition's next timer. A safety sweep visits every
-//! partition once per interval and counts the work only it found.
+//! each visit reports the partition's next timer, and whether its role
+//! waits for the storage lane to complete any job. A safety sweep visits
+//! every partition once per interval and counts the work only it found.
 
 use super::woken::{Visiting, Woken};
 use super::{PartitionActors, PartitionError};
@@ -36,6 +37,9 @@ pub(super) struct Wakeups {
     refused: Vec<bool>,
     /// Each partition's next timer, as of its last visit.
     deadlines: Vec<Option<Duration>>,
+    /// The partition's role suspected stalled storage at its last visit.
+    /// The lane completing a job, for any partition, ends that.
+    stalled: Vec<bool>,
     sweep: Duration,
     swept: Option<Duration>,
     /// Visits where only the sweep found progress: missed wakeups.
@@ -55,6 +59,7 @@ impl Wakeups {
             wakers: woken.iter().cloned().map(Waker::from).collect(),
             refused: vec![false; slots],
             deadlines: vec![None; slots],
+            stalled: vec![false; slots],
             woken,
             shard,
             sweep,
@@ -165,7 +170,7 @@ impl PartitionActors {
         let mut again = false;
         for offset in 0..count {
             let slot = (first + offset) % count;
-            let due = wakeups.due(slot, now);
+            let due = wakeups.due(slot, now) || (wakeups.stalled[slot] && self.storage_moved(slot));
             if !(sweep || due) {
                 continue;
             }
@@ -193,10 +198,22 @@ impl PartitionActors {
                 Err(error) => return (wakeups, Err(error)),
             }
         }
+        // A visit above can complete a job after the scan passed a
+        // partition that waits for one.
+        for slot in 0..count {
+            if wakeups.stalled[slot] && self.storage_moved(slot) {
+                wakeups.woken[slot].keep();
+                again = true;
+            }
+        }
         if again {
             cx.waker().wake_by_ref();
         }
         (wakeups, Ok(()))
+    }
+
+    fn storage_moved(&self, slot: usize) -> bool {
+        self.actors[slot].storage_moved() == Some(true)
     }
 
     /// Visit a partition under its own waker, then record its next timer.
@@ -239,6 +256,7 @@ impl PartitionActors {
         drop(visiting);
         wakeups.refused[slot] = refused;
         wakeups.deadlines[slot] = self.slot_deadline(slot, now);
+        wakeups.stalled[slot] = self.actors[slot].storage_moved().is_some();
         visited
     }
 

@@ -298,6 +298,8 @@ On the SDK:
   wakes itself, instead of waiting for later turns.
 - Freed reply slots and returned port capacity wake the shard only after a
   send was refused.
+- A partition whose leader suspects stalled storage wakes when the shard's
+  storage lane completes any job, also one of another partition.
 - A periodic safety sweep visits every partition. Work that only the sweep
   finds counts as `partition_sweep_progress`; a nonzero value means a missed
   wakeup.
