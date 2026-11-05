@@ -6,6 +6,7 @@
 
 mod setup;
 
+pub(crate) use setup::{DEDUP_GROUP, DEDUP_WINDOW, PRODUCER_IDLE};
 use setup::{actor_config, generation, journal_clock, journal_config, lanes, readers, services};
 
 use crate::{
@@ -76,13 +77,47 @@ const CLOCK_WAKE: u64 = 100;
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Shape {
     pub partitions: usize,
-    /// Clock-driven decisions wait for the clock guard. Off only in the
-    /// negative control.
-    pub guarded: bool,
+    /// The safeguard a negative control turns off, if any.
+    pub control: Control,
     pub max_segments: usize,
     pub segment_bytes: u64,
     pub sparse: bool,
 }
+/// A negative control: one safeguard off, so the checks must fail.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum Control {
+    #[default]
+    None,
+    /// Clock-driven decisions skip the clock guard.
+    Unguarded,
+    /// The dedup partition stores every resend.
+    NoDedup,
+    /// Producer sessions retire after a sixth of `PRODUCER_IDLE`.
+    EarlyIdle,
+}
+
+impl Shape {
+    /// Clock-driven decisions wait for the clock guard.
+    pub(crate) fn guarded(self) -> bool {
+        self.control != Control::Unguarded
+    }
+
+    /// The dedup partition deduplicates.
+    pub(crate) fn dedup(self) -> bool {
+        self.control != Control::NoDedup
+    }
+
+    /// When the dedup partition retires an idle producer session.
+    pub(crate) fn idle(self) -> Duration {
+        let millis = if self.control == Control::EarlyIdle {
+            PRODUCER_IDLE / 6
+        } else {
+            PRODUCER_IDLE
+        };
+        Duration::from_millis(millis)
+    }
+}
+
 /// Partition visits per shard poll and polls per broker per tick.
 const TURN_ACTORS: usize = 16;
 const POLL_BUDGET: usize = 1000;
@@ -116,6 +151,8 @@ pub(crate) struct Broker {
     pub index: usize,
     /// Restarts so far.
     pub incarnation: u64,
+    /// What each start builds.
+    shape: Shape,
     pub shard: PartitionActors,
     pub disk: Disk,
     pub inbox: Inbox,
@@ -254,7 +291,7 @@ impl Broker {
             let journal = owner
                 .into_shard_journal(
                     ShardJournalConfig::default(),
-                    journal_clock(&host, shape.guarded.then_some(&trust)),
+                    journal_clock(&host, shape.guarded().then_some(&trust)),
                 )
                 .map_err(|error| format!("broker {index}: journal: {error}"))?;
             // One ID namespace per actor startup.
@@ -280,7 +317,7 @@ impl Broker {
             if group == 0 {
                 lanes_out = lanes(&mut actor, clients)?;
             }
-            services_out.push(services(&mut actor, index, group)?);
+            services_out.push(services(&mut actor, index, group, shape)?);
             actors.push(actor);
         }
         let mut shard = PartitionActors::new(actors, GROUPS.len(), TURN_ACTORS)
@@ -307,6 +344,7 @@ impl Broker {
         let broker = Self {
             index,
             incarnation,
+            shape,
             shard,
             disk,
             inbox: Inbox::default(),
@@ -462,7 +500,7 @@ impl Broker {
             } else {
                 None
             };
-            let (bootstrap, intake) = services(actor, index, slot)?;
+            let (bootstrap, intake) = services(actor, index, slot, self.shape)?;
             self.shard
                 .install_native(intake, self.links.clone())
                 .map_err(failure)?;

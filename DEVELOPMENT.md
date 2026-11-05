@@ -116,7 +116,7 @@ system tests in that slice.
 | --- | --- | --- | --- |
 | Unit and core | Codecs, state transitions, bounds, authority fences | `src/` and `tests/` of `ozzy-proto`, `ozzy-core`, `ozzy-journal`, `ozzy-journal-segment`, `ozzy-replication`, `ozzy-config` | `default` |
 | Core simulation | Replayable protocol fault schedules with gated time, messages, and file jobs | `ozzy-sim/tests/` | `default`; `stress` in `extended` |
-| Seeded actor cluster | Production partition shards of three brokers, each with two partitions on one device, on one thread from one seed: link, disk, client, and clock faults, scripted leader loss, power loss and restart, per-tick history checks, record, release, and read checks, convergence, missed wakeups | `ozzy-sim/tests/actor_cluster/` | `default`; seed campaign in `extended` |
+| Seeded actor cluster | Production partition shards of three brokers, each with two partitions on one device, on one thread from one seed: link, disk, client, and clock faults, scripted leader loss, power loss and restart, per-tick history checks, record, release, dedup, idle expiry, and read checks, convergence, missed wakeups | `ozzy-sim/tests/actor_cluster/` | `default`; seed campaign in `extended` |
 | Inproc integration | Real SDKs and brokers over OMQ inproc and memory file jobs; owner lifecycle | `ozzy-broker/tests/journals/serving/`, `ozzy-sim/tests/broker/` | `default`; `stress` in `extended` |
 | Full-product simulator | Sustained workload and fault churn over real owners, SDKs, and brokers | `ozzy-sim` `ozzy_sim` binary | Short gate in `default`; long runs manual |
 | Backend conformance | The same owned file operations on the pool and AIO backends | `ozzy-io-pool/tests/`, `ozzy-io-aio/tests/` | `default` |
@@ -284,13 +284,21 @@ reader service, then its live topic, merged by the production `LiveCursor`.
 A live copy goes only to a consumer the broker's reader grants admit and
 drops on a full queue or by the profile's PUB loss; a gap holds it and
 replays up to it. A leader change or silence replays from the next offset
-again. A third of the batches are scheduled, each record due between
-0.5 s ago and 3 s ahead. Every confirmation and delivery goes through one
+again. The first partition has delay: a third of its batches are
+scheduled, each record due between 0.5 s ago and 3 s ahead. The second
+deduplicates within 5 s, as no topic does both, and retires producer
+sessions idle for 3 s. Its producers sometimes restart with a batch in
+flight, resuming and fencing a new epoch as the SDK takeover does, and send
+the batch again from sequence zero; some pause for 1.5 to 4.5 s and resume
+a fresh epoch after NACK 6. Every confirmation and delivery goes through one
 ledger per partition: one offset and schedule sequence per record, one
 record per offset and schedule sequence, each producer's unscheduled
-records in sequence order, scheduled ones released in order of due time,
-then schedule sequence, never more than the tolerance early by true time,
-and payloads as sent. At the end the consumers
+records in order, scheduled ones released in order of due time, then
+schedule sequence, never more than the tolerance early by true time, and
+payloads as sent. A resend found stored names the original offset; a second
+offset is allowed only once the window, less twice the largest host clock
+offset so far, passed since the first send. No session retires before its
+idle time, less that slack, since it surely last changed. At the end the consumers
 must have read every copy's whole log, every confirmed record among it,
 scheduled ones too, and an unconfirmed record only from a batch whose
 outcome stayed unknown.
@@ -301,7 +309,10 @@ seconds; campaigns run every scenario over both. In the negative control
 `rewound_disks_fail_the_run`, every disk restarts from a copy taken 5 s
 before a power loss, and the checks must fail; in
 `unguarded_skewed_leader_releases_early`, the skewed leader decides without
-the guard and must be caught releasing early.
+the guard and must be caught releasing early; in
+`partition_without_dedup_stores_resends_twice` a restart's resend must be
+caught at a second offset; in `early_idle_expiry_fails_the_run` sessions
+retire after 0.5 s and must be caught.
 
 A failing seed prints its parameters, schedule hash, and this command with
 `OZZY_ACTOR_SIM_SEED`, `OZZY_ACTOR_SIM_PROFILE`,

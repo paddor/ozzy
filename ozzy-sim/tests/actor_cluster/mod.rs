@@ -28,7 +28,7 @@ mod seeds;
 mod sim;
 mod workload;
 
-use broker::{GROUPS, MAX_SEGMENTS, SEGMENT_BYTES};
+use broker::{Control, GROUPS, MAX_SEGMENTS, SEGMENT_BYTES};
 use network::Profile;
 use sim::{
     Fault::{
@@ -55,8 +55,8 @@ struct Scenario {
     records: bool,
     /// Random overlapping faults.
     chaos: bool,
-    /// Clock-driven decisions wait for the clock guard.
-    guarded: bool,
+    /// The safeguard a negative control turns off, if any.
+    control: Control,
     /// Caps the profile's floors for confirmed proposals, records, and
     /// compared ops, where a full journal bounds them.
     max_floor: usize,
@@ -76,7 +76,7 @@ const RANDOM: Scenario = Scenario {
     slow: &[],
     records: true,
     chaos: false,
-    guarded: true,
+    control: Control::None,
     max_floor: usize::MAX,
     max_record_floor: usize::MAX,
     min_applied: 0,
@@ -280,7 +280,19 @@ fn scenario(name: &str) -> Option<Scenario> {
         // records before they are due, and the run must fail.
         "skew-unguarded" => Scenario {
             script: &[SKEWED_LEADER],
-            guarded: false,
+            control: Control::Unguarded,
+            ..RANDOM
+        },
+        // Negative control: the dedup partition stores what producers send
+        // again after a restart, and the run must fail.
+        "dedup-off" => Scenario {
+            control: Control::NoDedup,
+            ..RANDOM
+        },
+        // Negative control: producer sessions retire after 0.5 s instead of
+        // 3 s, and the run must fail.
+        "idle-early" => Scenario {
+            control: Control::EarlyIdle,
             ..RANDOM
         },
         // Negative control: every disk loses the last 5 s it reported done.
@@ -372,7 +384,7 @@ fn options(profile: &str, scenario: &str, partitions: usize) -> Options {
         slow: scenario.slow,
         records: scenario.records,
         chaos: scenario.chaos,
-        guarded: scenario.guarded,
+        control: scenario.control,
         min_confirmed: floor,
         min_records: floor.min(scenario.max_record_floor),
         min_compared: floor as u64,
@@ -415,13 +427,18 @@ fn outcome(seed: u64, profile: &str, scenario: &str, partitions: usize) -> Repor
 
 /// Run one seed on one partition that must fail; returns why.
 fn failure(seed: u64, profile: &str, scenario: &str) -> String {
+    failure_on(1, seed, profile, scenario)
+}
+
+/// As `failure`, on `partitions` partitions.
+fn failure_on(partitions: usize, seed: u64, profile: &str, scenario: &str) -> String {
     let swarm = seeds::Seeds::derive(seed).swarm;
     let parameters = Profile::named(profile, swarm).expect("known profile");
-    match sim::run(seed, parameters, options(profile, scenario, 1)) {
+    match sim::run(seed, parameters, options(profile, scenario, partitions)) {
         Ok(report) => panic!(
             "actor cluster seed {seed} profile {profile} scenario {scenario} passed: {report:?}\n\
              reproduce: {}",
-            reproduce(seed, profile, scenario, 1)
+            reproduce(seed, profile, scenario, partitions)
         ),
         Err(failure) => failure.reason,
     }
@@ -455,6 +472,12 @@ fn quiet_network_confirms_and_converges() {
     // Consumers went live and read most records from the live topic.
     assert!(
         report.cancels >= 1 && report.live * 4 >= report.records as u64,
+        "{report:?}"
+    );
+    // Dedup producers restarted with batches in flight and found them
+    // stored, and some sessions retired while their producers paused.
+    assert!(
+        report.restarts >= 1 && report.duplicates >= 1 && report.retired >= 1,
         "{report:?}"
     );
     eprintln!("{report:?}");
@@ -624,6 +647,25 @@ fn skewed_leader_holds_releases_until_its_clock_agrees() {
 fn unguarded_skewed_leader_releases_early() {
     let reason = failure(1, "none", "skew-unguarded");
     assert!(reason.contains("before its due time"), "{reason}");
+}
+
+/// Negative control: a partition without dedup stores a restarted
+/// producer's resend again, and the checks must notice.
+#[test]
+fn partition_without_dedup_stores_resends_twice() {
+    let reason = failure_on(GROUPS.len(), 1, "none", "dedup-off");
+    assert!(reason.contains("seen at"), "{reason}");
+}
+
+/// Negative control: producer sessions retire after a sixth of their idle
+/// time, and the checks must notice.
+#[test]
+fn early_idle_expiry_fails_the_run() {
+    let reason = failure_on(GROUPS.len(), 1, "none", "idle-early");
+    assert!(
+        reason.contains("after the session last changed"),
+        "{reason}"
+    );
 }
 
 /// Negative control: every disk loses what it reported done in the last 5 s.

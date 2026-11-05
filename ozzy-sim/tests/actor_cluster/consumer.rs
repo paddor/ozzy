@@ -531,7 +531,7 @@ fn deliver(
         })?;
         if !producers.sent(producer, sequence) {
             return Err(format!(
-                "consumer {index}: offset {offset} holds producer {producer} sequence \
+                "consumer {index}: offset {offset} holds producer {producer} record \
                  {sequence}, which it never sent"
             ));
         }
@@ -540,6 +540,7 @@ fn deliver(
             sequence,
             offset,
             producers.due(producer, sequence),
+            producers.repeat_from(producer, sequence),
             clock::wall_millis(now),
         )?;
         consumer.next += 1;

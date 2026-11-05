@@ -6,15 +6,27 @@
 //! A third of the batches are scheduled, each record due between 0.5 s ago
 //! and 3 s ahead by true time; their confirmations carry schedule sequences.
 //!
+//! The dedup partition takes no due times. Its producers sometimes restart
+//! with a batch in flight, as the SDK takeover does: resume, fence a new
+//! epoch, and send the batch again from sequence zero. Some pause around
+//! the idle expiry; NACK 6 then makes them resume a fresh epoch. Each epoch
+//! maps its sequences onto logical record numbers, which the message ID and
+//! body carry.
+//!
 //! Every confirmation goes to the `Ledger`, stale ones too: two records at
 //! one offset or schedule sequence, one record at two, or a producer's
-//! unscheduled records out of order fail the run. Scheduled records release
-//! in order of due time, then schedule sequence, and never before their due
-//! time minus the clock tolerance. At the end, every copy's log must hold
-//! exactly the confirmed records, at offsets from zero without a gap.
+//! unscheduled records out of order fail the run. A `Duplicate` names the
+//! original's offset. Scheduled records release in order of due time, then
+//! schedule sequence, and never before their due time minus the clock
+//! tolerance. A session retires only after its idle time, less the clock
+//! slack. At the end, every copy's log must hold exactly the confirmed
+//! records, at offsets from zero without a gap.
+
+mod ledger;
+pub(crate) use ledger::Ledger;
 
 use crate::{
-    broker::{Broker, CLOCK_TOLERANCE, GROUPS, PARTITIONS},
+    broker::{Broker, DEDUP_GROUP, DEDUP_WINDOW, GROUPS, PARTITIONS, PRODUCER_IDLE},
     clock,
     network::{BROKERS, node},
     seeds::{Rng, Trace},
@@ -60,13 +72,32 @@ const SPAN: u64 = 3500;
 const TIMEOUT: u64 = 300;
 const RESEND: u64 = 100;
 const REDIRECT: u64 = 10;
+/// Per tick with an APPEND out, the chance that a dedup partition's
+/// producer restarts.
+const RESTART: f64 = 1.0 / 150.0;
+/// After a batch, the chance that a dedup partition's producer pauses, for
+/// half to one and a half times the idle expiry.
+const PAUSE: f64 = 1.0 / 50.0;
+/// NACK code of a fenced or unknown session.
+const FENCED: u16 = 6;
 /// The first byte of every producer node ID.
 const NODE: u8 = 0xc0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
-    Open,
+    /// Resume the session, or open epoch one.
+    Resume,
+    /// Fence a new epoch over this one.
+    Fence(u64),
     Append,
+}
+
+/// One batch's first send, and whether a later epoch sent it again.
+#[derive(Debug, Clone, Copy)]
+struct Batch {
+    sent: u64,
+    epoch: u64,
+    resent: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -81,9 +112,21 @@ struct Producer {
     phase: Phase,
     /// Writer fence once opened.
     epoch: u64,
-    /// First sequence of the current batch.
+    /// Logical record number of sequence zero in each epoch.
+    bases: BTreeMap<u64, u64>,
+    /// The current open, reused by its resends, and its first send.
+    operation: u64,
+    open_sent: Option<u64>,
+    /// A restart: fence a new epoch once resumed.
+    takeover: bool,
+    /// The latest tick the session surely changed after: the first send of
+    /// a batch it confirmed, or of an open that made its epoch.
+    changed: u64,
+    /// Every batch so far, by its first record.
+    batches: BTreeMap<u64, Batch>,
+    /// First record of the current batch.
     first: u64,
-    /// Sequences of the current batch confirmed so far.
+    /// Records of the current batch confirmed so far.
     done: [bool; RECORDS as usize],
     /// An attempt at the current batch has an unknown outcome, so the batch
     /// may be stored. A refusal says nothing about earlier attempts.
@@ -92,11 +135,11 @@ struct Producer {
     /// refuses its resends for good, so the batch stays unknown.
     drain_refusals: u32,
     abandoned: bool,
-    /// End of every sequence sent so far.
+    /// End of every record sent so far.
     sent_end: u64,
     /// Due times of the current batch, when it is scheduled.
     due: Option<[u64; RECORDS as usize]>,
-    /// Due time of every scheduled sequence so far.
+    /// Due time of every scheduled record so far.
     scheduled: BTreeMap<u64, u64>,
     target: usize,
     /// The newest view any reply or hint named.
@@ -115,262 +158,11 @@ pub(crate) struct Counts {
     pub redirects: u64,
     pub backoffs: u64,
     pub ignored: u64,
-}
-
-/// What one offset holds, as confirmations and reads saw it.
-#[derive(Debug, Clone, Copy)]
-struct Entry {
-    record: (usize, u64),
-    confirmed: bool,
-    read: bool,
-}
-
-/// Every confirmed and every read record, checked as it arrives: one
-/// offset and schedule sequence per record, one record per offset and
-/// schedule sequence, and each producer's unscheduled records in sequence
-/// order.
-#[derive(Debug, Default)]
-pub(crate) struct Ledger {
-    /// Offset of each record, by producer and sequence, and whether it was
-    /// scheduled.
-    records: BTreeMap<(usize, u64), (u64, bool)>,
-    offsets: BTreeMap<u64, Entry>,
-    confirmed: usize,
-    /// Schedule sequence of each confirmed scheduled record, and the reverse.
-    schedules: BTreeMap<(usize, u64), u64>,
-    scheduled: BTreeMap<u64, (usize, u64)>,
-}
-
-impl Ledger {
-    /// Distinct confirmed records.
-    pub(crate) fn len(&self) -> usize {
-        self.confirmed + self.schedules.len()
-    }
-
-    /// Confirmed scheduled records.
-    pub(crate) fn scheduled(&self) -> usize {
-        self.schedules.len()
-    }
-
-    /// Every confirmed scheduled record was read.
-    pub(crate) fn released(&self) -> bool {
-        self.schedules
-            .keys()
-            .all(|record| self.records.contains_key(record))
-    }
-
-    fn confirm(
-        &mut self,
-        producer: usize,
-        sequences: std::ops::Range<u64>,
-        first_offset: u64,
-    ) -> Result<(), String> {
-        for sequence in sequences.clone() {
-            let offset = first_offset + (sequence - sequences.start);
-            self.note(producer, sequence, offset, true, false)?;
-        }
-        Ok(())
-    }
-
-    /// Records held until due, confirmed with schedule sequences from
-    /// `first_schedule`.
-    fn schedule(
-        &mut self,
-        producer: usize,
-        sequences: std::ops::Range<u64>,
-        first_schedule: u64,
-    ) -> Result<(), String> {
-        for sequence in sequences.clone() {
-            let schedule = first_schedule + (sequence - sequences.start);
-            let record = (producer, sequence);
-            if let Some(&old) = self.schedules.get(&record)
-                && old != schedule
-            {
-                return Err(format!(
-                    "producer {producer} sequence {sequence} scheduled as {schedule}, as {old} \
-                     before"
-                ));
-            }
-            if let Some(&other) = self.scheduled.get(&schedule)
-                && other != record
-            {
-                return Err(format!(
-                    "schedule sequence {schedule} confirmed for producer {producer} sequence \
-                     {sequence}, for {other:?} before"
-                ));
-            }
-            self.schedules.insert(record, schedule);
-            self.scheduled.insert(schedule, record);
-        }
-        Ok(())
-    }
-
-    /// A consumer read producer `producer`'s record `sequence` at `offset`
-    /// at true time `wall`. A scheduled record, due at `due`, released at
-    /// most the clock tolerance early.
-    pub(crate) fn read(
-        &mut self,
-        producer: usize,
-        sequence: u64,
-        offset: u64,
-        due: Option<u64>,
-        wall: u64,
-    ) -> Result<(), String> {
-        if let Some(due) = due
-            && due > wall + CLOCK_TOLERANCE
-        {
-            return Err(format!(
-                "producer {producer} sequence {sequence} read at offset {offset} {} ms before \
-                 its due time",
-                due - wall
-            ));
-        }
-        self.note(producer, sequence, offset, false, due.is_some())
-    }
-
-    fn note(
-        &mut self,
-        producer: usize,
-        sequence: u64,
-        offset: u64,
-        confirmed: bool,
-        scheduled: bool,
-    ) -> Result<(), String> {
-        let how = if confirmed { "confirmed" } else { "read" };
-        if let Some(&(old, _)) = self.records.get(&(producer, sequence))
-            && old != offset
-        {
-            return Err(format!(
-                "producer {producer} sequence {sequence} {how} at offset {offset}, seen at {old} \
-                 before"
-            ));
-        }
-        if let Some(entry) = self.offsets.get(&offset)
-            && entry.record != (producer, sequence)
-        {
-            return Err(format!(
-                "offset {offset} {how} for producer {producer} sequence {sequence}, seen with {:?} \
-                 before",
-                entry.record
-            ));
-        }
-        // One producer's unscheduled records keep their sequence order.
-        let unscheduled = |(_, (_, scheduled)): &(&(usize, u64), &(u64, bool))| !*scheduled;
-        let before = self
-            .records
-            .range((producer, 0)..(producer, sequence))
-            .rev()
-            .find(unscheduled);
-        let after = self
-            .records
-            .range((producer, sequence + 1)..(producer + 1, 0))
-            .find(unscheduled);
-        if !scheduled
-            && (before.is_some_and(|(_, &(earlier, _))| earlier >= offset)
-                || after.is_some_and(|(_, &(later, _))| later <= offset))
-        {
-            return Err(format!(
-                "producer {producer} sequence {sequence} {how} at offset {offset}, out of order \
-                 with {before:?} and {after:?}"
-            ));
-        }
-        self.records
-            .insert((producer, sequence), (offset, scheduled));
-        let entry = self.offsets.entry(offset).or_insert(Entry {
-            record: (producer, sequence),
-            confirmed: false,
-            read: false,
-        });
-        if confirmed && !entry.confirmed {
-            self.confirmed += 1;
-        }
-        entry.confirmed |= confirmed;
-        entry.read |= !confirmed;
-        Ok(())
-    }
-
-    /// At the end, on a copy whose log ends at `end`: consumers read every
-    /// offset below it, each confirmed record is among them, scheduled ones
-    /// in release order, and a record nobody confirmed comes from a batch
-    /// whose outcome stayed unknown.
-    pub(crate) fn check_log(
-        &self,
-        broker: usize,
-        end: u64,
-        read_through: u64,
-        producers: &Producers,
-    ) -> Result<(), String> {
-        if let Some((&offset, entry)) = self.offsets.range(end..).next() {
-            return Err(format!(
-                "broker {broker}: log ends at offset {end}, but offset {offset} holds {:?} \
-                 (confirmed {}, read {})",
-                entry.record, entry.confirmed, entry.read
-            ));
-        }
-        if read_through != end {
-            return Err(format!(
-                "broker {broker}: log ends at offset {end}, consumers read through {read_through}"
-            ));
-        }
-        if self.offsets.len() as u64 != end {
-            return Err(format!(
-                "broker {broker}: log ends at offset {end}, but {} offsets were seen",
-                self.offsets.len()
-            ));
-        }
-        for (&offset, entry) in &self.offsets {
-            let (producer, sequence) = entry.record;
-            if !entry.read {
-                return Err(format!(
-                    "broker {broker}: confirmed offset {offset} was never read"
-                ));
-            }
-            let confirmed = entry.confirmed || self.schedules.contains_key(&entry.record);
-            if !confirmed && !producers.may_hold(producer, sequence) {
-                return Err(format!(
-                    "broker {broker}: offset {offset} holds producer {producer} sequence \
-                     {sequence}, never confirmed though its batch was settled"
-                ));
-            }
-        }
-        self.check_releases(broker, producers)
-    }
-
-    /// Every confirmed scheduled record was released, in order of due time,
-    /// then schedule sequence: a later schedule sequence that is due no
-    /// later never releases first. Acceptance times only grow with the
-    /// schedule sequence, so they cannot reverse that.
-    fn check_releases(&self, broker: usize, producers: &Producers) -> Result<(), String> {
-        let mut released = Vec::new();
-        for (&(producer, sequence), &schedule) in &self.schedules {
-            let Some(&(offset, _)) = self.records.get(&(producer, sequence)) else {
-                return Err(format!(
-                    "broker {broker}: producer {producer} sequence {sequence}, confirmed as \
-                     schedule {schedule}, was never released"
-                ));
-            };
-            let due = producers.due(producer, sequence).ok_or_else(|| {
-                format!("producer {producer} sequence {sequence} has no due time")
-            })?;
-            released.push((offset, due, schedule));
-        }
-        released.sort_unstable();
-        for (at, &(offset, due, schedule)) in released.iter().enumerate() {
-            if let Some(&(later, later_due, later_schedule)) =
-                released[at + 1..]
-                    .iter()
-                    .find(|(_, later_due, later_schedule)| {
-                        *later_schedule < schedule && *later_due <= due
-                    })
-            {
-                return Err(format!(
-                    "broker {broker}: schedule {later_schedule} due {later_due} released at offset \
-                     {later}, after schedule {schedule} due {due} at offset {offset}"
-                ));
-            }
-        }
-        Ok(())
-    }
+    /// Dedup partition: restarts, sessions found retired, and records a
+    /// confirmation found stored before.
+    pub restarts: u64,
+    pub retired: u64,
+    pub duplicates: u64,
 }
 
 #[derive(Debug)]
@@ -380,6 +172,9 @@ pub(crate) struct Producers {
     rng: Rng,
     /// No new batches: finish the current ones.
     draining: bool,
+    /// The largest host clock offset so far, in milliseconds. Stamps of a
+    /// stepped leader stay, so time windows may close this much early.
+    slack: u64,
     pub counts: Counts,
 }
 
@@ -388,8 +183,14 @@ impl Producers {
         let mut producers = Self {
             writers: (0..PER_PARTITION * partitions)
                 .map(|index| Producer {
-                    phase: Phase::Open,
+                    phase: Phase::Resume,
                     epoch: 0,
+                    bases: BTreeMap::new(),
+                    operation: 0,
+                    open_sent: None,
+                    takeover: false,
+                    changed: 0,
+                    batches: BTreeMap::new(),
                     first: 0,
                     done: [false; RECORDS as usize],
                     uncertain: false,
@@ -408,12 +209,42 @@ impl Producers {
             partitions,
             rng: Rng::new(seed),
             draining: false,
+            slack: 0,
             counts: Counts::default(),
         };
-        for producer in &mut producers.writers {
-            plan(&mut producers.rng, producer, 0);
+        for (index, producer) in producers.writers.iter_mut().enumerate() {
+            plan(
+                &mut producers.rng,
+                producer,
+                0,
+                index % partitions != DEDUP_GROUP,
+            );
         }
         producers
+    }
+
+    /// Whether producer `index` writes the dedup partition.
+    fn dedup(&self, index: usize) -> bool {
+        self.partitions > DEDUP_GROUP && index % self.partitions == DEDUP_GROUP
+    }
+
+    /// A host clock is `offset` milliseconds from true time.
+    pub(crate) fn clock_offset(&mut self, offset: u64) {
+        self.slack = self.slack.max(offset);
+    }
+
+    /// The true time from which producer `producer`'s record `record` may
+    /// take a second offset: a later epoch sent its batch again on the dedup
+    /// partition, and the window has passed since the first send.
+    pub(crate) fn repeat_from(&self, producer: usize, record: u64) -> Option<u64> {
+        let batch = self.writers[producer]
+            .batches
+            .get(&(record - record % RECORDS))?;
+        (batch.resent && self.dedup(producer)).then(|| {
+            wall(batch.sent)
+                .saturating_add(DEDUP_WINDOW)
+                .saturating_sub(2 * self.slack)
+        })
     }
 
     /// The due time of producer `producer`'s record `sequence`, if scheduled.
@@ -459,11 +290,28 @@ impl Producers {
                 // gone silent. Resend the same identity elsewhere.
                 self.counts.timeouts += 1;
                 producer.pending = None;
-                producer.uncertain = producer.phase == Phase::Append;
+                producer.uncertain |= producer.phase == Phase::Append;
                 producer.target = other(&mut self.rng, request.broker);
                 producer.next_at = tick;
             }
+            let dedup = self.dedup(index);
             let producer = &mut self.writers[index];
+            // As the SDK takeover after a process restart: the batch in
+            // flight may be stored, so it goes again under a new epoch.
+            if submit
+                && dedup
+                && producer.phase == Phase::Append
+                && producer.pending.is_some()
+                && self.rng.chance(RESTART)
+            {
+                self.counts.restarts += 1;
+                producer.pending = None;
+                producer.uncertain = true;
+                producer.done = [false; RECORDS as usize];
+                producer.takeover = true;
+                producer.reopen(Phase::Resume);
+                producer.next_at = tick;
+            }
             if producer.pending.is_some()
                 || producer.abandoned
                 || tick < producer.next_at
@@ -503,17 +351,22 @@ impl Producers {
         let mut metadata = Vec::with_capacity(LIMITS.envelope.max_metadata_bytes);
         let mut payload = Vec::with_capacity(LIMITS.envelope.max_payload_bytes);
         let header = match producer.phase {
-            Phase::Open => {
+            phase @ (Phase::Resume | Phase::Fence(_)) => {
                 self.counts.opens += 1;
+                producer.open_sent.get_or_insert(tick);
+                let (mode, expected_epoch) = match phase {
+                    Phase::Fence(epoch) => (Mode::Fence, Some(epoch)),
+                    _ => (Mode::Resume, None),
+                };
                 producer::encode_open(
                     envelope(Opcode::OpenProducer),
                     Open {
                         authority,
                         partition: PARTITIONS[partition],
                         producer: producer_id(index),
-                        mode: Mode::Resume,
-                        expected_epoch: None,
-                        operation: OperationId::from_bytes([NODE + index as u8; 16]),
+                        mode,
+                        expected_epoch,
+                        operation: operation_id(index, producer.operation),
                     },
                     &mut metadata,
                     LIMITS.envelope,
@@ -523,6 +376,14 @@ impl Producers {
             Phase::Append => {
                 self.counts.appends += 1;
                 producer.sent_end = producer.sent_end.max(producer.first + RECORDS);
+                let epoch = producer.epoch;
+                let batch = producer.batches.entry(producer.first).or_insert(Batch {
+                    sent: tick,
+                    epoch,
+                    resent: false,
+                });
+                batch.resent |= batch.epoch != epoch;
+                let first_sequence = producer.first - producer.bases[&epoch];
                 let bodies: Vec<[u8; 16]> = (producer.first..producer.first + RECORDS)
                     .map(|sequence| body(index, sequence))
                     .collect();
@@ -545,7 +406,7 @@ impl Producers {
                         key: AppendKey {
                             producer_id: producer_id(index),
                             producer_epoch: producer.epoch,
-                            first_sequence: producer.first,
+                            first_sequence,
                         },
                         policy: Policy::QuorumDurable,
                         due_millis: producer.due.as_ref().map(|due| &due[..]),
@@ -594,6 +455,7 @@ impl Producers {
         trace: &mut Trace,
     ) -> Result<(), String> {
         let ledger = &mut ledgers[index % self.partitions];
+        let dedup = self.dedup(index);
         let frames: [&[u8]; 3] =
             std::array::from_fn(|frame| message.part_slice(frame + 1).unwrap_or_default());
         let packet = decode_packet(&frames, LIMITS.envelope)
@@ -611,27 +473,54 @@ impl Producers {
                 if key.producer_id != producer_id(index) {
                     return Err(format!("producer {index}: confirmation for {key:?}"));
                 }
-                let sequences = key.first_sequence..confirmed.end_sequence;
+                let base = *self.writers[index]
+                    .bases
+                    .get(&key.producer_epoch)
+                    .ok_or_else(|| format!("producer {index}: confirmation for {key:?}"))?;
+                let records = base + key.first_sequence..base + confirmed.end_sequence;
                 let scheduled = confirmed.disposition == AppendDisposition::Scheduled;
-                if let Some(sequence) = sequences
+                if let Some(record) = records
                     .clone()
-                    .find(|&sequence| self.due(index, sequence).is_some() != scheduled)
+                    .find(|&record| self.due(index, record).is_some() != scheduled)
                 {
                     return Err(format!(
-                        "producer {index}: sequence {sequence} confirmed as {:?}",
+                        "producer {index}: record {record} confirmed as {:?}",
                         confirmed.disposition
                     ));
                 }
-                if scheduled {
-                    ledger.schedule(index, sequences, confirmed.first_offset)?;
-                } else {
-                    ledger.confirm(index, sequences, confirmed.first_offset)?;
+                match confirmed.disposition {
+                    AppendDisposition::Scheduled => {
+                        ledger.schedule(index, records.clone(), confirmed.first_offset)?;
+                    }
+                    AppendDisposition::Duplicate if !dedup => {
+                        return Err(format!(
+                            "producer {index}: {key:?} found stored on a partition without dedup"
+                        ));
+                    }
+                    disposition => {
+                        if disposition == AppendDisposition::Duplicate {
+                            self.counts.duplicates += records.end - records.start;
+                        }
+                        ledger.confirm(
+                            index,
+                            records.clone(),
+                            confirmed.first_offset,
+                            |record| self.repeat_from(index, record),
+                            wall(tick),
+                        )?;
+                    }
                 }
                 let producer = &mut self.writers[index];
                 producer.view = producer.view.max(confirmed.authority.view);
-                if key.producer_epoch == producer.epoch {
-                    for sequence in key.first_sequence..confirmed.end_sequence {
-                        if let Some(done) = sequence
+                // A restarted process never sees its predecessor's replies.
+                if key.producer_epoch == producer.epoch && !producer.takeover {
+                    // It committed after the batch's first send.
+                    let batch = records.start - records.start % RECORDS;
+                    if let Some(batch) = producer.batches.get(&batch) {
+                        producer.changed = producer.changed.max(batch.sent);
+                    }
+                    for record in records {
+                        if let Some(done) = record
                             .checked_sub(producer.first)
                             .and_then(|at| producer.done.get_mut(at as usize))
                         {
@@ -641,39 +530,77 @@ impl Producers {
                 }
                 if producer.done.iter().all(|done| *done) {
                     producer.first += RECORDS;
-                    plan(&mut self.rng, producer, tick);
+                    plan(&mut self.rng, producer, tick, !dedup);
                     producer.done = [false; RECORDS as usize];
                     producer.uncertain = false;
                     producer.drain_refusals = 0;
                     producer.pending = None;
                     producer.next_at = tick + self.rng.below(3);
+                    if dedup && self.rng.chance(PAUSE) {
+                        let idle = ticks(PRODUCER_IDLE);
+                        producer.next_at += idle / 2 + self.rng.below(idle);
+                    }
                 }
             }
             Opcode::ProducerOpened if current => {
                 let opened = producer::decode_opened(packet, LIMITS.envelope)
                     .map_err(|error| format!("producer {index}: opened: {error}"))?;
+                let slack = self.slack;
                 let producer = &mut self.writers[index];
                 producer.view = producer.view.max(opened.authority.view);
-                if producer.epoch != 0 && opened.epoch != producer.epoch {
-                    return Err(format!(
-                        "producer {index}: resumed epoch {} after {}",
-                        opened.epoch, producer.epoch
-                    ));
-                }
-                if opened.next_sequence > producer.first {
-                    // A resend of the current batch would reuse its results.
-                    // Nothing else may have advanced this writer.
-                    if opened.next_sequence > producer.first + RECORDS {
+                let old = producer.epoch;
+                let new = opened.epoch != old;
+                match producer.phase {
+                    Phase::Fence(over) if opened.epoch <= over || opened.next_sequence != 0 => {
                         return Err(format!(
-                            "producer {index}: opened at sequence {}, current batch starts at {}",
-                            opened.next_sequence, producer.first
+                            "producer {index}: fenced epoch {over} into epoch {} at sequence {}",
+                            opened.epoch, opened.next_sequence
                         ));
                     }
+                    Phase::Fence(_) => producer.takeover = false,
+                    // Only a session that retired resumes under a new epoch.
+                    _ if old != 0 && new => {
+                        let idle = (tick - producer.changed) * tick_millis();
+                        if opened.epoch < old
+                            || opened.next_sequence != 0
+                            || idle + 2 * slack < PRODUCER_IDLE
+                        {
+                            return Err(format!(
+                                "producer {index}: resumed epoch {} at sequence {} after epoch \
+                                 {old}, {idle} ms after the session last changed",
+                                opened.epoch, opened.next_sequence
+                            ));
+                        }
+                        self.counts.retired += 1;
+                    }
+                    _ if new && opened.next_sequence != 0 => {
+                        return Err(format!(
+                            "producer {index}: opened epoch {} at sequence {}",
+                            opened.epoch, opened.next_sequence
+                        ));
+                    }
+                    _ => {}
+                }
+                if new {
+                    producer.bases.insert(opened.epoch, producer.first);
+                    producer.changed = producer.changed.max(producer.open_sent.unwrap_or(tick));
+                } else if opened.next_sequence > producer.first - producer.bases[&old] + RECORDS {
+                    // A resend of the current batch would reuse its results.
+                    // Nothing else may have advanced this writer.
+                    return Err(format!(
+                        "producer {index}: opened at sequence {}, current batch starts at \
+                         record {}",
+                        opened.next_sequence, producer.first
+                    ));
                 }
                 producer.epoch = opened.epoch;
-                producer.phase = Phase::Append;
                 producer.pending = None;
                 producer.next_at = tick;
+                if producer.takeover {
+                    producer.reopen(Phase::Fence(opened.epoch));
+                } else {
+                    producer.phase = Phase::Append;
+                }
             }
             Opcode::Nack if current => {
                 let refusal = nack::decode(packet, LIMITS.envelope)
@@ -705,9 +632,15 @@ impl Producers {
                     }
                     RetryClass::UnknownOutcome | RetryClass::AfterReconnect => {
                         self.counts.unknown += 1;
-                        producer.uncertain = producer.phase == Phase::Append;
+                        producer.uncertain |= producer.phase == Phase::Append;
                         producer.target = other(&mut self.rng, broker);
                         producer.next_at = tick + RESEND;
+                    }
+                    // The session retired, or retired between a restart's
+                    // resume and its fence: resume a fresh one.
+                    RetryClass::Permanent if dedup && refusal.code == FENCED => {
+                        producer.reopen(Phase::Resume);
+                        producer.next_at = tick + REDIRECT;
                     }
                     RetryClass::Permanent => {
                         return Err(format!(
@@ -732,7 +665,14 @@ impl Producers {
 impl Producer {
     /// The current batch may be stored but is not fully confirmed yet.
     fn unresolved(&self) -> bool {
-        self.phase == Phase::Append && (self.uncertain || self.done.iter().any(|done| *done))
+        self.uncertain || self.done.iter().any(|done| *done)
+    }
+
+    /// Start a new open, under a new operation ID.
+    fn reopen(&mut self, phase: Phase) {
+        self.phase = phase;
+        self.operation += 1;
+        self.open_sent = None;
     }
 }
 
@@ -779,6 +719,29 @@ fn body(index: usize, sequence: u64) -> [u8; 16] {
     body
 }
 
+/// Producer `index`'s open number `open`.
+fn operation_id(index: usize, open: u64) -> OperationId {
+    let mut bytes = [NODE + index as u8; 16];
+    if open != 0 {
+        bytes[8..].copy_from_slice(&open.to_be_bytes());
+    }
+    OperationId::from_bytes(bytes)
+}
+
+/// True Unix time at `tick`.
+fn wall(tick: u64) -> u64 {
+    clock::wall_millis(clock::TICK * u32::try_from(tick).expect("tick fits u32"))
+}
+
+fn tick_millis() -> u64 {
+    u64::try_from(clock::TICK.as_millis()).expect("tick fits u64")
+}
+
+/// Whole ticks in `millis`.
+fn ticks(millis: u64) -> u64 {
+    millis / tick_millis()
+}
+
 fn request_id(index: usize, attempt: u64) -> RequestId {
     let mut bytes = [NODE + index as u8; 16];
     bytes[8..].copy_from_slice(&attempt.to_be_bytes());
@@ -792,9 +755,9 @@ fn broker_of(primary: NodeId) -> Option<usize> {
 /// A random broker other than `broker`.
 /// Decide whether the batch starting now at `tick` is scheduled, and when
 /// each of its records is due.
-fn plan(rng: &mut Rng, producer: &mut Producer, tick: u64) {
-    let start = clock::wall_millis(clock::TICK * u32::try_from(tick).expect("tick fits u32"));
-    producer.due = rng.chance(SCHEDULED).then(|| {
+fn plan(rng: &mut Rng, producer: &mut Producer, tick: u64, scheduling: bool) {
+    let start = wall(tick);
+    producer.due = (scheduling && rng.chance(SCHEDULED)).then(|| {
         std::array::from_fn(|_| {
             start
                 .checked_add_signed(EARLIEST)

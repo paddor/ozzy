@@ -11,7 +11,7 @@ pub(crate) use script::Fault;
 use ozzy_io::simulation::Image;
 
 use crate::{
-    broker::{Broker, Lane, Shape, session},
+    broker::{Broker, Control, Lane, Shape, session},
     chaos::{self, Chaos, Kind},
     check::{Checker, converged, leader, log_end},
     clock::Clock,
@@ -58,9 +58,8 @@ pub(crate) struct Options {
     pub records: bool,
     /// Random overlapping faults beside the profile's and the script's.
     pub chaos: bool,
-    /// Clock-driven decisions wait for the clock guard. Off only in the
-    /// negative control.
-    pub guarded: bool,
+    /// The safeguard a negative control turns off, if any.
+    pub control: Control,
     /// Vacuity floors: confirmed proposals, confirmed records per partition,
     /// ops two brokers reported, the converged op, and proposals a full
     /// journal refused.
@@ -77,7 +76,7 @@ impl Options {
     fn shape(&self, broker: usize) -> Shape {
         Shape {
             partitions: self.partitions,
-            guarded: self.guarded,
+            control: self.control,
             max_segments: self.max_segments,
             segment_bytes: self.segment_bytes,
             sparse: self.sparse.contains(&broker),
@@ -132,6 +131,12 @@ pub(crate) struct Report {
     /// Live copies consumers read, and replay streams they canceled to go live.
     pub live: u64,
     pub cancels: u64,
+    /// Dedup partition: producer restarts, sessions that retired, records a
+    /// resend found stored, and records stored again after their window.
+    pub restarts: u64,
+    pub retired: u64,
+    pub duplicates: u64,
+    pub repeats: usize,
     /// Visits only the safety sweep found work for within 1 s of a clock
     /// step, before the guard's next look could see it.
     pub clock_wakeups: u64,
@@ -266,6 +271,10 @@ pub(crate) fn run(seed: u64, profile: Profile, options: Options) -> Result<Repor
             scheduled: sim.ledgers.iter().map(Ledger::scheduled).sum(),
             live: sim.consumers.counts.published,
             cancels: sim.consumers.counts.cancels,
+            restarts: sim.producers.counts.restarts,
+            retired: sim.producers.counts.retired,
+            duplicates: sim.producers.counts.duplicates,
+            repeats: sim.ledgers.iter().map(Ledger::repeats).sum(),
             clock_wakeups: sim.clock_wakeups,
             vacuous,
         })
@@ -463,6 +472,10 @@ impl Sim {
             while let Some(message) = self.brokers[broker].publications.pop_front() {
                 self.consumers.publish(&self.brokers[broker], &message);
             }
+        }
+        for broker in &self.brokers {
+            self.producers
+                .clock_offset(broker.host.offset().unsigned_abs());
         }
         self.producers
             .step(tick, submit, &mut self.brokers, &mut self.trace)?;

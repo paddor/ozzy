@@ -25,7 +25,9 @@ use ozzy_runtime::{
         ActorConfig, NativeAccess, NativeIntake, NativeIntakeConfig, PartitionActor,
         SharedReaderConfig, SyncBatchTarget,
     },
-    replica_journal::{ClockReading, DelayLimits, InstallationConfig, OwnedConfig},
+    replica_journal::{
+        ClockReading, DedupLimits, DelayLimits, InstallationConfig, OwnedConfig, dedup_limits,
+    },
     replica_transport::QueueLimits,
 };
 use std::time::Duration;
@@ -33,6 +35,14 @@ use std::time::Duration;
 /// The partitions' maximum delay, and the held records each takes.
 const MAX_DELAY: u64 = 10_000;
 const HELD: u64 = 1024;
+/// The group whose partition deduplicates instead of delaying, as no topic
+/// does both. Its producer sessions retire after `PRODUCER_IDLE`.
+pub(crate) const DEDUP_GROUP: usize = 1;
+/// Its dedup window and producer idle expiry in milliseconds, and the
+/// identities its index holds: about four windows of records.
+pub(crate) const DEDUP_WINDOW: u64 = 5_000;
+pub(crate) const PRODUCER_IDLE: u64 = 3_000;
+const DEDUP_ENTRIES: usize = 4096;
 
 /// The bootstrap lane with its partition creation prepared, and native intake
 /// for the producers, as `ozzy-broker/src/serving/shard/build.rs` builds them.
@@ -40,20 +50,22 @@ pub(super) fn services(
     actor: &mut PartitionActor,
     index: usize,
     group: usize,
+    shape: Shape,
 ) -> Result<(Bootstrap, NativeIntake), String> {
     let failure = |error: &dyn std::fmt::Display| format!("broker {index}: services: {error}");
     let mut buffer = actor
         .lease_proposal_buffer_with_limits(PIPELINE)
         .map_err(|error| failure(&error))?;
+    let dedup = group == DEDUP_GROUP && shape.dedup();
     buffer
         .prepare_partition(CreatePartition {
             partition: PARTITIONS[group],
             stream: "sim",
-            topic: "orders",
+            topic: if dedup { "events" } else { "orders" },
             partition_id: PartitionId::new(group as u32),
             owner_epoch: OwnerEpoch::INITIAL,
-            delay_max_millis: std::num::NonZeroU64::new(MAX_DELAY),
-            dedup_window_millis: None,
+            delay_max_millis: std::num::NonZeroU64::new(MAX_DELAY).filter(|_| group != DEDUP_GROUP),
+            dedup_window_millis: std::num::NonZeroU64::new(DEDUP_WINDOW).filter(|_| dedup),
             retention: RetentionPolicy::default(),
         })
         .map_err(|error| failure(&error))?;
@@ -73,7 +85,7 @@ pub(super) fn services(
             writers: records::PRODUCERS,
         },
         limits: records::LIMITS,
-        reserve_dedup_results: false,
+        reserve_dedup_results: dedup,
         requests_per_writer: 1,
         progress_requests: 0,
         progress_batch: 1,
@@ -248,8 +260,21 @@ pub(super) fn journal_config(index: usize, shape: Shape, group: usize) -> OwnedC
         },
         // Native intake arenas, reader leases, and replication.
         append_buffers: 32,
-        delay: Some(DelayLimits::new(HELD)),
-        deduplication: None,
+        delay: (group != DEDUP_GROUP).then(|| DelayLimits::new(HELD)),
+        deduplication: (group == DEDUP_GROUP && shape.dedup()).then(|| {
+            let limits = dedup_limits(
+                DEDUP_WINDOW,
+                DEDUP_ENTRIES,
+                usize::MAX,
+                records::LIMITS.max_records,
+                PIPELINE,
+            );
+            // The index reserves its whole budget up front.
+            DedupLimits {
+                bytes: limits.required_bytes().expect("dedup budget fits"),
+                ..limits
+            }
+        }),
         append_limits: PIPELINE,
         writeback: PIPELINE,
         // One byte ends each group after its first operation.
@@ -262,6 +287,6 @@ pub(super) fn journal_config(index: usize, shape: Shape, group: usize) -> OwnedC
             cached_indexes: 4,
             concurrent_reads: 2,
         },
-        producer_idle: None,
+        producer_idle: (group == DEDUP_GROUP).then(|| shape.idle()),
     }
 }
