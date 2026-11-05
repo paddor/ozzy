@@ -304,6 +304,11 @@ On the SDK:
 - A partition with held scheduled records wakes when the earliest
   committed one is due, by the journal clock. While the
   [clock guard](REPLICATION.md#clock-guard) pauses, it checks once per second.
+- The guard signals the shards when the clocks agree again, or when its look
+  finds this clock stepped forward since the last look or since any reading
+  in between. A shard then visits every partition, which re-arms its release,
+  age retention, and idle expiry timers by the clock as it is now. The guard
+  looks at least once per second.
 
 ### Release steps
 

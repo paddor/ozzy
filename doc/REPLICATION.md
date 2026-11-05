@@ -281,6 +281,7 @@ wall clock. A broker whose clock disagrees with the others stops them.
 - Other writes, reads, byte retention and its carries, and deduplication continue.
   Followers need no check: only the leader proposes these.
 - A paused leader holds due records until its clock is fixed or leadership moves.
+  Once the clocks agree again, records that came due meanwhile release at once.
   A paused leader does not give up its view.
 - A disagreement lasting a sample interval warns once on stderr and in the admin
   log, and again when it ends. Startup and lost peers pause without a warning.

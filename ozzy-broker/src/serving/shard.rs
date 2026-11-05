@@ -61,6 +61,8 @@ struct State {
     synced_links: Option<u64>,
     /// Partitions not yet compared with `synced_links`.
     unsynced: usize,
+    /// Clock guard generation every partition's timers reflect.
+    synced_clock: Option<u64>,
     routes: frontend::RoutingTable,
     publisher: Option<RoutePublisher>,
     outbound: Outbound,
@@ -323,6 +325,8 @@ async fn serve(
     tokio::pin!(shutdown);
     let links = binding.links.clone();
     let mut links_changed = Box::pin(links.changed_after(links.generation()));
+    let clock = state.config.clock.clone();
+    let mut clock_changed = Box::pin(clock.changed_after(clock.generation()));
     let mut waits = Waits::default();
     loop {
         let port_generation = binding.port.generation();
@@ -354,6 +358,9 @@ async fn serve(
             },
             () = &mut links_changed => {
                 links_changed = Box::pin(links.changed_after(links.generation()));
+            },
+            () = &mut clock_changed => {
+                clock_changed = Box::pin(clock.changed_after(clock.generation()));
             },
         }
     }

@@ -132,9 +132,8 @@ pub(crate) struct Report {
     /// Live copies consumers read, and replay streams they canceled to go live.
     pub live: u64,
     pub cancels: u64,
-    /// Visits only the safety sweep found work for within 4 s of a clock
-    /// step or the guard resuming. Open finding: neither wakes a partition
-    /// whose held records come due then.
+    /// Visits only the safety sweep found work for within 1 s of a clock
+    /// step, before the guard's next look could see it.
     pub clock_wakeups: u64,
     /// Below a vacuity floor, or a scripted fault never started: the run
     /// converged but proved little.

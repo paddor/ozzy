@@ -3,11 +3,18 @@
 //! routes to a partition. Other threads read the published immutable status.
 
 use super::{Class, Kind, NodeId, ReceiveError, Service, routed};
+use crate::signal::StateSignal;
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use ozzy_proto::{Envelope, EnvelopeLimits, Opcode, clock};
 use ozzy_replication::clock::{ClockGuard, ClockVerdict, SAMPLE_INTERVAL};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicI64, Ordering},
+    },
+    time::Duration,
+};
 
 /// What the guard last concluded.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -25,13 +32,38 @@ struct Published {
     status: ClockStatus,
     /// Wall minus monotonic time when the clocks last agreed. A clock step
     /// moves it at once, long before the next sample can show it.
-    anchor: Option<i128>,
+    anchor: Option<i64>,
     tolerance_millis: u64,
 }
 
+/// The published status, and a signal for changes that can make clock-driven
+/// work due before its timer.
+#[derive(Debug)]
+struct Shared {
+    published: ArcSwap<Published>,
+    changed: StateSignal,
+    /// The lowest anchor any reading saw since the dispatcher's last look.
+    /// Timers armed by it are late once the clock steps forward again.
+    lowest: AtomicI64,
+}
+
+impl Default for Shared {
+    fn default() -> Self {
+        Self {
+            published: ArcSwap::default(),
+            changed: StateSignal::default(),
+            lowest: AtomicI64::new(i64::MAX),
+        }
+    }
+}
+
+/// A forward step past this makes timers armed before it late. Drift
+/// between two looks stays far below it.
+const STEP_NOTICE_MILLIS: i64 = 10;
+
 /// One writer's status, read by every thread. Only the dispatcher writes it.
 #[derive(Clone, Debug)]
-pub struct ClockTrust(Arc<ArcSwap<Published>>);
+pub struct ClockTrust(Arc<Shared>);
 
 impl ClockTrust {
     /// A broker with no peers: nothing to compare with, and never paused.
@@ -42,30 +74,54 @@ impl ClockTrust {
     /// A broker with peers starts paused until their samples arrive, so a
     /// restart with a bad clock decides nothing on its first turn.
     pub fn guarded(peers: impl IntoIterator<Item = NodeId>, tolerance_millis: u64) -> Self {
-        Self(Arc::new(ArcSwap::from_pointee(Published {
-            status: ClockStatus {
-                paused: true,
-                offsets: peers.into_iter().map(|peer| (peer, None)).collect(),
-            },
-            anchor: None,
-            tolerance_millis,
-        })))
+        Self(Arc::new(Shared {
+            published: ArcSwap::from_pointee(Published {
+                status: ClockStatus {
+                    paused: true,
+                    offsets: peers.into_iter().map(|peer| (peer, None)).collect(),
+                },
+                anchor: None,
+                tolerance_millis,
+            }),
+            ..Shared::default()
+        }))
     }
 
     /// Whether clock-driven decisions may run at this reading: the clocks last
     /// agreed, and this clock has not stepped since. Reads `now` only when
-    /// there is an anchor to compare with.
+    /// there is an anchor to compare with, and keeps the lowest reading for
+    /// the dispatcher's next look.
     pub fn trusted(&self, now: impl FnOnce() -> ClockNow) -> bool {
-        let published = self.0.load();
-        !published.status.paused
-            && published
-                .anchor
-                .is_none_or(|anchor| !stepped(anchor, now().anchor(), published.tolerance_millis))
+        let published = self.0.published.load();
+        if published.status.paused {
+            return false;
+        }
+        let Some(anchor) = published.anchor else {
+            return true;
+        };
+        let reading = now().anchor();
+        if reading < self.0.lowest.load(Ordering::Relaxed) {
+            self.0.lowest.fetch_min(reading, Ordering::Relaxed);
+        }
+        !stepped(anchor, reading, published.tolerance_millis)
     }
 
     /// The latest published status.
     pub fn status(&self) -> ClockStatus {
-        self.0.load().status.clone()
+        self.0.published.load().status.clone()
+    }
+
+    /// Capture before arming clock-driven timers, then wait with
+    /// [`Self::changed_after`].
+    pub fn generation(&self) -> u64 {
+        self.0.changed.generation()
+    }
+
+    /// Wait for a change that can make clock-driven work due before the
+    /// timers armed earlier: the clocks agreeing again, or this clock
+    /// stepping forward. Pausing signals nothing, since it only delays work.
+    pub async fn changed_after(&self, generation: u64) {
+        self.0.changed.changed_after(generation).await;
     }
 }
 
@@ -80,13 +136,14 @@ pub struct ClockNow {
 
 impl ClockNow {
     /// Wall minus monotonic time. A running clock keeps it nearly constant.
-    fn anchor(self) -> i128 {
-        i128::from(self.wall_millis) - i128::try_from(self.monotonic.as_millis()).unwrap_or(0)
+    fn anchor(self) -> i64 {
+        let wall = i64::try_from(self.wall_millis).unwrap_or(i64::MAX);
+        wall.saturating_sub(i64::try_from(self.monotonic.as_millis()).unwrap_or(0))
     }
 }
 
-fn stepped(anchor: i128, now: i128, tolerance_millis: u64) -> bool {
-    (now - anchor).unsigned_abs() > u128::from(tolerance_millis)
+fn stepped(anchor: i64, now: i64, tolerance_millis: u64) -> bool {
+    now.abs_diff(anchor) > tolerance_millis
 }
 
 /// The dispatcher's guard and its sampling schedule.
@@ -97,7 +154,7 @@ pub struct ClockSampling {
     now: Box<dyn Fn() -> ClockNow>,
     next_sample: Duration,
     /// Wall minus monotonic time at the last look.
-    anchor: Option<i128>,
+    anchor: Option<i64>,
     /// When the guard began to disagree. A burst of samples queued behind a
     /// stalled thread disagrees for an instant; only a lasting one warns.
     disagreed_since: Option<Duration>,
@@ -121,7 +178,7 @@ impl ClockSampling {
         trust: ClockTrust,
         now: impl Fn() -> ClockNow + 'static,
     ) -> Self {
-        let tolerance_millis = trust.0.load().tolerance_millis;
+        let tolerance_millis = trust.0.published.load().tolerance_millis;
         Self {
             guard: ClockGuard::new(peers, tolerance_millis),
             trust,
@@ -138,8 +195,8 @@ impl ClockSampling {
     /// broker's wall time once a sample to each broker peer is due.
     pub fn tick(&mut self) -> Option<u64> {
         let now = (self.now)();
-        self.forget_after_step(now);
-        self.evaluate(now);
+        let advanced = self.look(now);
+        self.evaluate(now, advanced);
         if now.monotonic < self.next_sample {
             return None;
         }
@@ -151,10 +208,10 @@ impl ClockSampling {
     /// session, and publish the verdict.
     pub fn observe(&mut self, peer: NodeId, wall_millis: u64) {
         let now = (self.now)();
-        self.forget_after_step(now);
+        let advanced = self.look(now);
         self.guard
             .observe(peer, wall_millis, now.wall_millis, now.monotonic);
-        self.evaluate(now);
+        self.evaluate(now, advanced);
     }
 
     /// When [`Self::tick`] next returns a sample, on the deadlines' origin.
@@ -168,25 +225,31 @@ impl ClockSampling {
         self.next_sample = Duration::ZERO;
     }
 
-    /// Offsets measured before a clock step mean nothing after it. Keeping them
-    /// would let one new sample and one old one outvote the truth.
-    fn forget_after_step(&mut self, now: ClockNow) {
+    /// Compare this clock with the last look. Offsets measured before a step
+    /// mean nothing after it: keeping them would let one new sample and one
+    /// old one outvote the truth. Returns whether the clock stepped forward
+    /// since this look or any reading after it, which makes the timers
+    /// armed meanwhile late.
+    fn look(&mut self, now: ClockNow) -> bool {
         let anchor = now.anchor();
-        if self
-            .anchor
-            .is_some_and(|last| stepped(last, anchor, self.tolerance_millis))
-        {
+        let lowest = self.trust.0.lowest.swap(anchor, Ordering::Relaxed);
+        let last = self.anchor.replace(anchor);
+        if last.is_some_and(|last| stepped(last, anchor, self.tolerance_millis)) {
             self.guard.forget();
         }
-        self.anchor = Some(anchor);
+        last.is_some_and(|last| anchor.saturating_sub(last.min(lowest)) > STEP_NOTICE_MILLIS)
     }
 
     /// Publish the guard's conclusion, and warn once a disagreement lasts.
-    fn evaluate(&mut self, clock: ClockNow) {
+    /// Trust resuming, or a trusted clock that `advanced`, signals the
+    /// shards: work may be due before the timers they armed.
+    fn evaluate(&mut self, clock: ClockNow, advanced: bool) {
         let now = clock.monotonic;
         let verdict = self.guard.verdict(now);
+        let paused = verdict != ClockVerdict::Agreed;
+        let was_paused = self.trust.0.published.load().status.paused;
         let status = ClockStatus {
-            paused: verdict != ClockVerdict::Agreed,
+            paused,
             offsets: self.guard.offsets(now).collect(),
         };
         match verdict {
@@ -216,11 +279,14 @@ impl ClockSampling {
             ClockVerdict::Unknown => {}
         }
         let anchor = (verdict == ClockVerdict::Agreed).then(|| clock.anchor());
-        self.trust.0.store(Arc::new(Published {
+        self.trust.0.published.store(Arc::new(Published {
             status,
             anchor,
             tolerance_millis: self.tolerance_millis,
         }));
+        if !paused && (was_paused || advanced) {
+            self.trust.0.changed.notify_changed();
+        }
     }
 }
 
@@ -362,14 +428,14 @@ mod tests {
         /// Both peers' samples sent with their wall clocks `offset` from ours.
         fn observe(&self, sampling: &mut ClockSampling, offset: i64) {
             let now = self.read();
-            sampling.forget_after_step(now);
+            let advanced = sampling.look(now);
             let wall = now.wall_millis.checked_add_signed(offset).unwrap();
             for peer in [node(1), node(2)] {
                 sampling
                     .guard
                     .observe(peer, wall, now.wall_millis, now.monotonic);
             }
-            sampling.evaluate(now);
+            sampling.evaluate(now, advanced);
         }
     }
 
@@ -394,14 +460,14 @@ mod tests {
         sampling
             .guard
             .observe(node(1), now.wall_millis + 5, now.wall_millis, now.monotonic);
-        sampling.evaluate(now);
+        sampling.evaluate(now, false);
         assert!(trust.trusted(|| clock.read()));
         assert_eq!(
             trust.status().offsets,
             [(node(1), Some(5)), (node(2), None)]
         );
         clock.pass(Duration::from_secs(6));
-        sampling.evaluate(clock.read());
+        sampling.evaluate(clock.read(), false);
         assert!(!trust.trusted(|| clock.read()));
         assert!(!sampling.warned, "lost samples stay quiet");
     }
@@ -458,15 +524,60 @@ mod tests {
         clock.step(3_600_000);
         // The first sample after the step, against one measured before it.
         let now = clock.read();
-        sampling.forget_after_step(now);
+        let advanced = sampling.look(now);
         sampling.guard.observe(
             node(1),
             now.wall_millis - 3_600_000,
             now.wall_millis,
             now.monotonic,
         );
-        sampling.evaluate(now);
+        sampling.evaluate(now, advanced);
         assert!(trust.status().paused, "{:?}", trust.status());
         assert!(!trust.trusted(|| clock.read()));
+    }
+
+    #[test]
+    fn resuming_and_forward_steps_signal_and_pausing_does_not() {
+        let (clock, mut sampling, trust) = Clock::sampling();
+        let mut seen = trust.generation();
+        let mut signaled = || {
+            let generation = trust.generation();
+            std::mem::replace(&mut seen, generation) != generation
+        };
+        clock.observe(&mut sampling, 0);
+        assert!(signaled(), "agreeing at startup resumes");
+        clock.observe(&mut sampling, 0);
+        assert!(!signaled(), "agreeing again is no change");
+        clock.observe(&mut sampling, -3_600_000);
+        assert!(!signaled(), "pausing only delays work");
+        clock.observe(&mut sampling, 0);
+        assert!(signaled(), "resuming");
+
+        clock.step(500);
+        assert!(trust.trusted(|| clock.read()));
+        assert_eq!(sampling.tick(), Some(clock.read().wall_millis));
+        assert!(signaled(), "a step forward makes armed timers late");
+        clock.step(-500);
+        clock.pass(SAMPLE_INTERVAL);
+        sampling.tick();
+        assert!(!signaled(), "a step back makes them early");
+        clock.step(5);
+        clock.pass(SAMPLE_INTERVAL);
+        sampling.tick();
+        assert!(!signaled(), "drift");
+        clock.step(-500);
+        assert!(trust.trusted(|| clock.read()), "a timer armed now");
+        clock.step(500);
+        clock.pass(SAMPLE_INTERVAL);
+        sampling.tick();
+        assert!(
+            signaled(),
+            "is late once the clock steps back between looks"
+        );
+        clock.step(3_600_000);
+        clock.pass(SAMPLE_INTERVAL);
+        sampling.tick();
+        assert!(trust.status().paused);
+        assert!(!signaled(), "a step past the tolerance pauses");
     }
 }

@@ -117,6 +117,15 @@ impl PartitionActors {
         }
     }
 
+    /// Visit every partition at the next poll, so each re-arms its timers
+    /// after a change none of them registered, such as the clock guard
+    /// resuming. Without wakeups every poll visits every partition anyway.
+    pub fn wake_all(&self) {
+        for slot in 0..self.actors.len() {
+            self.touch(slot);
+        }
+    }
+
     /// Mark a partition that received work outside its own visit, and wake
     /// the shard to visit it unless a poll is already due.
     pub(super) fn touch(&self, slot: usize) {

@@ -66,10 +66,10 @@ pub(crate) const MAX_SEGMENTS: usize = 256;
 /// Clock disagreement that clock-driven decisions allow, as the broker's
 /// default `cluster.max_clock_offset_millis`.
 pub(crate) const CLOCK_TOLERANCE: u64 = 1000;
-/// Ticks after a clock step or the guard resuming in which a safety sweep
-/// may find due releases: the 3 s span of due times and the 1 s paused
-/// recheck. Open finding: neither wakes a partition.
-const CLOCK_WAKE: u64 = 400;
+/// Ticks after a clock step in which a safety sweep may find due work: a
+/// step is unseen until the guard's next look, within a sample interval,
+/// and a partition that read the stepped clock rechecks within one too.
+const CLOCK_WAKE: u64 = 100;
 
 /// A broker's shard: the partitions it hosts, and its journals' segment
 /// limit and size, and whether they write one operation per physical group.
@@ -127,10 +127,11 @@ pub(crate) struct Broker {
     pub trust: ClockTrust,
     /// The session of each peer link, zero while down.
     sessions: [LinkSessionId; BROKERS],
-    /// The last tick this host's clock stepped or its guard resumed.
-    clock_event: Option<u64>,
-    /// The guard was paused at the last look; sweep-found visits so far.
-    was_paused: bool,
+    /// The last tick this host's clock stepped.
+    stepped: Option<u64>,
+    /// Clock guard generation every partition's timers reflect.
+    synced_clock: Option<u64>,
+    /// Sweep-found visits so far.
     swept: u64,
     /// Latest receipt alias per group of each sending broker, as the
     /// receiving frontend binds it (`ozzy-runtime/src/frontend/flow.rs`).
@@ -314,8 +315,8 @@ impl Broker {
             sampling,
             trust,
             sessions,
-            clock_event: None,
-            was_paused: true,
+            stepped: None,
+            synced_clock: None,
             swept: 0,
             aliases: std::array::from_fn(|_| BTreeMap::new()),
             unbound: 0,
@@ -392,11 +393,18 @@ impl Broker {
             self.requests.pop_front();
             input = true;
         }
+        // As the broker's `sync_clock`: the guard resumed or the clock
+        // stepped forward, so every partition re-arms its timers.
+        let generation = self.trust.generation();
+        let retime = self.synced_clock.replace(generation) != Some(generation);
+        if retime {
+            self.shard.wake_all();
+        }
         let due = self
             .shard
             .next_deadline()
             .is_some_and(|deadline| now >= deadline);
-        if !(input || due || self.woken.is_set()) {
+        if !(input || retime || due || self.woken.is_set()) {
             return Ok(None);
         }
         let waker = Waker::from(self.woken.clone());
@@ -656,10 +664,13 @@ impl Broker {
         }
     }
 
-    /// As the dispatcher's `clock_tick`: age out samples, and send each linked
-    /// peer this host's wall time when due. A sample that does not fit its
-    /// lane is dropped.
+    /// As the dispatcher's `clock_tick` at its deadline: age out samples, and
+    /// send each linked peer this host's wall time. A sample that does not
+    /// fit its lane is dropped.
     pub(crate) fn sample(&mut self, network: &mut Network, tick: u64, trace: &mut Trace) {
+        if self.host.now() < self.sampling.deadline() {
+            return;
+        }
         let Some(wall) = self.sampling.tick() else {
             return;
         };
@@ -691,21 +702,16 @@ impl Broker {
     /// Step this host's wall clock to `offset` from true time.
     pub(crate) fn step_clock(&mut self, offset: i64, tick: u64) {
         self.host.step(offset);
-        self.clock_event = Some(tick);
+        self.stepped = Some(tick);
     }
 
     /// Visits only the safety sweep found work for since the last look:
-    /// those within `CLOCK_WAKE` of a clock step or of the guard resuming,
-    /// then the rest, each a missed wakeup.
+    /// those within `CLOCK_WAKE` of a clock step, then the rest, each a
+    /// missed wakeup.
     pub(crate) fn missed_wakeups(&mut self, tick: u64) -> (u64, u64) {
-        let paused = self.trust.status().paused;
-        if self.was_paused && !paused {
-            self.clock_event = Some(tick);
-        }
-        self.was_paused = paused;
         let swept = self.shard.sweep_progress();
         let missed = swept - std::mem::replace(&mut self.swept, swept);
-        if self.clock_event.is_some_and(|at| tick <= at + CLOCK_WAKE) {
+        if self.stepped.is_some_and(|at| tick <= at + CLOCK_WAKE) {
             (missed, 0)
         } else {
             (0, missed)

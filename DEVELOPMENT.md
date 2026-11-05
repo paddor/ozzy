@@ -269,11 +269,13 @@ restart refetches or replays all history. The three sparse or full scenarios
 skip `heavy` and `swarm`, which make too little progress to fill a journal.
 
 Each broker's dispatcher runs the production clock guard, sampling its
-host's wall clock against its peers over the modeled control links, and its
-journals decide clock-driven work only while the guard trusts that clock.
-Nothing wakes a partition when the guard resumes or a trusted clock steps,
-so a safety sweep that finds work within 4 s of either only counts in
-`Report::clock_wakeups`; any other sweep that finds work fails the run.
+host's wall clock against its peers over the modeled control links at the
+dispatcher's own deadlines, and its journals decide clock-driven work only
+while the guard trusts that clock. The guard resuming, or seeing a forward
+step, wakes every partition, as the broker shard does. A step stays unseen
+until the guard's next look, so a safety sweep that finds work within 1 s
+of a step only counts in `Report::clock_wakeups`; any other sweep that finds
+work fails the run.
 Each broker's shard hosts two partitions on one device. Beside barrier
 proposals on the first, four producers append records through each broker's
 production native intake, and four consumers read the partitions as the SDK
