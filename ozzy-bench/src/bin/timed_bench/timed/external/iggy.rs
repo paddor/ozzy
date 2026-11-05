@@ -3,9 +3,9 @@ mod writer;
 use super::{Config, Record, Result, Value, Window};
 use iggy::prelude::{
     Client as _, ClusterClient, ClusterNodeStatus, CompressionAlgorithm, Consumer, Durability,
-    Identifier, IggyByteSize, IggyExpiry, MaxTopicSize, MessageClient, Partitioning,
-    PollingStrategy, StreamClient, TcpClient, TopicClient, TopicCreateOptions, TopicDetails,
-    UserClient,
+    Identifier, IggyByteSize, IggyExpiry, MaxTopicSize, MessageClient, Partitioning, PollOptions,
+    PollingStrategy, StreamClient, StreamCreateOptions, TcpClient, TopicClient, TopicCreateOptions,
+    TopicDetails, UserClient,
 };
 use ozzy_proto::MessageId;
 
@@ -27,7 +27,9 @@ pub(super) async fn provision(config: &Config, name: &str) -> Result<Value> {
     let client = connect(config).await?;
     let policy = super::policy(config)?;
     await_healthy(&client, policy.brokers()).await?;
-    client.create_stream(name).await?;
+    client
+        .create_stream(name, &StreamCreateOptions::default())
+        .await?;
     let requested = TopicCreateOptions {
         partitions_count: Some(config.partitions() as u32),
         compression_algorithm: Some(CompressionAlgorithm::None),
@@ -98,7 +100,7 @@ fn check_topic(
         || topic.partitions_count != config.partitions() as u32
         || topic.partitions.len() != config.partitions()
         || partition_ids != (0..config.partitions() as u32).collect::<Vec<_>>()
-        || topic.compression_algorithm != CompressionAlgorithm::None
+        || topic.resolved_options().compression_algorithm != CompressionAlgorithm::None
     {
         return Err("Iggy effective topic options differ from benchmark request".into());
     }
@@ -175,11 +177,15 @@ impl Client {
             .poll_messages(
                 &self.stream,
                 &self.topic,
-                Some(self.partition),
+                self.partition,
                 &Consumer::default(),
                 &PollingStrategy::offset(sequence),
-                self.reader_records,
-                false,
+                PollOptions {
+                    count: self.reader_records,
+                    // The 0.9 API sent no byte cap, so only the count and server limits apply.
+                    max_bytes: u32::MAX,
+                    ..PollOptions::default()
+                },
             )
             .await?;
         Ok(messages

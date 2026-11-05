@@ -9,10 +9,13 @@ use std::{
 };
 
 pub(super) fn checkout() -> PathBuf {
-    artifact_root().join("iggy-server-0.9.0-rc.1")
+    artifact_root().join(format!("iggy-server-{RELEASE}"))
+}
+fn target() -> PathBuf {
+    artifact_root().join(format!("cargo-target/iggy-{RELEASE}"))
 }
 pub(crate) fn binary() -> PathBuf {
-    artifact_root().join("cargo-target/iggy-0.9.0-rc.1/release/iggy-server")
+    target().join("release/iggy-server")
 }
 
 fn dependencies() -> PathBuf {
@@ -130,8 +133,8 @@ fn fetch_release(directory: &Path) -> Result<()> {
                 .arg(directory),
         )?;
     }
-    // Existing RC artifacts contain the same source commit as the final release.
-    // Fetch its tag once, retaining those build directories and their warm cache.
+    // A checkout cloned from another ref lacks the tag. Fetch it once, keeping
+    // the checkout and its build directory.
     if !Command::new("git")
         .args([
             "show-ref",
@@ -170,10 +173,7 @@ fn compile(directory: &Path, logs: &Path) -> Result<()> {
     let output = Command::new("cargo")
         .args(arguments)
         .current_dir(directory)
-        .env(
-            "CARGO_TARGET_DIR",
-            artifact_root().join("cargo-target/iggy-0.9.0-rc.1"),
-        )
+        .env("CARGO_TARGET_DIR", target())
         .env("TMPDIR", artifact_root())
         .env("PKG_CONFIG_PATH", library_path().join("pkgconfig"))
         .env("PKG_CONFIG_SYSROOT_DIR", dependencies())

@@ -324,8 +324,12 @@ fn server_identity(args: &Args, profile: &str) -> Result<Option<Value>> {
     if profile.starts_with("iggy-") {
         let version =
             capture(Command::new("podman").args(["exec", name, "iggy-server", "--version"]))?;
-        if !version.ends_with(" 0.9.0") {
-            return Err("Iggy workload adapter requires server 0.9.0".into());
+        // The server reports its crate version, without the release-candidate suffix.
+        let crate_version = super::server::RELEASE
+            .split_once('-')
+            .map_or(super::server::RELEASE, |(version, _)| version);
+        if !version.ends_with(&format!(" {crate_version}")) {
+            return Err(format!("Iggy workload adapter requires server {crate_version}").into());
         }
     }
     Ok(Some(info))
