@@ -15,7 +15,11 @@ if [[ -d "$UV_PROJECT_ENVIRONMENT" && ! -f "$UV_PROJECT_ENVIRONMENT/pyvenv.cfg" 
 fi
 uv sync --project bindings/python --locked --no-install-project --python "$ozzy_python_version"
 export PYO3_PYTHON="$UV_PROJECT_ENVIRONMENT/bin/python"
-ozzy_python_base="$(dirname "$(dirname "$(readlink -f "$PYO3_PYTHON")")")"
+ozzy_python_exe="$(readlink -f "$PYO3_PYTHON")"
+# The venv path stays the same when a restored CI cache meets a new Python
+# patch release, so PyO3 keys its cached build config on the real interpreter.
+export PYO3_ENVIRONMENT_SIGNATURE="$ozzy_python_exe"
+ozzy_python_base="$(dirname "$(dirname "$ozzy_python_exe")")"
 export LD_LIBRARY_PATH="$ozzy_python_base/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 ozzy_python_wheels="$CARGO_TARGET_DIR/python/$ozzy_python_version/wheels"
 mkdir -p "$ozzy_python_wheels"
