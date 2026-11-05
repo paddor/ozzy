@@ -117,20 +117,20 @@ pub(crate) fn leads(status: &ActorStatus) -> bool {
             .is_some_and(|normal| normal.backups.is_some() && normal.ready_for_appends)
 }
 
-/// The ready leader of the newest view and that view.
-pub(crate) fn leader(brokers: &[Broker]) -> Option<(usize, u64)> {
+/// The ready leader of `group`'s newest view and that view.
+pub(crate) fn leader(brokers: &[Broker], group: usize) -> Option<(usize, u64)> {
     brokers
         .iter()
-        .map(|broker| (broker.index, broker.status()))
+        .map(|broker| (broker.index, broker.status(group)))
         .filter(|(_, status)| leads(status))
         .max_by_key(|(_, status)| status.scope.view)
         .map(|(index, status)| (index, status.scope.view))
 }
 
-/// The common applied prefix once one ready leader leads the newest view and
-/// every broker is ready in that view with the same applied prefix.
-pub(crate) fn converged(brokers: &[Broker]) -> Option<Prefix> {
-    let statuses: Vec<_> = brokers.iter().map(Broker::status).collect();
+/// `group`'s common applied prefix once one ready leader leads the newest
+/// view and every broker is ready in that view with the same applied prefix.
+pub(crate) fn converged(brokers: &[Broker], group: usize) -> Option<Prefix> {
+    let statuses: Vec<_> = brokers.iter().map(|broker| broker.status(group)).collect();
     let leader = statuses
         .iter()
         .filter(|status| leads(status))
@@ -144,4 +144,12 @@ pub(crate) fn converged(brokers: &[Broker]) -> Option<Prefix> {
                 && status.normal.map(|normal| normal.applied) == Some(applied)
         })
         .then_some(applied)
+}
+
+/// The log end of `partition`'s newest ready leader, when it reports one.
+pub(crate) fn log_end(brokers: &[Broker], partition: usize) -> Option<u64> {
+    let (index, _) = leader(brokers, partition)?;
+    brokers[index]
+        .facts(partition)
+        .map(|facts| facts.next_offset.get())
 }

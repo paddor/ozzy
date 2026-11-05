@@ -9,15 +9,15 @@
 //! confirmed records, at offsets from zero without a gap.
 
 use crate::{
-    broker::{Broker, GROUP},
+    broker::{Broker, GROUPS, PARTITIONS},
     network::{BROKERS, node},
     seeds::{Rng, Trace},
 };
 use bytes::Bytes;
 use omq_tokio::Message;
 use ozzy_proto::{
-    Envelope, EnvelopeLimits, LinkSessionId, MessageId, NodeId, Opcode, OperationId,
-    PartitionIncarnation, ProducerId, RequestId,
+    Envelope, EnvelopeLimits, LinkSessionId, MessageId, NodeId, Opcode, OperationId, ProducerId,
+    RequestId,
     append::{self, AppendKey, Authority, Policy},
     data::{DataLimits, Encoding, Record},
     decode_packet, handshake,
@@ -27,10 +27,11 @@ use ozzy_proto::{
 use ozzy_runtime::frontend::{Binding, Kind, Link};
 use std::collections::BTreeMap;
 
-/// Producers, each with its own client link to every broker.
-pub(crate) const PRODUCERS: usize = 2;
-/// The one partition every broker provisions.
-pub(crate) const PARTITION: PartitionIncarnation = PartitionIncarnation::from_bytes([8; 16]);
+/// Producers per partition, each with its own client link to every broker;
+/// producer `i` writes partition `i % partitions`.
+const PER_PARTITION: usize = 2;
+/// Producers when every group hosts a partition.
+pub(crate) const PRODUCERS: usize = PER_PARTITION * GROUPS.len();
 /// Client codec limits in both directions.
 pub(crate) const LIMITS: DataLimits = DataLimits {
     envelope: EnvelopeLimits {
@@ -254,6 +255,7 @@ impl Ledger {
 #[derive(Debug)]
 pub(crate) struct Producers {
     writers: Vec<Producer>,
+    partitions: usize,
     rng: Rng,
     /// No new batches: finish the current ones.
     draining: bool,
@@ -261,9 +263,9 @@ pub(crate) struct Producers {
 }
 
 impl Producers {
-    pub(crate) fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64, partitions: usize) -> Self {
         Self {
-            writers: (0..PRODUCERS)
+            writers: (0..PER_PARTITION * partitions)
                 .map(|index| Producer {
                     phase: Phase::Open,
                     epoch: 0,
@@ -280,6 +282,7 @@ impl Producers {
                     attempts: 0,
                 })
                 .collect(),
+            partitions,
             rng: Rng::new(seed),
             draining: false,
             counts: Counts::default(),
@@ -315,7 +318,7 @@ impl Producers {
         trace: &mut Trace,
     ) -> Result<(), String> {
         self.draining = !submit;
-        for index in 0..PRODUCERS {
+        for index in 0..self.writers.len() {
             let producer = &mut self.writers[index];
             if let Some(request) = producer.pending
                 && tick >= request.sent + TIMEOUT
@@ -350,6 +353,7 @@ impl Producers {
     ) -> Result<(), String> {
         let producer = &mut self.writers[index];
         producer.attempts += 1;
+        let partition = index % self.partitions;
         let broker = &mut brokers[producer.target];
         let id = request_id(index, producer.attempts);
         let envelope = |opcode| Envelope {
@@ -360,7 +364,7 @@ impl Producers {
             session: Some(broker.client_session(index)),
         };
         let authority = Authority {
-            group_id: GROUP,
+            group_id: GROUPS[partition],
             config_epoch: 1,
             view: producer.view,
         };
@@ -373,7 +377,7 @@ impl Producers {
                     envelope(Opcode::OpenProducer),
                     Open {
                         authority,
-                        partition: PARTITION,
+                        partition: PARTITIONS[partition],
                         producer: producer_id(index),
                         mode: Mode::Resume,
                         expected_epoch: None,
@@ -404,7 +408,7 @@ impl Producers {
                     envelope(Opcode::Append),
                     append::Append {
                         authority,
-                        partition: PARTITION,
+                        partition: PARTITIONS[partition],
                         owner_epoch: 1,
                         key: AppendKey {
                             producer_id: producer_id(index),
@@ -427,12 +431,15 @@ impl Producers {
         control.extend_from_slice(&metadata);
         let mut control = Bytes::from(control);
         let header = control.split_to(header.len());
-        broker.requests.push_back(Message::multipart([
-            Bytes::copy_from_slice(client(index).as_bytes()),
-            header,
-            control,
-            Bytes::from(payload),
-        ]));
+        broker.requests.push_back((
+            partition,
+            Message::multipart([
+                Bytes::copy_from_slice(client(index).as_bytes()),
+                header,
+                control,
+                Bytes::from(payload),
+            ]),
+        ));
         producer.pending = Some(Request {
             broker: broker.index,
             id,
@@ -443,17 +450,18 @@ impl Producers {
         Ok(())
     }
 
-    /// One reply to producer `index`. Every confirmation goes to `ledger`,
-    /// a late one too.
+    /// One reply to producer `index`. Every confirmation goes to its
+    /// partition's ledger, a late one too.
     pub(crate) fn reply(
         &mut self,
         index: usize,
         broker: usize,
         message: &Message,
         tick: u64,
-        ledger: &mut Ledger,
+        ledgers: &mut [Ledger],
         trace: &mut Trace,
     ) -> Result<(), String> {
+        let ledger = &mut ledgers[index % self.partitions];
         let frames: [&[u8]; 3] =
             std::array::from_fn(|frame| message.part_slice(frame + 1).unwrap_or_default());
         let packet = decode_packet(&frames, LIMITS.envelope)

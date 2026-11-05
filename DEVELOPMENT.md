@@ -116,7 +116,7 @@ system tests in that slice.
 | --- | --- | --- | --- |
 | Unit and core | Codecs, state transitions, bounds, authority fences | `src/` and `tests/` of `ozzy-proto`, `ozzy-core`, `ozzy-journal`, `ozzy-journal-segment`, `ozzy-replication`, `ozzy-config` | `default` |
 | Core simulation | Replayable protocol fault schedules with gated time, messages, and file jobs | `ozzy-sim/tests/` | `default`; `stress` in `extended` |
-| Seeded actor cluster | Production partition shards and journals of three brokers on one thread from one seed: link, disk, and client faults, scripted leader loss, power loss and restart, per-tick history checks, record and read checks, convergence, missed wakeups | `ozzy-sim/tests/actor_cluster/` | `default`; seed campaign in `extended` |
+| Seeded actor cluster | Production partition shards of three brokers, each with two partitions on one device, on one thread from one seed: link, disk, and client faults, scripted leader loss, power loss and restart, per-tick history checks, record and read checks, convergence, missed wakeups | `ozzy-sim/tests/actor_cluster/` | `default`; seed campaign in `extended` |
 | Inproc integration | Real SDKs and brokers over OMQ inproc and memory file jobs; owner lifecycle | `ozzy-broker/tests/journals/serving/`, `ozzy-sim/tests/broker/` | `default`; `stress` in `extended` |
 | Full-product simulator | Sustained workload and fault churn over real owners, SDKs, and brokers | `ozzy-sim` `ozzy_sim` binary | Short gate in `default`; long runs manual |
 | Backend conformance | The same owned file operations on the pool and AIO backends | `ozzy-io-pool/tests/`, `ozzy-io-aio/tests/` | `default` |
@@ -265,22 +265,29 @@ of order. The power-loss fast test also bounds the outage, which grows when a
 restart refetches or replays all history. The three sparse or full scenarios
 skip `heavy` and `swarm`, which make too little progress to fill a journal.
 
-Beside barrier proposals, two producers append records through each
-broker's production native intake, and a consumer replays the partition
-through the leader's production reader service, subscribing again from its
-next offset after a leader change. Every confirmation and delivery goes
-through one ledger: one offset per record, one record per offset, each
-producer's records in sequence order, and payloads as sent. At the end the
-consumer must have read every copy's whole log, every confirmed record among
-it, and an unconfirmed record only from a batch whose outcome stayed
-unknown. `sparse-rejoin` runs without records: they fill the leader, and a
-sparse copy of a full leader does not fit. In the negative control
+Each broker's shard hosts two partitions on one device. Beside barrier
+proposals on the first, four producers append records through each broker's
+production native intake, and four consumers read the partitions as the SDK
+does, two of each per partition: replay through the leader's production
+reader service, then its live topic, merged by the production `LiveCursor`.
+A live copy goes only to a consumer the broker's reader grants admit and
+drops on a full queue or by the profile's PUB loss; a gap holds it and
+replays up to it. A leader change or silence replays from the next offset
+again. Every confirmation and delivery goes through one ledger per
+partition: one offset per record, one record per offset, each producer's
+records in sequence order, and payloads as sent. At the end the consumers
+must have read every copy's whole log, every confirmed record among it, and
+an unconfirmed record only from a batch whose outcome stayed unknown.
+`sparse-rejoin` runs without records: they fill the leader, and a sparse
+copy of a full leader does not fit. Scripted cases in the fast suite host
+one partition, with two producers and two consumers, to stay near ten
+seconds; campaigns run every scenario over both. In the negative control
 `rewound_disks_fail_the_run`, every disk restarts from a copy taken 5 s
 before a power loss, and the checks must fail.
 
 A failing seed prints its parameters, schedule hash, and this command with
-`OZZY_ACTOR_SIM_SEED`, `OZZY_ACTOR_SIM_PROFILE`, and
-`OZZY_ACTOR_SIM_SCENARIO` set. A run whose faults left too little progress
+`OZZY_ACTOR_SIM_SEED`, `OZZY_ACTOR_SIM_PROFILE`,
+`OZZY_ACTOR_SIM_SCENARIO`, and `OZZY_ACTOR_SIM_PARTITIONS` set. A run whose faults left too little progress
 to prove much is vacuous: the campaign lists it and fails only above one in
 twenty. It runs 20 seeds unless `OZZY_ACTOR_SIM_SEEDS` sets another count.
 Runs spread over one thread per core; `OZZY_ACTOR_SIM_THREADS` sets the

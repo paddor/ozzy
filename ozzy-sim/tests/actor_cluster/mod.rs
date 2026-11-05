@@ -1,7 +1,8 @@
 //! Seeded single-thread cluster over production partition schedulers.
 //!
-//! Three brokers each run a production `PartitionActors` shard with one
-//! replicated group over production shard journals on a simulated device.
+//! Three brokers each run a production `PartitionActors` shard with one or
+//! two replicated groups, each over a production shard journal on the
+//! broker's simulated device.
 //! One seed drives the network, disks, clients, and broker order; virtual
 //! time moves in 10 ms ticks. Safety checks run after every tick; a healing
 //! drain then requires convergence. A failure prints its reproduce command.
@@ -27,7 +28,7 @@ mod seeds;
 mod sim;
 mod workload;
 
-use broker::{MAX_SEGMENTS, SEGMENT_BYTES};
+use broker::{GROUPS, MAX_SEGMENTS, SEGMENT_BYTES};
 use network::Profile;
 use sim::{
     Fault::{
@@ -322,9 +323,9 @@ fn scenario(name: &str) -> Option<Scenario> {
     })
 }
 
-/// Proposals and faults for the scenario, then up to 30 s to heal and
-/// converge. Vacuity floors fit each profile's fault rate.
-fn options(profile: &str, scenario: &str) -> Options {
+/// Proposals and faults for the scenario on `partitions`, then up to 30 s to
+/// heal and converge. Vacuity floors fit each profile's fault rate.
+fn options(profile: &str, scenario: &str, partitions: usize) -> Options {
     let scenario = self::scenario(scenario).expect("known scenario");
     let floor = match profile {
         "none" | "slow" => 100,
@@ -336,6 +337,7 @@ fn options(profile: &str, scenario: &str) -> Options {
         ticks: scenario.ticks,
         drain: 3000,
         clients: 3,
+        partitions,
         batch: scenario.batch,
         max_segments: scenario.max_segments,
         segment_bytes: scenario.segment_bytes,
@@ -352,10 +354,10 @@ fn options(profile: &str, scenario: &str) -> Options {
 }
 
 /// The command that replays one run.
-fn reproduce(seed: u64, profile: &str, scenario: &str) -> String {
+fn reproduce(seed: u64, profile: &str, scenario: &str, partitions: usize) -> String {
     format!(
         "OZZY_ACTOR_SIM_SEED={seed} OZZY_ACTOR_SIM_PROFILE={profile} \
-         OZZY_ACTOR_SIM_SCENARIO={scenario} \
+         OZZY_ACTOR_SIM_SCENARIO={scenario} OZZY_ACTOR_SIM_PARTITIONS={partitions} \
          cargo nextest run -p ozzy-sim --test ozzy_actor_cluster --profile extended \
          seeded::stress::campaign"
     )
@@ -363,54 +365,70 @@ fn reproduce(seed: u64, profile: &str, scenario: &str) -> String {
 
 /// Run one seed or panic with everything needed to reproduce a failure. A
 /// vacuous run is no failure here.
-fn outcome(seed: u64, profile: &str, scenario: &str) -> Report {
+fn outcome(seed: u64, profile: &str, scenario: &str, partitions: usize) -> Report {
     let swarm = seeds::Seeds::derive(seed).swarm;
     let parameters = Profile::named(profile, swarm).expect("known profile");
-    sim::run(seed, parameters, options(profile, scenario)).unwrap_or_else(|failure| {
+    let options = options(profile, scenario, partitions);
+    sim::run(seed, parameters, options).unwrap_or_else(|failure| {
         panic!(
-            "actor cluster seed {seed} profile {profile} scenario {scenario} failed at tick {}: {}\n\
+            "actor cluster seed {seed} profile {profile} scenario {scenario} partitions \
+             {partitions} failed at tick {}: {}\n\
              parameters {:?}\nhash {:#018x}\n{}\nreproduce: {}",
             failure.tick,
             failure.reason,
             failure.profile,
             failure.hash,
             failure.detail,
-            reproduce(seed, profile, scenario)
+            reproduce(seed, profile, scenario, partitions)
         )
     })
 }
 
-/// Run one seed that must fail; returns why.
+/// Run one seed on one partition that must fail; returns why.
 fn failure(seed: u64, profile: &str, scenario: &str) -> String {
     let swarm = seeds::Seeds::derive(seed).swarm;
     let parameters = Profile::named(profile, swarm).expect("known profile");
-    match sim::run(seed, parameters, options(profile, scenario)) {
+    match sim::run(seed, parameters, options(profile, scenario, 1)) {
         Ok(report) => panic!(
             "actor cluster seed {seed} profile {profile} scenario {scenario} passed: {report:?}\n\
              reproduce: {}",
-            reproduce(seed, profile, scenario)
+            reproduce(seed, profile, scenario, 1)
         ),
         Err(failure) => failure.reason,
     }
 }
 
-/// Run one seed that must also clear its vacuity floors.
+/// Run one seed over every partition; it must also clear its vacuity floors.
 fn checked(seed: u64, profile: &str, scenario: &str) -> Report {
-    let report = outcome(seed, profile, scenario);
+    checked_on(GROUPS.len(), seed, profile, scenario)
+}
+
+/// As `checked`, on one partition. Scripted fast cases run one to stay near
+/// ten seconds; campaigns run every scenario over both.
+fn one_partition(seed: u64, profile: &str, scenario: &str) -> Report {
+    checked_on(1, seed, profile, scenario)
+}
+
+fn checked_on(partitions: usize, seed: u64, profile: &str, scenario: &str) -> Report {
+    let report = outcome(seed, profile, scenario, partitions);
     assert!(
         !report.vacuous,
-        "actor cluster seed {seed} profile {profile} scenario {scenario} was vacuous: {report:?}\n\
-         reproduce: {}",
-        reproduce(seed, profile, scenario)
+        "actor cluster seed {seed} profile {profile} scenario {scenario} partitions {partitions} \
+         was vacuous: {report:?}\nreproduce: {}",
+        reproduce(seed, profile, scenario, partitions)
     );
     report
 }
 
 #[test]
 fn quiet_network_confirms_and_converges() {
-    for seed in [1, 2] {
-        checked(seed, "none", "random");
-    }
+    let report = checked(1, "none", "random");
+    // Consumers went live and read most records from the live topic.
+    assert!(
+        report.cancels >= 1 && report.live * 4 >= report.records as u64,
+        "{report:?}"
+    );
+    eprintln!("{report:?}");
 }
 
 #[test]
@@ -445,43 +463,43 @@ fn slow_disks_keep_history_and_converge() {
 /// catches up after it rejoins.
 #[test]
 fn lost_leader_is_replaced() {
-    checked(1, "none", "failover");
-    checked(2, "light", "failover");
+    one_partition(1, "none", "failover");
+    one_partition(2, "light", "failover");
 }
 
 /// A view change after a long history still finishes within the election
 /// timeouts.
 #[test]
 fn lost_leader_is_replaced_after_long_history() {
-    checked(1, "none", "long-history");
+    one_partition(1, "none", "long-history");
 }
 
 /// A new leader commits through a follower's slow disk.
 #[test]
 fn new_leader_commits_through_a_slow_follower() {
-    checked(1, "none", "slow-follower");
+    one_partition(1, "none", "slow-follower");
 }
 
 /// Each new leader is lost in turn.
 #[test]
 fn repeatedly_lost_leaders_are_replaced() {
-    checked(1, "light", "repeated-failover");
+    one_partition(1, "light", "repeated-failover");
 }
 
 /// A full journal refuses proposals without faulting, and the full group
 /// still replaces its lost leader and converges.
 #[test]
 fn full_journal_refuses_proposals_and_replaces_its_leader() {
-    checked(1, "none", "full");
+    one_partition(1, "none", "full");
     // Light faults also change views before the journal fills.
-    checked(4, "light", "full");
+    one_partition(4, "light", "full");
 }
 
 /// Followers that need several times the leader's space pack sparse
 /// segments instead of filling, so the group keeps confirming and converges.
 #[test]
 fn sparse_followers_pack_instead_of_filling() {
-    checked(1, "none", "sparse-followers");
+    one_partition(1, "none", "sparse-followers");
 }
 
 /// A follower that missed a long history catches up within one view
@@ -490,35 +508,35 @@ fn sparse_followers_pack_instead_of_filling() {
 fn lagging_sparse_follower_installs_a_long_suffix_at_the_limit() {
     // The catch-up outlasts the 8 s longest election timeout, yet ends in
     // the first view after the old one.
-    assert_eq!(checked(1, "none", "sparse-rejoin").view, 1);
+    assert_eq!(one_partition(1, "none", "sparse-rejoin").view, 1);
 }
 
 /// A follower, then the leader, lose power and restart over their durable
 /// disks. Each rejoins without losing a confirmed operation.
 #[test]
 fn crashed_brokers_restart_and_rejoin() {
-    checked(1, "none", "crash");
+    one_partition(1, "none", "crash");
 }
 
 /// A broker whose disk fails writes and syncs stops, restarts over what its
 /// disk kept, and rejoins. The leader is replaced meanwhile.
 #[test]
 fn failed_disk_stops_and_restarts_its_broker() {
-    checked(1, "none", "disk-error");
+    one_partition(1, "none", "disk-error");
 }
 
 /// A follower, then the leader, are killed and restart over their cached
 /// disks. Each rejoins without losing a confirmed operation.
 #[test]
 fn killed_brokers_restart_and_rejoin() {
-    checked(1, "none", "kill");
+    one_partition(1, "none", "kill");
 }
 
 /// All three brokers lose power at once and elect again over their durable
 /// disks without losing a committed operation.
 #[test]
 fn whole_cluster_power_loss_keeps_every_commit() {
-    let report = checked(1, "none", "power-loss");
+    let report = one_partition(1, "none", "power-loss");
     // Rolls publish the applied commit, and an installation replays only
     // after the state a restart recovered. Refetching or replaying all
     // history takes twice as long.
@@ -532,35 +550,35 @@ fn whole_cluster_power_loss_keeps_every_commit() {
 /// second recovery keeps every commit too.
 #[test]
 fn power_loss_during_recovery_keeps_every_commit() {
-    checked(1, "none", "recovery-crash");
+    one_partition(1, "none", "recovery-crash");
 }
 
 /// Power fails while every disk holds queued writes. Whatever part of them
 /// reached media, every commit survives.
 #[test]
 fn power_loss_mid_write_keeps_every_commit() {
-    checked(1, "none", "torn-write");
+    one_partition(1, "none", "torn-write");
 }
 
 /// A leader whose disk stalls hands over to the two healthy brokers, then
 /// rejoins once its disk recovers.
 #[test]
 fn stalled_leader_disk_is_replaced() {
-    checked(1, "none", "disk-stall");
+    one_partition(1, "none", "disk-stall");
 }
 
 /// A leader whose process stops is replaced. Once it resumes, its due
 /// timers and stale input do not disturb the newer view.
 #[test]
 fn paused_leader_is_replaced_and_resumes_as_follower() {
-    checked(1, "none", "pause");
+    one_partition(1, "none", "pause");
 }
 
 /// A leader that only hears, then one that only speaks, is replaced by the
 /// two brokers that still talk both ways.
 #[test]
 fn one_way_cut_leaders_are_replaced() {
-    checked(1, "none", "one-way");
+    one_partition(1, "none", "one-way");
 }
 
 /// Negative control: every disk loses what it reported done in the last 5 s.
@@ -581,11 +599,17 @@ fn rewound_disks_fail_the_run() {
 /// confirmed record and converge once they end.
 #[test]
 fn random_overlapping_faults_keep_history_and_converge() {
-    for (seed, profile) in [(1, "none"), (2, "light")] {
-        let report = checked(seed, profile, "chaos");
-        assert!(report.faults >= 20, "{report:?}");
-        eprintln!("{report:?}");
-    }
+    let report = checked(1, "none", "chaos");
+    assert!(report.faults >= 20, "{report:?}");
+    eprintln!("{report:?}");
+}
+
+/// As above, with the light profile's loss, delay, and short cuts too.
+#[test]
+fn random_overlapping_and_network_faults_keep_history_and_converge() {
+    let report = checked(2, "light", "chaos");
+    assert!(report.faults >= 20, "{report:?}");
+    eprintln!("{report:?}");
 }
 
 /// Seeds that found bugs. Schedules move with the code, so each names what
@@ -597,7 +621,7 @@ fn regression_seeds() {
     checked(5, "swarm", "random");
     // A follower refused a proposal it still held, after a due retention
     // turn had deferred to it. Nothing asked for the next round.
-    checked(74, "slow", "crash");
+    one_partition(74, "slow", "crash");
 }
 
 /// Process-wide state would leak from one run into the next one.
@@ -613,7 +637,7 @@ fn same_seed_replays_in_one_process() {
 /// Seed campaigns. The `::stress::` path keeps them out of the fast suite.
 mod seeded {
     mod stress {
-        use super::super::{checked, outcome, reproduce};
+        use super::super::{GROUPS, checked, outcome, reproduce};
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
         const PROFILES: [&str; 5] = ["none", "light", "heavy", "swarm", "slow"];
@@ -647,7 +671,8 @@ mod seeded {
 
         /// `OZZY_ACTOR_SIM_SEEDS` seeds (default 20) over every scenario and
         /// its profiles, or `OZZY_ACTOR_SIM_SEED`. `OZZY_ACTOR_SIM_PROFILE` and
-        /// `OZZY_ACTOR_SIM_SCENARIO` pick one of each. Runs share nothing, so
+        /// `OZZY_ACTOR_SIM_SCENARIO` pick one of each, and
+        /// `OZZY_ACTOR_SIM_PARTITIONS` hosts one partition instead of two. Runs share nothing, so
         /// they spread over `OZZY_ACTOR_SIM_THREADS` threads (default: one per
         /// core). Any failure stops the campaign; vacuous runs fail only above
         /// one in twenty.
@@ -678,6 +703,14 @@ mod seeded {
                     .map_or(20, |count| count.parse().expect("OZZY_ACTOR_SIM_SEEDS"));
                 (1..=count).collect()
             };
+            let partitions = std::env::var("OZZY_ACTOR_SIM_PARTITIONS")
+                .map_or(GROUPS.len(), |count| {
+                    count.parse().expect("OZZY_ACTOR_SIM_PARTITIONS")
+                });
+            assert!(
+                (1..=GROUPS.len()).contains(&partitions),
+                "OZZY_ACTOR_SIM_PARTITIONS is 1 or 2"
+            );
             let threads = std::env::var("OZZY_ACTOR_SIM_THREADS").map_or_else(
                 |_| std::thread::available_parallelism().map_or(1, usize::from),
                 |threads| threads.parse().expect("OZZY_ACTOR_SIM_THREADS"),
@@ -704,11 +737,11 @@ mod seeded {
                     else {
                         break;
                     };
-                    let report = outcome(seed, profile, scenario);
+                    let report = outcome(seed, profile, scenario, partitions);
                     if report.vacuous {
                         eprintln!(
                             "vacuous: {report:?}\n  {}",
-                            reproduce(seed, profile, scenario)
+                            reproduce(seed, profile, scenario, partitions)
                         );
                         vacuous.push((seed, profile, scenario));
                     }

@@ -9,7 +9,7 @@ use ozzy_io::simulation::Image;
 use crate::{
     broker::{Broker, Lane, Shape, session},
     chaos::{self, Chaos, Kind},
-    check::{Checker, converged, leader},
+    check::{Checker, converged, leader, log_end},
     clock::Clock,
     consumer::{self, Consumers},
     disk::Disk,
@@ -33,6 +33,8 @@ pub(crate) struct Options {
     /// Further ticks to heal, settle outstanding proposals, and converge.
     pub drain: u64,
     pub clients: usize,
+    /// Partitions each broker hosts, one per group, on one device.
+    pub partitions: usize,
     /// Barrier operations per proposal.
     pub batch: usize,
     /// Journal segment limit and size.
@@ -61,6 +63,7 @@ pub(crate) struct Options {
 impl Options {
     fn shape(&self, broker: usize) -> Shape {
         Shape {
+            partitions: self.partitions,
             max_segments: self.max_segments,
             segment_bytes: self.segment_bytes,
             sparse: self.sparse.contains(&broker),
@@ -221,6 +224,9 @@ pub(crate) struct Report {
     pub faults: u64,
     /// Records confirmed and read.
     pub records: usize,
+    /// Live copies consumers read, and replay streams they canceled to go live.
+    pub live: u64,
+    pub cancels: u64,
     /// Below a vacuity floor, or a scripted fault never started: the run
     /// converged but proved little.
     pub vacuous: bool,
@@ -243,9 +249,10 @@ struct Sim {
     workload: Workload,
     producers: Producers,
     consumers: Consumers,
-    /// Every confirmed and read record.
-    ledger: Ledger,
-    checker: Checker,
+    /// Every confirmed and read record, by partition.
+    ledgers: Vec<Ledger>,
+    /// History checks, by group.
+    checkers: Vec<Checker>,
     trace: Trace,
     options: Options,
     /// The next scripted fault and a running isolation.
@@ -301,10 +308,12 @@ pub(crate) fn run(seed: u64, profile: Profile, options: Options) -> Result<Repor
         executor: Rng::new(seeds.executor),
         brokers,
         workload: Workload::new(lanes, seeds.workload, options.batch),
-        producers: Producers::new(seeds.producers),
-        consumers: Consumers::new(),
-        ledger: Ledger::default(),
-        checker: Checker::default(),
+        producers: Producers::new(seeds.producers, options.partitions),
+        consumers: Consumers::new(seeds.consumers, options.partitions, profile.pub_loss),
+        ledgers: (0..options.partitions).map(|_| Ledger::default()).collect(),
+        checkers: (0..options.partitions)
+            .map(|_| Checker::default())
+            .collect(),
         trace: Trace::default(),
         options,
         next_fault: 0,
@@ -320,7 +329,7 @@ pub(crate) fn run(seed: u64, profile: Profile, options: Options) -> Result<Repor
     let hash = sim.trace.value();
     let tick = sim.clock.tick();
     let detail = sim.detail();
-    let view = leader(&sim.brokers).map_or(0, |(_, view)| view);
+    let view = leader(&sim.brokers, 0).map_or(0, |(_, view)| view);
     let result = result.and_then(|applied| {
         for broker in sim.brokers {
             broker.shutdown()?;
@@ -332,13 +341,15 @@ pub(crate) fn run(seed: u64, profile: Profile, options: Options) -> Result<Repor
             hash,
             ticks: tick,
             confirmed: sim.workload.confirmed.len(),
-            compared: sim.checker.compared,
+            compared: sim.checkers.iter().map(|checker| checker.compared).sum(),
             applied,
             view,
             refused: sim.workload.counts.full,
             outage: sim.power_loss.and_then(|(_, outage)| outage),
             faults: sim.chaos.as_ref().map_or(0, Chaos::total),
-            records: sim.ledger.len(),
+            records: sim.ledgers.iter().map(Ledger::len).sum(),
+            live: sim.consumers.counts.published,
+            cancels: sim.consumers.counts.cancels,
             vacuous,
         })
         .map_err(|reason| {
@@ -387,8 +398,8 @@ impl Sim {
             let mut exited = None;
             let held_paused: [bool; BROKERS] =
                 std::array::from_fn(|index| self.held(index, Kind::Pause));
-            let held_failing: [bool; BROKERS] =
-                std::array::from_fn(|index| self.held(index, Kind::FailDisk));
+            // A random disk failure may surface after its fault ended.
+            let chaos = self.chaos.is_some();
             for step in 0..DISK_STEPS {
                 let at = tick * DISK_STEPS + step;
                 for index in order {
@@ -410,7 +421,7 @@ impl Sim {
                             if broker.disk.failed()
                                 && (self.isolation.is_some_and(|isolation| {
                                     isolation.broker == index && !isolation.restarted
-                                }) || held_failing[index]) =>
+                                }) || chaos) =>
                         {
                             exited = Some(index);
                         }
@@ -420,7 +431,6 @@ impl Sim {
             }
             if let Some(broker) = exited
                 && let Some(chaos) = &mut self.chaos
-                && chaos.holds(broker, Kind::FailDisk)
             {
                 // Its supervisor restarts it over the cache, healthy.
                 chaos
@@ -437,12 +447,12 @@ impl Sim {
                 }
             }
             self.workload
-                .step(tick, !draining, &mut self.checker, &mut self.trace)?;
+                .step(tick, !draining, &mut self.checkers[0], &mut self.trace)?;
             if self.options.records {
                 self.clients(tick, !draining)?;
             }
             for broker in &self.brokers {
-                let status = broker.status();
+                let status = broker.status(0);
                 if std::env::var_os("OZZY_ACTOR_SIM_TRACE").is_some() {
                     let shown = Some((
                         status.scope.view,
@@ -460,7 +470,11 @@ impl Sim {
                         last[broker.index] = shown;
                     }
                 }
-                self.checker.observe(broker.index, &status)?;
+                for (group, checker) in self.checkers.iter_mut().enumerate() {
+                    checker
+                        .observe(broker.index, &broker.status(group))
+                        .map_err(|reason| format!("group {group}: {reason}"))?;
+                }
                 let missed = broker.shard.sweep_progress();
                 if missed != 0 {
                     return Err(format!(
@@ -470,7 +484,7 @@ impl Sim {
                 }
             }
             if let Some((at, outage @ None)) = &mut self.power_loss
-                && leader(&self.brokers).is_some()
+                && (0..self.options.partitions).all(|group| leader(&self.brokers, group).is_some())
             {
                 *outage = Some(tick - *at);
             }
@@ -478,8 +492,13 @@ impl Sim {
                 && self.workload.idle()
                 && self.producers.idle()
                 && (!self.options.records
-                    || log_end(&self.brokers).is_some_and(|end| self.consumers.caught_up(end)))
-                && let Some(applied) = converged(&self.brokers)
+                    || (0..self.options.partitions).all(|partition| {
+                        log_end(&self.brokers, partition)
+                            .is_some_and(|end| self.consumers.caught_up(partition, end))
+                    }))
+                && (1..self.options.partitions)
+                    .all(|group| converged(&self.brokers, group).is_some())
+                && let Some(applied) = converged(&self.brokers, 0)
             {
                 return self.finish(applied);
             }
@@ -492,6 +511,7 @@ impl Sim {
 
     /// Hand every client its replies, then let producers and consumers send.
     fn clients(&mut self, tick: u64, submit: bool) -> Result<(), String> {
+        let now = self.clock.now();
         for broker in 0..BROKERS {
             while let Some(message) = self.brokers[broker].replies.pop_front() {
                 if let Some(index) = records::producer(&message) {
@@ -500,7 +520,7 @@ impl Sim {
                         broker,
                         &message,
                         tick,
-                        &mut self.ledger,
+                        &mut self.ledgers,
                         &mut self.trace,
                     )?;
                 } else if let Some(index) = consumer::consumer(&message) {
@@ -509,24 +529,37 @@ impl Sim {
                         broker,
                         &message,
                         tick,
-                        &mut self.ledger,
+                        now,
+                        &mut self.ledgers,
                         &self.producers,
                     )?;
                 }
             }
+            while let Some(message) = self.brokers[broker].publications.pop_front() {
+                self.consumers.publish(&self.brokers[broker], &message);
+            }
         }
         self.producers
             .step(tick, submit, &mut self.brokers, &mut self.trace)?;
-        let end = log_end(&self.brokers);
-        self.consumers
-            .step(tick, &mut self.brokers, end, &mut self.trace)
+        let ends: Vec<Option<u64>> = (0..self.options.partitions)
+            .map(|partition| log_end(&self.brokers, partition))
+            .collect();
+        self.consumers.step(
+            tick,
+            now,
+            &mut self.brokers,
+            &ends,
+            &mut self.ledgers,
+            &self.producers,
+            &mut self.trace,
+        )
     }
 
     /// End a due isolation, then start the next scripted fault once it is due
     /// and a leader exists.
     fn script(&mut self, tick: u64) -> Result<(), String> {
         if let Some(isolation) = &mut self.isolation
-            && leader(&self.brokers)
+            && leader(&self.brokers, 0)
                 .is_some_and(|(broker, view)| broker != isolation.broker && view > isolation.view)
         {
             isolation.replaced = true;
@@ -581,7 +614,7 @@ impl Sim {
         if self.isolation.is_none()
             && let Some(fault) = self.options.script.get(self.next_fault).copied()
             && tick >= fault.window().0
-            && let Some((leader, view)) = leader(&self.brokers)
+            && let Some((leader, view)) = leader(&self.brokers, 0)
         {
             self.next_fault += 1;
             self.trace.word(tick);
@@ -683,7 +716,9 @@ impl Sim {
         )?;
         self.brokers.insert(broker, restarted);
         self.workload.restarted(broker, lanes, tick);
-        self.checker.restarted(broker);
+        for checker in &mut self.checkers {
+            checker.restarted(broker);
+        }
         Ok(())
     }
 
@@ -862,16 +897,19 @@ impl Sim {
     /// The converged op, and whether the run was vacuous.
     fn finish(&self, applied: ozzy_replication::Prefix) -> Result<(u64, bool), String> {
         for broker in &self.brokers {
-            let facts = broker
-                .shard
-                .facts(crate::broker::GROUP, records::PARTITION)
-                .ok_or_else(|| format!("broker {}: no partition facts", broker.index))?;
-            self.ledger.check_log(
-                broker.index,
-                facts.next_offset.get(),
-                self.consumers.read_through(),
-                &self.producers,
-            )?;
+            for (partition, ledger) in self.ledgers.iter().enumerate() {
+                let facts = broker.facts(partition).ok_or_else(|| {
+                    format!("broker {}: no facts of partition {partition}", broker.index)
+                })?;
+                ledger
+                    .check_log(
+                        broker.index,
+                        facts.next_offset.get(),
+                        self.consumers.read_through(partition),
+                        &self.producers,
+                    )
+                    .map_err(|reason| format!("partition {partition}: {reason}"))?;
+            }
         }
         for through in &self.workload.confirmed {
             if through.op > applied.op {
@@ -886,8 +924,12 @@ impl Sim {
             || self.workload.counts.full < self.options.min_refused
             || applied.op.0 < self.options.min_applied
             || self.workload.confirmed.len() < self.options.min_confirmed
-            || (self.options.records && self.ledger.len() < self.options.min_confirmed)
-            || self.checker.compared < self.options.min_compared;
+            || (self.options.records
+                && self
+                    .ledgers
+                    .iter()
+                    .any(|ledger| ledger.len() < self.options.min_confirmed))
+            || self.checkers[0].compared < self.options.min_compared;
         Ok((applied.op.0, vacuous))
     }
 
@@ -897,14 +939,16 @@ impl Sim {
         let counts: Counts = self.workload.counts;
         let mut detail = format!(
             "network {network:?}, {} queued\nworkload {counts:?}, {} confirmed, {} compared\n\
-             producers {:?}, {} records confirmed\nconsumers {:?}, read through {}",
+             producers {:?}, {:?} records confirmed\nconsumers {:?}, read through {:?}",
             self.network.queued(),
             self.workload.confirmed.len(),
-            self.checker.compared,
+            self.checkers[0].compared,
             self.producers.counts,
-            self.ledger.len(),
+            self.ledgers.iter().map(Ledger::len).collect::<Vec<_>>(),
             self.consumers.counts,
-            self.consumers.read_through(),
+            (0..self.options.partitions)
+                .map(|partition| self.consumers.read_through(partition))
+                .collect::<Vec<_>>(),
         );
         if let Some(isolation) = self.isolation {
             let _ = write!(detail, "\nisolation {isolation:?}");
@@ -921,11 +965,16 @@ impl Sim {
         for entry in ozzy_runtime::profiling::recent_logs().iter().rev().take(8) {
             let _ = write!(detail, "\nlog {entry:?}");
         }
-        for broker in &self.brokers {
-            let status = broker.status();
+        let partitions = self.options.partitions;
+        for (broker, group) in self
+            .brokers
+            .iter()
+            .flat_map(|broker| (0..partitions).map(move |group| (broker, group)))
+        {
+            let status = broker.status(group);
             let _ = write!(
                 detail,
-                "\nbroker {}: restarts {} view {} ready {} normal {:?} disk {} unbound {} lanes {}/{}",
+                "\nbroker {} group {group}: restarts {} view {} ready {} normal {:?} disk {} unbound {} lanes {}/{}",
                 broker.index,
                 broker.incarnation,
                 status.scope.view,
@@ -944,13 +993,4 @@ impl Sim {
         }
         detail
     }
-}
-
-/// The newest ready leader's log end, when it reports one.
-fn log_end(brokers: &[Broker]) -> Option<u64> {
-    let (index, _) = leader(brokers)?;
-    brokers[index]
-        .shard
-        .facts(crate::broker::GROUP, records::PARTITION)
-        .map(|facts| facts.next_offset.get())
 }
