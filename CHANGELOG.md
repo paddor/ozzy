@@ -42,6 +42,11 @@
   commit.
 - A disk-quorum partition no longer leaves work it deferred during a
   segment roll waiting for the 100 ms safety sweep when the roll ends.
+- A disk-quorum partition with retention keeps admitting and writing while
+  a retention cleanup job removes old files. Every copy used to stop new
+  writes until the job finished, which on a slow disk stalled the partition
+  for most of a second after each retirement. Only installation and history
+  pins still wait for the job.
 
 ## [0.10.0] - 2026-11-05
 

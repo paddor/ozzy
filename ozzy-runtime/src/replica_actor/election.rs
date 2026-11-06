@@ -42,21 +42,21 @@ impl ReplicaActor {
         if self.schedule_durability()? {
             return Ok(());
         }
-        // Installation publishes and selects storage; a cleanup job beside
-        // writes finishes first.
-        if self.journal.cleaning() {
-            return Ok(());
-        }
-        if let Some(ticket) = self.driver.installation_ticket() {
-            return self.schedule_installation(&ticket);
-        }
-        if self.schedule_pin()? {
-            return Ok(());
+        // A cleanup job runs beside writes. Installation, pins, and
+        // activation select or publish storage, so they wait for it.
+        let cleaning = self.journal.cleaning();
+        if !cleaning {
+            if let Some(ticket) = self.driver.installation_ticket() {
+                return self.schedule_installation(&ticket);
+            }
+            if self.schedule_pin()? {
+                return Ok(());
+            }
         }
         if self.driver.normal().is_some() {
-            return self.schedule_activation(now, hold);
+            return self.schedule_activation(now, hold, cleaning);
         }
-        if self.transfer.is_some() || self.schedule_bridge()? {
+        if cleaning || self.transfer.is_some() || self.schedule_bridge()? {
             return Ok(());
         }
         self.select_or_install()
@@ -189,11 +189,19 @@ impl ReplicaActor {
         Ok(true)
     }
 
-    fn schedule_activation(&mut self, now: Duration, hold: bool) -> Result<(), ActorError> {
+    fn schedule_activation(
+        &mut self,
+        now: Duration,
+        hold: bool,
+        cleaning: bool,
+    ) -> Result<(), ActorError> {
         let snapshot = require_normal(&self.driver)?.snapshot();
         if let Ok(ticket) = self.driver.begin_activation() {
             // Already active normal cores need no repeated manifest publication.
             if self.activated != Some((snapshot.scope, snapshot.journal.generation)) {
+                if cleaning {
+                    return Ok(());
+                }
                 self.pending = Some(PendingIo::Activate(
                     self.journal.activate_installed(ticket)?,
                 ));
