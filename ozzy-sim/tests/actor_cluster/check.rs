@@ -127,6 +127,15 @@ pub(crate) fn leader(brokers: &[Broker], group: usize) -> Option<(usize, u64)> {
         .map(|(index, status)| (index, status.scope.view))
 }
 
+/// Every broker is ready in `group`'s view `view`. Each reset its election
+/// timeout on becoming ready, and none still fetches missed history.
+pub(crate) fn settled(brokers: &[Broker], group: usize, view: u64) -> bool {
+    brokers.iter().all(|broker| {
+        let status = broker.status(group);
+        status.application_ready && status.scope.view == view
+    })
+}
+
 /// `group`'s common applied prefix once one ready leader leads the newest
 /// view and every broker is ready in that view with the same applied prefix.
 pub(crate) fn converged(brokers: &[Broker], group: usize) -> Option<Prefix> {

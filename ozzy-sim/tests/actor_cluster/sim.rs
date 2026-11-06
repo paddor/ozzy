@@ -14,7 +14,7 @@ use ozzy_io::simulation::Image;
 use crate::{
     broker::{Broker, Control, Lane, Shape, session},
     chaos::{self, Chaos, Kind},
-    check::{Checker, converged, leader, log_end},
+    check::{Checker, converged, leader, log_end, settled},
     clock::Clock,
     consumer::{self, Consumers},
     disk::Disk,
@@ -522,7 +522,9 @@ impl Sim {
     }
 
     /// End a due isolation, then start the next scripted fault once it is due
-    /// and a leader exists.
+    /// and a leader exists. A leader fault also waits until every broker is
+    /// ready in its view, so the replacement bound covers no backed-off
+    /// timeout or catch-up left from earlier faults.
     fn script(&mut self, tick: u64) -> Result<(), String> {
         if let Some(isolation) = &mut self.isolation
             && leader(&self.brokers, 0)
@@ -584,6 +586,7 @@ impl Sim {
             && let Some(fault) = self.options.script.get(self.next_fault).copied()
             && tick >= fault.window().0
             && let Some((leader, view)) = leader(&self.brokers, 0)
+            && (!fault.leader() || settled(&self.brokers, 0, view))
         {
             self.next_fault += 1;
             self.trace.word(tick);

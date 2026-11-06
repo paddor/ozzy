@@ -1,5 +1,8 @@
 //! Scripted faults: one at a time, each from a tick once a ready leader
-//! exists.
+//! exists. A fault on the leader also waits until every broker is ready in
+//! its view: the others must replace it within the fault, and a timeout
+//! backed off by earlier views or a copy still catching up would stretch
+//! that past any fixed bound.
 
 /// A scripted fault.
 #[derive(Debug, Clone, Copy)]
