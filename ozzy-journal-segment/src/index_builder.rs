@@ -151,8 +151,12 @@ impl SegmentIndex {
     }
 
     /// Look up an exact canonical control-operation identity.
-    pub fn find_operation(&self, operation_id: OperationId) -> Option<OperationIndexEntry> {
-        self.view().find_operation(operation_id)
+    pub fn find_operation(
+        &self,
+        operation_id: OperationId,
+        through: u64,
+    ) -> Option<OperationIndexEntry> {
+        self.view().find_operation(operation_id, through)
     }
 
     /// Borrow the exact encoded physical representation.
@@ -355,7 +359,8 @@ impl RunKind {
         match self {
             Self::Batch | Self::Location => 8,
             Self::Message => MESSAGE_INDEX_ENTRY_BYTES,
-            Self::Operation => 16,
+            // Operation ID, then operation number.
+            Self::Operation => 24,
             Self::Schedule => 44,
         }
     }

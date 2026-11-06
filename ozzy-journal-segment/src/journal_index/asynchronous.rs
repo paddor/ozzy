@@ -309,6 +309,43 @@ impl Snapshot {
         ))
     }
 
+    /// Read operations in order from `first`, all from its segment: at most
+    /// `max_operations`, and after the first only while their span fits
+    /// `max_bytes`. One read serves them, instead of one per operation.
+    /// Empty when `first` is outside this prefix.
+    pub async fn read_operation_run(
+        &self,
+        first: u64,
+        max_operations: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<crate::DecodedOperation<'static>>, Error> {
+        let Some(start) = self.find_operation_number(first).await? else {
+            return Ok(Vec::new());
+        };
+        let mut locations = vec![start.location];
+        while locations.len() < max_operations {
+            let Some(next) = first
+                .checked_add(locations.len() as u64)
+                .filter(|number| *number <= self.through.op_number)
+            else {
+                break;
+            };
+            let Some(next) = self.find_operation_number(next).await? else {
+                break;
+            };
+            let span = next
+                .location
+                .entry_offset
+                .saturating_add(next.location.entry_bytes)
+                .saturating_sub(start.location.entry_offset);
+            if next.source != start.source || span > max_bytes as u64 {
+                break;
+            }
+            locations.push(next.location);
+        }
+        Ok(self.reader(start.source)?.operations(&locations).await?)
+    }
+
     /// Read an exact control operation by retry ID, verifying its canonical
     /// digest and operation identity against the captured index. The snapshot
     /// keeps each referenced segment protected until this read settles.
@@ -338,8 +375,7 @@ impl Snapshot {
             });
         }
         if let Some(active) = &self.active
-            && let Some(entry) = active.find_operation(id)
-            && entry.location.op_number <= through
+            && let Some(entry) = active.find_operation(id, through)
         {
             return Ok(Some(IndexedOperationLocation {
                 source: active.source(),

@@ -308,7 +308,8 @@ pub struct Assign {
     pub operation_id: OperationId,
 }
 
-/// Advance one partition's committed earliest-retained offset.
+/// Advance one partition's committed earliest-retained offset and the
+/// journal's operation floor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Trim {
     /// Exact partition record incarnation.
@@ -317,6 +318,11 @@ pub struct Trim {
     pub expected_floor: Offset,
     /// New monotonic retention floor.
     pub new_floor: Offset,
+    /// Expected current operation floor of the journal.
+    pub expected_operation_floor: u64,
+    /// New monotonic operation floor: control-operation identities claimed
+    /// before it are forgotten on every copy, so their history may retire.
+    pub new_operation_floor: u64,
     /// Exact control-operation retry identity.
     pub operation_id: OperationId,
 }

@@ -93,7 +93,11 @@ fn cooperative_active_index_preserves_prefix_bounds_and_exact_sorted_image() {
             for number in 1..=through {
                 let id = OperationId::from_bytes(u128::from(131 - number).to_be_bytes());
                 assert_eq!(
-                    actual.find_operation(id).unwrap().location.op_number,
+                    actual
+                        .find_operation(id, u64::MAX)
+                        .unwrap()
+                        .location
+                        .op_number,
                     number
                 );
             }
@@ -115,7 +119,7 @@ fn cooperative_active_index_preserves_prefix_bounds_and_exact_sorted_image() {
 }
 
 #[test]
-fn cooperative_active_index_cancellation_limits_and_duplicate_keys_keep_scan_unchanged() {
+fn cooperative_active_index_cancellation_limits_and_repeated_identities_keep_scan_unchanged() {
     let bytes = fixture(false);
     let scan = scan_segment(
         &bytes,
@@ -197,17 +201,20 @@ fn cooperative_active_index_cancellation_limits_and_duplicate_keys_keep_scan_unc
         crate::DecodeLimits::default(),
     )
     .unwrap();
-    let (duplicate, polls) = run(ActiveSegmentIndex::build_async(
+    let (repeated, polls) = run(ActiveSegmentIndex::build_async(
         &scan,
         130,
         OperationLimits::default(),
         IndexLimits::default(),
     ));
     assert!(polls > 2);
-    assert!(matches!(
-        duplicate,
-        Err(ActiveIndexError::File(IndexFileError::UnsortedOrDuplicate(
-            "operation"
-        )))
-    ));
+    // An identity retried after the operation floor forgot it keeps one row
+    // per claim; a lookup finds the newest at or before its bound.
+    let repeated = repeated.unwrap().unwrap();
+    let id = OperationId::from_bytes(130u128.to_be_bytes());
+    for (through, claim) in [(u64::MAX, 130), (130, 130), (129, 1), (1, 1)] {
+        let found = repeated.find_operation(id, through).unwrap();
+        assert_eq!(found.location.op_number, claim);
+    }
+    assert_eq!(repeated.find_operation(id, 0), None);
 }

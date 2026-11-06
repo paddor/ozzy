@@ -3,7 +3,7 @@
 use super::{
     AssignmentKey, AssignmentState, CanonicalPartition, CanonicalState, IdentityClaim,
     IdentityIndex, Mutation, PartitionAddress, PartitionIncarnation, StateError, TransitionPlan,
-    operation_claim, progress_key, require_id, require_progress_owner,
+    TrimFloors, progress_key, require_id, require_progress_owner,
 };
 use ahash::AHashMap as HashMap;
 use ozzy_journal::operation::{
@@ -40,7 +40,7 @@ impl CanonicalState {
             OperationBody::PartitionPolicy(value) => {
                 self.prepare_policy(*value, op_number, identities)?
             }
-            OperationBody::Barrier(value) => Self::prepare_barrier(*value, op_number, identities)?,
+            OperationBody::Barrier(value) => self.prepare_barrier(*value, op_number, identities)?,
             OperationBody::ProducerResultFloor(value) => {
                 self.prepare_producer_result_floor(*value, op_number, identities)?
             }
@@ -155,7 +155,7 @@ impl CanonicalState {
         {
             return Err(StateError::ProducerEpochNotAdvanced);
         }
-        let claims = operation_claim(value.operation_id, op_number, identities)?;
+        let claims = self.operation_claim(value.operation_id, op_number, identities)?;
         Ok((
             Mutation::OpenProducer {
                 partition: value.partition,
@@ -264,7 +264,7 @@ impl CanonicalState {
         {
             return Err(StateError::LimitExceeded("assignments"));
         }
-        let claims = operation_claim(value.operation_id, op_number, identities)?;
+        let claims = self.operation_claim(value.operation_id, op_number, identities)?;
         Ok((
             Mutation::Assign {
                 key,
@@ -314,24 +314,37 @@ impl CanonicalState {
         identities: &impl IdentityIndex,
     ) -> Result<(Mutation, Vec<IdentityClaim>), StateError> {
         let partition = self.require_partition(value.partition)?;
-        if value.expected_floor != partition.retained_from {
+        if value.expected_floor != partition.retained_from
+            || value.expected_operation_floor != self.operation_floor
+        {
             return Err(StateError::TrimFloorMismatch);
         }
-        if value.new_floor <= value.expected_floor || value.new_floor > partition.next_offset {
+        // Either floor may stay; one must advance. An operation floor never
+        // passes the trim itself, so no claim it makes is forgotten at once.
+        let records = value.new_floor > value.expected_floor;
+        let operations = value.new_operation_floor > value.expected_operation_floor;
+        if value.new_floor < value.expected_floor
+            || value.new_floor > partition.next_offset
+            || value.new_operation_floor < value.expected_operation_floor
+            || value.new_operation_floor > op_number
+            || !(records || operations)
+        {
             return Err(StateError::InvalidTrimFloor);
         }
-        if partition
-            .producer_result_offset_floor()
-            .is_none_or(|retry_floor| value.new_floor > retry_floor)
+        if records
+            && partition
+                .producer_result_offset_floor()
+                .is_none_or(|retry_floor| value.new_floor > retry_floor)
         {
             return Err(StateError::TrimBeyondProducerResults);
         }
-        let claims = operation_claim(value.operation_id, op_number, identities)?;
+        let claims = self.operation_claim(value.operation_id, op_number, identities)?;
         Ok((
-            Mutation::Trim {
+            Mutation::Trim(TrimFloors {
                 partition: value.partition,
                 retained_from: value.new_floor,
-            },
+                operation_floor: value.new_operation_floor,
+            }),
             claims,
         ))
     }
@@ -349,7 +362,7 @@ impl CanonicalState {
         if value.expected_revision.checked_add(1) != Some(value.new_revision) {
             return Err(StateError::PolicyRevisionNotAdvanced);
         }
-        let claims = operation_claim(value.operation_id, op_number, identities)?;
+        let claims = self.operation_claim(value.operation_id, op_number, identities)?;
         Ok((
             Mutation::Policy {
                 partition: value.partition,
@@ -381,7 +394,7 @@ impl CanonicalState {
         {
             return Err(StateError::InvalidProducerResultFloor);
         }
-        let claims = operation_claim(value.operation_id, op_number, identities)?;
+        let claims = self.operation_claim(value.operation_id, op_number, identities)?;
         Ok((
             Mutation::ProducerResultFloor {
                 partition: value.partition,
@@ -418,13 +431,14 @@ impl CanonicalState {
     }
 
     fn prepare_barrier(
+        &self,
         value: Barrier,
         op_number: u64,
         identities: &impl IdentityIndex,
     ) -> Result<(Mutation, Vec<IdentityClaim>), StateError> {
         Ok((
             Mutation::Barrier,
-            operation_claim(value.operation_id, op_number, identities)?,
+            self.operation_claim(value.operation_id, op_number, identities)?,
         ))
     }
 

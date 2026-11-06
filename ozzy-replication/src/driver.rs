@@ -358,9 +358,7 @@ impl ReplicaDriver {
             || (outstanding && self.now >= self.progress_deadline)
             || (snapshot.accepted.op > snapshot.journal.durable
                 && self.now >= self.persistence_deadline)
-            || self
-                .storage_busy_since
-                .is_some_and(|since| self.now >= since.saturating_add(self.timing.primary_timeout))
+            || self.storage_timed_out()
     }
 
     fn next_view(&mut self) -> Result<(), DriverError> {

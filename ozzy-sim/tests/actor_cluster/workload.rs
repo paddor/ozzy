@@ -60,6 +60,8 @@ pub(crate) struct Workload {
     /// Barrier operations per proposal.
     batch: usize,
     rng: Rng,
+    /// A broker clients gave up on.
+    avoid: Option<usize>,
     /// Every confirmed prefix, in confirmation order.
     pub confirmed: Vec<Prefix>,
     pub counts: Counts,
@@ -88,6 +90,7 @@ impl Workload {
             clients,
             batch,
             rng: Rng::new(seed),
+            avoid: None,
             confirmed: Vec::new(),
             counts: Counts::default(),
         }
@@ -108,10 +111,27 @@ impl Workload {
                 client.pending = None;
                 self.counts.stopped += 1;
                 client.resent = true;
-                client.target = other(&mut self.rng, broker);
+                client.target = other(&mut self.rng, broker, self.avoid);
                 client.next_at = tick + RESEND;
             }
             client.lanes[broker] = Some(lane);
+        }
+    }
+
+    /// Clients give up on `broker` for good, as an SDK does once its requests
+    /// time out. Proposals outstanding there have unknown outcomes.
+    pub(crate) fn avoid(&mut self, broker: usize, tick: u64) {
+        self.avoid = Some(broker);
+        for client in &mut self.clients {
+            if client.pending.as_ref().is_some_and(|(at, _)| *at == broker) {
+                client.pending = None;
+                self.counts.stopped += 1;
+                client.resent = true;
+                client.next_at = tick + REDIRECT;
+            }
+            if client.target == broker {
+                client.target = other(&mut self.rng, broker, self.avoid);
+            }
         }
     }
 
@@ -146,7 +166,7 @@ impl Workload {
                     self.counts.stopped += 1;
                     client.lanes[broker] = None;
                     client.resent = true;
-                    client.target = other(&mut self.rng, broker);
+                    client.target = other(&mut self.rng, broker, self.avoid);
                     client.next_at = tick + RESEND;
                     continue;
                 };
@@ -162,13 +182,13 @@ impl Workload {
                     }
                     ProposalOutcome::NotAdmitted => {
                         self.counts.not_admitted += 1;
-                        client.target = other(&mut self.rng, broker);
+                        client.target = other(&mut self.rng, broker, self.avoid);
                         client.next_at = tick + REDIRECT;
                     }
                     ProposalOutcome::Unknown => {
                         self.counts.unknown += 1;
                         client.resent = true;
-                        client.target = other(&mut self.rng, broker);
+                        client.target = other(&mut self.rng, broker, self.avoid);
                         client.next_at = tick + RESEND;
                     }
                     ProposalOutcome::Invalid(JournalError::RollCapacity) => {
@@ -192,7 +212,7 @@ impl Workload {
             }
             let target = client.target;
             let Some(lane) = &mut client.lanes[target] else {
-                client.target = other(&mut self.rng, target);
+                client.target = other(&mut self.rng, target, self.avoid);
                 continue;
             };
             let mut buffer = lane.buffer.take().expect("idle lane keeps its arena");
@@ -224,7 +244,7 @@ impl Workload {
                     ..
                 }) => {
                     client.lanes[target] = None;
-                    client.target = other(&mut self.rng, target);
+                    client.target = other(&mut self.rng, target, self.avoid);
                 }
                 Err(rejected) => {
                     return Err(format!(
@@ -247,7 +267,12 @@ impl Client {
     }
 }
 
-/// A random broker other than `broker`.
-fn other(rng: &mut Rng, broker: usize) -> usize {
-    (broker + 1 + rng.below(BROKERS as u64 - 1) as usize) % BROKERS
+/// A random broker other than `broker` and `avoid`.
+fn other(rng: &mut Rng, broker: usize, avoid: Option<usize>) -> usize {
+    match avoid {
+        Some(avoid) if avoid != broker => (0..BROKERS)
+            .find(|index| *index != broker && *index != avoid)
+            .expect("three brokers"),
+        _ => (broker + 1 + rng.below(BROKERS as u64 - 1) as usize) % BROKERS,
+    }
 }

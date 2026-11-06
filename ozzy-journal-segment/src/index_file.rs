@@ -19,7 +19,7 @@ pub(crate) use asynchronous::decode_segment_index_async;
 pub use error::IndexFileError;
 pub(crate) use order::{
     compare_batch_entries, compare_locations, compare_message_rows, compare_operation_entries,
-    compare_schedule_entries,
+    compare_schedule_entries, newest_operation,
 };
 pub(crate) use rows::{
     RowBase, encode_batch_entry, encode_index_header, encode_message_row, encode_operation_entry,

@@ -7,23 +7,25 @@ use ozzy_core::dedup::AttemptOperation;
 use ozzy_journal::operation::AppendBatchView;
 use ozzy_proto::{MessageId, PartitionIncarnation};
 use ozzy_replication::{JournalGeneration, Scope, driver::ValidationTicket};
-use tokio::time::Instant;
+use std::time::Duration;
 
 #[derive(Debug)]
 pub(super) struct Clock {
     scope: Scope,
     generation: JournalGeneration,
     base: u64,
-    start: Instant,
+    start: Duration,
 }
 
 impl Clock {
+    /// Logical time at monotonic time `now`: the accepted time when this
+    /// view began, plus the time since.
     pub(super) fn time(
         clock: &mut Option<Self>,
         ticket: ValidationTicket,
         accepted_time: u64,
+        now: Duration,
     ) -> Result<u64, JournalError> {
-        let now = Instant::now();
         let clock = clock.get_or_insert_with(|| Self {
             scope: ticket.scope(),
             generation: ticket.generation(),
@@ -38,7 +40,7 @@ impl Clock {
                 start: now,
             };
         }
-        let elapsed = u64::try_from(now.duration_since(clock.start).as_millis())
+        let elapsed = u64::try_from(now.saturating_sub(clock.start).as_millis())
             .map_err(|_| JournalError::AppendCapacity)?;
         let time = clock
             .base
@@ -57,6 +59,7 @@ impl OwnedJournal {
         &mut self,
         ticket: ValidationTicket,
         buffer: &AppendBuffer,
+        now: Duration,
     ) -> Result<Rewrite, JournalError> {
         let limits = self.dedup.limits.ok_or(JournalError::Configuration)?;
         let record_bound = limits
@@ -76,7 +79,7 @@ impl OwnedJournal {
             .ok_or(JournalError::AppendMismatch)?;
         let batches = buffer.producer_batches(self.limits.operations)?;
         image.index.expire(record_bound, limits.bytes);
-        let time = Clock::time(&mut self.dedup.clock, ticket, image.time)?;
+        let time = Clock::time(&mut self.dedup.clock, ticket, image.time, now)?;
         let first = ticket
             .accepted()
             .op

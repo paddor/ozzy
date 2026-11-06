@@ -15,6 +15,7 @@ use ozzy_proto::layout::{self, Fixed, Reader};
 #[derive(Debug, Clone, Copy)]
 struct SnapshotShape {
     revision: u64,
+    operation_floor: u64,
     partition_count: usize,
     progress_count: usize,
     assignment_count: usize,
@@ -36,6 +37,7 @@ pub(super) async fn decode(
     let shape = decode_snapshot_shape(input, state_limits, limits, step).await?;
     let mut state = CanonicalState::new(state_limits);
     state.revision = shape.revision;
+    state.operation_floor = shape.operation_floor;
     let mut entries = Reader::new(input);
     entries.take(STATE_SNAPSHOT_HEADER_BYTES)?;
     decode_partitions(
@@ -193,7 +195,7 @@ async fn decode_snapshot_shape(
         || header.u32_at::<12>() != 0
         || header.u32_at::<44>() != 0
         || header
-            .slice::<124, { STATE_SNAPSHOT_HEADER_BYTES - 124 }>()
+            .slice::<132, { STATE_SNAPSHOT_HEADER_BYTES - 132 }>()
             .iter()
             .any(|byte| *byte != 0)
     {
@@ -220,6 +222,7 @@ impl SnapshotShape {
     fn decode(header: &[u8; STATE_SNAPSHOT_HEADER_BYTES]) -> Result<Self, StateSnapshotError> {
         Ok(Self {
             revision: header.u64_at::<24>(),
+            operation_floor: header.u64_at::<124>(),
             partition_count: header.u32_at::<32>() as usize,
             progress_count: header.u32_at::<36>() as usize,
             assignment_count: header.u32_at::<40>() as usize,
@@ -234,6 +237,9 @@ impl SnapshotShape {
     /// Check every declared count against the live-state limits before any
     /// entry is decoded.
     fn enforce(&self, limits: StateLimits) -> Result<(), StateSnapshotError> {
+        if self.operation_floor > self.revision {
+            return Err(StateSnapshotError::InvalidOperationFloor);
+        }
         enforce_limit("partitions", self.partition_count, limits.max_partitions)?;
         enforce_limit("consumer groups", self.group_count, limits.max_groups)?;
         enforce_limit(

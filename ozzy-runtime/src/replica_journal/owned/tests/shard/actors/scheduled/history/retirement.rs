@@ -1,7 +1,10 @@
 use super::*;
 use crate::replica_journal::owned::tests::{
     replay::persist,
-    writeback::{confirm, replica},
+    writeback::{
+        self, confirm, finish, initialize_writer, prepare, raise_operation_floor, replica,
+        synchronize,
+    },
 };
 use ozzy_proto::CheckpointId;
 use ozzy_replication::wire::Control;
@@ -25,7 +28,16 @@ fn election_bridges_retired_commit(installed_view: u64) {
     let mut primary = replica(&mut controller, io.clone(), 0, 8192);
     let mut lagging = replica(&mut controller, io.clone(), 1, 8192);
     let mut witness = replica(&mut controller, io.clone(), 2, 8192);
-    let mut accepted = Prefix::GENESIS;
+    // A partition, so a trim can raise the operation floor for retirement.
+    for replica in [&mut primary, &mut lagging, &mut witness] {
+        let receipt = initialize_writer(&mut controller, replica);
+        let work = prepare(replica);
+        finish(&mut controller, replica, work);
+        writeback::settle(replica, receipt);
+        synchronize(&mut controller, replica);
+    }
+    confirm(&mut primary, &witness);
+    let mut accepted;
     for number in 1..=4 {
         accepted = persist(&mut controller, &mut primary);
         persist(&mut controller, &mut witness);
@@ -55,6 +67,7 @@ fn election_bridges_retired_commit(installed_view: u64) {
             primary.journal.complete_roll(done).unwrap();
         }
     }
+    accepted = raise_operation_floor(&mut controller, &mut primary, &mut witness, 93);
     let retired = drive(
         &mut controller,
         primary.journal.retire_confirmed_history(
@@ -69,7 +82,8 @@ fn election_bridges_retired_commit(installed_view: u64) {
     .unwrap();
     assert_eq!(retired.unreferenced_segment_ids, [1, 2, 3]);
     // Seed a later installed view on the advanced copy. The old voter retains
-    // commit 1 and accepted 3; the chosen source retains only operation 4.
+    // commit 3 and accepted 5; the chosen source retains only operations 6
+    // and 7, the trim.
     drive(&mut controller, async {
         let stored = primary.journal.journal.ready_mut().unwrap();
         let mut manifest = stored.manifest().clone();
@@ -105,8 +119,8 @@ fn election_bridges_retired_commit(installed_view: u64) {
         .unwrap();
         let recovered = startup.recovered().unwrap();
         if index == 1 {
-            assert_eq!(recovered.log.committed.op.0, 1);
-            assert_eq!(recovered.log.accepted.op.0, 3);
+            assert_eq!(recovered.log.committed.op.0, 3);
+            assert_eq!(recovered.log.accepted.op.0, 5);
         }
         let journal = owner
             .into_shard_journal(

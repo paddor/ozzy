@@ -203,7 +203,7 @@ fn immutable_index_round_trips_and_binary_searches_without_entry_allocation() {
     assert_eq!(matches(0, 6), offsets(5, 5));
     assert_eq!(matches(7, 100), None);
     assert_eq!(
-        view.find_operation(OperationId::from_bytes([0x30; 16])),
+        view.find_operation(OperationId::from_bytes([0x30; 16]), u64::MAX),
         Some(image.operations()[0])
     );
 

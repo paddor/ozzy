@@ -5,6 +5,7 @@ use super::*;
 const PAUSED: crate::replica_journal::ClockReading = crate::replica_journal::ClockReading {
     wall_millis: NOW + 1_000_000,
     trusted: false,
+    monotonic: std::time::Duration::ZERO,
 };
 
 /// Whether `result` is the refusal a producer retries after a backoff.

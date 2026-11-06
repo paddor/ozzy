@@ -409,6 +409,46 @@ fn a_follower_receiving_expiry_with_the_reused_identities_waits_to_apply_it() {
     }
 }
 
+#[test]
+fn a_follower_receiving_an_original_with_its_reused_id_waits_for_its_commit() {
+    // The third broker misses an append, a watermark past its window, and
+    // the next append, which reuses its ID once the original committed.
+    // Staged as one suffix, the original's commit is unknown there. The
+    // broker must admit the original first and validate the reuse once it
+    // learns that commit, instead of failing its partition.
+    let pipeline = actor_config().pipeline;
+    let mut cluster = Cluster::new(crate::replica_journal::dedup_limits(
+        1_000,
+        64,
+        256 * 1024,
+        4,
+        pipeline,
+    ));
+    let before = cluster.actors[2].status().normal.unwrap().applied;
+    cluster.append(Some(Lag::Messages), 12, 0);
+    cluster.watermark(Some(Lag::Messages), 5_123);
+    cluster.submit(Some(Lag::Messages), &|buffer| {
+        let mut reuse = super::super::super::proposal::request(12, 1, 1);
+        reuse.records[0].message_id = ozzy_proto::MessageId::from_bytes([1; 16]);
+        buffer.prepare_append(reuse).unwrap();
+    });
+    assert_eq!(cluster.actors[2].status().normal.unwrap().applied, before);
+    let Cluster {
+        mut devices,
+        mut actors,
+        held,
+        now,
+        ..
+    } = cluster;
+    for message in &held {
+        actors[2].receive(message, now).unwrap();
+    }
+    catch_up(&mut devices, &mut actors, now);
+    for (actor, (controller, _)) in actors.into_iter().zip(&mut devices) {
+        scheduled::close(controller, actor);
+    }
+}
+
 /// Run until the third broker applies the leader's prefix. The idle leader
 /// announces its commit on its heartbeat.
 fn catch_up(devices: &mut [(Controller, Local)], actors: &mut [ScheduledReplica], now: Duration) {
@@ -520,103 +560,90 @@ struct Lagging {
     held: Vec<Message>,
 }
 
-/// With stalled writes, the third broker holds a deferred received suffix.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one controlled expiry schedule with a lagging follower"
-)]
-fn deferred_follower(lag: Lag) -> Lagging {
-    let mut devices: Vec<_> = (0..3).map(|_| setup()).collect();
-    let pipeline = actor_config().pipeline;
-    let limits = crate::replica_journal::dedup_limits(1_000, 4, 256 * 1024, 4, pipeline);
-    let (mut actors, bootstrap, mut lane, buffers) = {
-        let mut borrowed: Vec<_> = devices
-            .iter_mut()
-            .map(|(controller, io)| (controller, &*io))
-            .collect();
-        cluster_on(&mut borrowed, limits)
-    };
-    let mut buffers = Vec::from(buffers);
-    let mut held = Vec::new();
-    let mut now = Duration::ZERO;
-    let mut submit = |buffers: &mut Vec<ProposalBuffer>,
-                      actors: &mut [ScheduledReplica],
-                      devices: &mut [(Controller, Local)],
-                      held: &mut Vec<Message>,
-                      now: Duration,
-                      prepare: &dyn Fn(&mut ProposalBuffer),
-                      lagging: bool| {
-        let mut buffer = buffers.pop().unwrap();
-        prepare(&mut buffer);
-        let mut pending = Box::pin(lane.try_submit(buffer).unwrap());
-        for _ in 0..20000 {
-            for (to, message) in scheduled::collect(actors, now, false) {
-                if lagging && lag == Lag::Messages && to == 2 {
-                    held.push(message);
-                } else {
-                    actors[to].receive(&message, now).unwrap();
-                }
+/// A bootstrapped three-broker cluster on its own devices that proposes
+/// through broker 0's lane.
+struct Cluster {
+    devices: Vec<(Controller, Local)>,
+    actors: Vec<ScheduledReplica>,
+    lane: ProposalSubmitter,
+    buffers: Vec<ProposalBuffer>,
+    /// Messages to the third broker held back while it lagged.
+    held: Vec<Message>,
+    now: Duration,
+}
+
+impl Cluster {
+    fn new(limits: ozzy_core::dedup::Limits) -> Self {
+        let mut devices: Vec<_> = (0..3).map(|_| setup()).collect();
+        let (mut actors, bootstrap, lane, buffers) = {
+            let mut borrowed: Vec<_> = devices
+                .iter_mut()
+                .map(|(controller, io)| (controller, &*io))
+                .collect();
+            cluster_on(&mut borrowed, limits)
+        };
+        let mut bootstrap = Box::pin(bootstrap);
+        for _ in 0..10000 {
+            scheduled::round(&mut actors, false);
+            settle_devices(&mut devices, false);
+            if poll(bootstrap.as_mut()).is_ready() {
+                break;
             }
-            settle_devices(devices, lagging && lag == Lag::Writes);
+        }
+        Self {
+            devices,
+            actors,
+            lane,
+            buffers: Vec::from(buffers),
+            held: Vec::new(),
+            now: Duration::ZERO,
+        }
+    }
+
+    /// Propose one buffer and run until it commits, with the third broker
+    /// behind as `lag` says.
+    fn submit(&mut self, lag: Option<Lag>, prepare: &dyn Fn(&mut ProposalBuffer)) {
+        let mut buffer = self.buffers.pop().unwrap();
+        prepare(&mut buffer);
+        let mut pending = Box::pin(self.lane.try_submit(buffer).unwrap());
+        for _ in 0..20000 {
+            self.step(lag);
             if let Poll::Ready(reply) = poll(pending.as_mut()) {
                 let mut reply = reply.unwrap();
-                assert!(matches!(reply.outcome, ProposalOutcome::Committed { .. }));
+                assert!(
+                    matches!(reply.outcome, ProposalOutcome::Committed { .. }),
+                    "{:?}",
+                    reply.outcome
+                );
                 reply.buffer.clear();
-                buffers.push(reply.buffer);
+                self.buffers.push(reply.buffer);
                 return;
             }
         }
         panic!("proposal stopped progressing");
-    };
-    let mut bootstrap = Box::pin(bootstrap);
-    for _ in 0..10000 {
-        scheduled::round(&mut actors, false);
-        settle_devices(&mut devices, false);
-        if poll(bootstrap.as_mut()).is_ready() {
-            break;
+    }
+
+    /// Deliver one round of messages and run the devices, with the third
+    /// broker behind as `lag` says.
+    fn step(&mut self, lag: Option<Lag>) {
+        for (to, message) in scheduled::collect(&mut self.actors, self.now, false) {
+            if lag == Some(Lag::Messages) && to == 2 {
+                self.held.push(message);
+            } else {
+                self.actors[to].receive(&message, self.now).unwrap();
+            }
         }
+        settle_devices(&mut self.devices, lag == Some(Lag::Writes));
     }
-    for sequence in 0..4 {
-        submit(
-            &mut buffers,
-            &mut actors,
-            &mut devices,
-            &mut held,
-            now,
-            &|buffer| {
-                buffer
-                    .prepare_append(super::super::super::proposal::request(12, sequence, 1))
-                    .unwrap();
-            },
-            false,
-        );
-    }
-    if lag == Lag::Messages {
-        // The third broker applies the full window before it falls behind,
-        // so nothing earlier is left to apply when the held suffix arrives.
-        let leader = actors[0].status().normal.unwrap().applied;
-        while actors[2].status().normal.unwrap().applied != leader {
-            assert!(now < Duration::from_secs(1), "the follower must catch up");
-            now += Duration::from_millis(1);
-            scheduled::round_at(&mut actors, now, false);
-            settle_devices(&mut devices, false);
-        }
-    }
-    let released = actors[2].status().normal.unwrap().applied;
-    // Later logical time expires the full window once it commits.
-    super::CLOCK.with(|clock| clock.set(5_123));
-    submit(
-        &mut buffers,
-        &mut actors,
-        &mut devices,
-        &mut held,
-        now,
-        &|buffer| {
+
+    /// Propose a watermark that moves logical time to `time`.
+    fn watermark(&mut self, lag: Option<Lag>, time: u64) {
+        self.submit(lag, &|buffer| {
             let watermark =
                 OperationBody::DedupWatermark(ozzy_journal::operation::DedupWatermark {
                     partition: PartitionIncarnation::from_bytes([11; 16]),
                     owner_epoch: OwnerEpoch::INITIAL,
-                    logical_time: 5_123,
+                    logical_time: time,
                 });
             buffer
                 .push(
@@ -624,24 +651,61 @@ fn deferred_follower(lag: Lag) -> Lagging {
                     &encode_operation_body(&watermark, OperationLimits::default()).unwrap(),
                 )
                 .unwrap();
-        },
-        true,
-    );
-    for sequence in 4..8 {
-        submit(
-            &mut buffers,
-            &mut actors,
-            &mut devices,
-            &mut held,
-            now,
-            &|buffer| {
-                buffer
-                    .prepare_append(super::super::super::proposal::request(12, sequence, 1))
-                    .unwrap();
-            },
-            true,
-        );
+        });
     }
+
+    /// Propose writer `writer`'s one record at `sequence`.
+    fn append(&mut self, lag: Option<Lag>, writer: u8, sequence: u64) {
+        self.submit(lag, &|buffer| {
+            buffer
+                .prepare_append(super::super::super::proposal::request(writer, sequence, 1))
+                .unwrap();
+        });
+    }
+}
+
+/// With stalled writes, the third broker holds a deferred received suffix.
+fn deferred_follower(lag: Lag) -> Lagging {
+    let pipeline = actor_config().pipeline;
+    let mut cluster = Cluster::new(crate::replica_journal::dedup_limits(
+        1_000,
+        4,
+        256 * 1024,
+        4,
+        pipeline,
+    ));
+    for sequence in 0..4 {
+        cluster.append(None, 12, sequence);
+    }
+    if lag == Lag::Messages {
+        // The third broker applies the full window before it falls behind,
+        // so nothing earlier is left to apply when the held suffix arrives.
+        let leader = cluster.actors[0].status().normal.unwrap().applied;
+        while cluster.actors[2].status().normal.unwrap().applied != leader {
+            assert!(
+                cluster.now < Duration::from_secs(1),
+                "the follower must catch up"
+            );
+            cluster.now += Duration::from_millis(1);
+            scheduled::round_at(&mut cluster.actors, cluster.now, false);
+            settle_devices(&mut cluster.devices, false);
+        }
+    }
+    let released = cluster.actors[2].status().normal.unwrap().applied;
+    // Later logical time expires the full window once it commits.
+    super::CLOCK.with(|clock| clock.set(5_123));
+    cluster.watermark(Some(lag), 5_123);
+    for sequence in 4..8 {
+        cluster.append(Some(lag), 12, sequence);
+    }
+    let Cluster {
+        devices,
+        actors,
+        lane,
+        held,
+        now,
+        ..
+    } = cluster;
     Lagging {
         devices,
         actors,

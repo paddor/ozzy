@@ -129,7 +129,7 @@ pub(super) fn section_checks(
         ))
         .chain(raw_order_checks::<OPERATION_INDEX_ENTRY_BYTES>(
             view.operations,
-            16,
+            24,
             "operation",
         ))
         .chain(raw_order_checks::<SCHEDULE_INDEX_ENTRY_BYTES>(

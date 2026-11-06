@@ -182,6 +182,10 @@ part. General descriptors use:
   the committed revision it retires, operation ID.
 - `CreatePartition` stores the dedup window, then the maximum delay, as
   `u64` milliseconds; zero disables each. A partition cannot enable both.
+- `Trim` (kind 6): partition incarnation, expected and new record floor
+  `u64`, expected and new operation floor `u64`, operation ID. Either floor
+  may stay; one must advance. The operation floor never passes the trim's
+  own operation.
 - `RetireProducer` (kind 14): partition incarnation, producer ID, epoch
   `u64`, next sequence `u64`. It has no operation ID: the epoch and next
   sequence fence it against any open or append ordered first.
@@ -291,7 +295,19 @@ part. General descriptors use:
   identities are never evicted.
 - Expiry follows committed logical time only. A discarded `DedupWatermark`
   changes nothing. Followers apply confirmed time before admitting new IDs.
+- A leader's logical time is the accepted time when its view began, plus the
+  monotonic time since, as its journal clock reads it. Wall clock steps never
+  move it.
 - Both modes keep live IDs after their payloads retire.
+- An operation with an operation ID claims it at its operation number. Each
+  copy finds claims through its retained segment indexes.
+- Canonical state keeps an operation floor. A claim before it counts as
+  absent on every copy, whatever history that copy still holds, so copies
+  that retire on their own schedules agree. `Trim` raises the floor;
+  retirement never passes it.
+- A retry from before the floor counts as new: the fences of its kind
+  (expected epoch, revision, or floor) decide it again, and a barrier runs
+  again.
 
 ## Consumer progress and groups
 
@@ -439,6 +455,10 @@ duplicate results, and 64-byte scheduled records.
   per batch.
 - A message row holds one record's ID and its offset as a 32-bit delta from the
   header's first offset, sorted by ID, then offset.
+- An operation row holds a control operation's ID, number, location, and
+  digest, sorted by ID, then number. An ID retried after the operation floor
+  forgot it has one row per claim; a lookup takes the newest at or before
+  its bound.
 - Scheduled-record rows sort by partition, release key, then operation and
   record index, since a carried copy keeps its original's key. Each holds
   the key, its `Schedule` or `Carry` operation, record index, encoded bytes,
@@ -471,10 +491,10 @@ duplicate results, and 64-byte scheduled records.
 Canonical checkpoint images start with a 104-byte `OZYCIMG\0` header: version
 `u16` (1), six zero bytes, core snapshot length `u64`, partition incarnation
 (16 bytes), and the 64-byte dedup index header. The last 80 bytes are zero
-without an identity section. The core snapshot (`OZYSTA01`, version 6,
-256-byte header) follows, then identity rows. Bare snapshots and other versions
-are rejected. Coordinator group images are each a `u32` length plus the
-`GroupPlan` body.
+without an identity section. The core snapshot (`OZYSTA01`, version 7,
+256-byte header, which holds the operation floor) follows, then identity
+rows. Bare snapshots and other versions are rejected. Coordinator group images
+are each a `u32` length plus the `GroupPlan` body.
 
 The dedup index header is 64 bytes: `OZYDIDX\0`, version `u16` (1), six zero
 bytes, then six `u64` values: canonical operation, logical time, window, first
@@ -482,9 +502,10 @@ live offset, exclusive record end, and row count. Each 32-byte row is message
 ID, offset, and logical acceptance time. The enclosing checkpoint supplies
 integrity and partition authority.
 
-- Checkpoints hold state, producer coordinates, retry floors, live confirmed
-  identities, the last released key, carry floor, and held-record totals,
-  and the original committed operation and digest. Never payloads.
+- Checkpoints hold state, producer coordinates, retry floors, the operation
+  floor, live confirmed identities, the last released key, carry floor, and
+  held-record totals, and the original committed operation and digest. Never
+  payloads.
 - Failed or canceled builds never select themselves. Installation checks the
   captured position and source lineage.
 - Decoded state stays private until every chunk and the state digest match.
@@ -492,6 +513,9 @@ integrity and partition authority.
   or incomplete identity image supplies no admission state.
 - Recovery restores the matching identity image before admission. Canonical
   state alone cannot authorize an empty index.
+- Restore replays the operations after the checkpoint, or all of them
+  without one, in runs of up to 256 operations or 1 MiB from one segment.
+  Each run costs one length check and one read.
 - Received checkpoints stage privately; limits apply before allocation.
   Unselected input authorizes neither voting nor admission.
 
@@ -511,6 +535,10 @@ Topics set `retention.max_age_secs` and `retention.max_bytes`; see
   a checkpoint, publish a manifest without the prefix, then delete files.
   Payloads and duplicate proof operations go only after their producer result
   floors confirm.
+- A copy retires a segment only when all its operations lie before the
+  operation floor. The leader's `Trim` raises the floor to the end of the
+  prefix it retires, so a copy whose segment ends later waits for a later
+  trim.
 - Retention debt runs in bounded steps between foreground turns. The periodic
   interval applies only after catching up.
 - A due turn waits for accepted operations to apply. New proposals wait with

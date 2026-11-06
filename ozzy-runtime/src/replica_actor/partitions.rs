@@ -119,6 +119,13 @@ impl PartitionActors {
             .map(|&slot| self.actors[slot].status())
     }
 
+    /// Whether a known replicated partition's role suspects stalled storage.
+    #[cfg(test)]
+    pub(crate) fn storage_stalled(&self, group: GroupId) -> Option<bool> {
+        let slot = *self.index.get(&group)?;
+        Some(self.actors[slot].storage_moved().is_some())
+    }
+
     /// Whether a known local partition has no write or durable evidence outstanding.
     #[cfg(test)]
     pub(crate) fn storage_idle(&self, group: GroupId) -> Option<bool> {

@@ -185,6 +185,9 @@ impl TransitionPlan {
 pub struct CanonicalState {
     limits: StateLimits,
     revision: u64,
+    /// Control-operation identities claimed before this operation are
+    /// forgotten on every copy, whatever history it still holds.
+    operation_floor: u64,
     partitions: HashMap<PartitionIncarnation, CanonicalPartition>,
     addresses: HashMap<PartitionAddress, PartitionIncarnation>,
     progress: HashMap<ProgressKey, Offset>,
@@ -242,10 +245,7 @@ enum Mutation {
         key: AssignmentKey,
         value: AssignmentState,
     },
-    Trim {
-        partition: PartitionIncarnation,
-        retained_from: Offset,
-    },
+    Trim(TrimFloors),
     Policy {
         partition: PartitionIncarnation,
         revision: u64,
@@ -268,6 +268,14 @@ enum Mutation {
     Barrier,
 }
 
+/// The floors one validated `Trim` installs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TrimFloors {
+    partition: PartitionIncarnation,
+    retained_from: Offset,
+    operation_floor: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AppendCursor {
     partition: PartitionIncarnation,
@@ -288,6 +296,7 @@ impl CanonicalState {
         Self {
             limits,
             revision: 0,
+            operation_floor: 0,
             partitions: HashMap::new(),
             addresses: HashMap::new(),
             progress: HashMap::new(),
@@ -314,6 +323,36 @@ impl CanonicalState {
     /// Current mutation revision used to fence prepared transitions.
     pub const fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// First operation whose control-operation identity is still claimed.
+    /// `Trim` advances it; retirement never passes it, so every copy holds
+    /// each claim at or after it.
+    pub const fn operation_floor(&self) -> u64 {
+        self.operation_floor
+    }
+
+    /// A claim that still binds its identity: one at or after the operation
+    /// floor. Older claims count as absent on every copy.
+    pub fn live_claim(&self, claim: Option<IdentityClaim>) -> Option<IdentityClaim> {
+        claim.filter(|claim| claim.op_number >= self.operation_floor)
+    }
+
+    fn operation_claim(
+        &self,
+        operation_id: OperationId,
+        op_number: u64,
+        identities: &impl IdentityIndex,
+    ) -> Result<Vec<IdentityClaim>, StateError> {
+        require_id("operation", operation_id.as_bytes())?;
+        let claim = IdentityClaim {
+            operation_id,
+            op_number,
+        };
+        if self.live_claim(identities.lookup(claim.key())?).is_some() {
+            return Err(StateError::IdentityConflict);
+        }
+        Ok(vec![claim])
     }
 
     /// Look up live state for one exact partition incarnation.
@@ -354,22 +393,6 @@ impl CanonicalState {
     ) -> Option<Offset> {
         self.progress.get(&progress_key(owner, partition)).copied()
     }
-}
-
-fn operation_claim(
-    operation_id: OperationId,
-    op_number: u64,
-    identities: &impl IdentityIndex,
-) -> Result<Vec<IdentityClaim>, StateError> {
-    require_id("operation", operation_id.as_bytes())?;
-    let claim = IdentityClaim {
-        operation_id,
-        op_number,
-    };
-    if identities.lookup(claim.key())?.is_some() {
-        return Err(StateError::IdentityConflict);
-    }
-    Ok(vec![claim])
 }
 
 fn progress_key(owner: ProgressOwner, partition: PartitionIncarnation) -> ProgressKey {

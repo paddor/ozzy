@@ -18,7 +18,7 @@ fn turn(
         controller,
         journal.retention_turn(
             driver.begin_validation().unwrap(),
-            Some(now),
+            now.into(),
             OperationId::from_bytes([93; 16]),
             true,
         ),

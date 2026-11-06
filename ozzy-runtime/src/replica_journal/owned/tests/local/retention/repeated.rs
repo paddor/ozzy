@@ -290,7 +290,7 @@ fn seed(
         .retention_proposal(
             partition(),
             Offset::new(3),
-            0,
+            active_operation(&journal),
             OperationId::from_bytes([91; 16]),
         )
         .unwrap()

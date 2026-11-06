@@ -1,5 +1,6 @@
 //! Virtual time. Only the simulator advances it, one 10 ms tick at a time.
-//! Brokers see monotonic time as a `Duration` and Unix time in milliseconds.
+//! Brokers see monotonic time as a `Duration` and Unix time in milliseconds,
+//! each host's wall clock off by its own seeded offset.
 
 use std::{cell::Cell, rc::Rc, time::Duration};
 
@@ -26,7 +27,51 @@ impl Clock {
         TICK * u32::try_from(self.tick()).expect("tick count fits u32")
     }
 
+    /// True Unix time, as clients read it.
     pub(crate) fn unix_millis(&self) -> u64 {
-        EPOCH_MILLIS + self.tick() * TICK.as_millis() as u64
+        wall_millis(self.now())
+    }
+}
+
+/// True Unix time at monotonic time `now`.
+pub(crate) fn wall_millis(now: Duration) -> u64 {
+    EPOCH_MILLIS + u64::try_from(now.as_millis()).expect("time fits u64")
+}
+
+/// One host's wall clock: true time plus an offset that a clock step
+/// changes. A broker restart keeps its host's clock.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Host {
+    clock: Clock,
+    offset: Rc<Cell<i64>>,
+}
+
+impl Host {
+    pub(crate) fn new(clock: &Clock) -> Self {
+        Self {
+            clock: clock.clone(),
+            offset: Rc::default(),
+        }
+    }
+
+    pub(crate) fn wall_millis(&self) -> u64 {
+        self.clock
+            .unix_millis()
+            .checked_add_signed(self.offset.get())
+            .expect("wall clock in range")
+    }
+
+    /// Monotonic time, which no step moves.
+    pub(crate) fn now(&self) -> Duration {
+        self.clock.now()
+    }
+
+    pub(crate) fn offset(&self) -> i64 {
+        self.offset.get()
+    }
+
+    /// Step the wall clock to `offset` from true time.
+    pub(crate) fn step(&self, offset: i64) {
+        self.offset.set(offset);
     }
 }

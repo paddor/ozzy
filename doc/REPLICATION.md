@@ -100,14 +100,16 @@ sequenceDiagram
 ## Leader change
 
 A broker suspects the leader when contact, commit progress, or storage
-progress times out. Storage stalls when an admitted write stays undurable,
+progress times out. Any current-view COMMIT from the leader is contact,
+even one past the operations this copy holds. Storage stalls when an admitted write stays undurable,
 or when a journal command, such as a sync or maintenance step, is pending
 and the shard's storage lane completes no job for the primary timeout; such
 a command can hold new writes back. A long command whose jobs complete is
-not a stall. A suspicious leader stops heartbeats. In an election, a
-nonvoting recovery request from the view's primary is suspicion too: that
-primary cannot install its view. A restart's retained-history probe still
-votes and is not suspicion.
+not a stall, nor is one that completes a job after the timeout passed. A
+suspicious leader stops heartbeats. In an election, a nonvoting recovery
+request from the view's primary is suspicion too: that primary cannot
+install its view. A restart's retained-history probe still votes and is
+not suspicion.
 
 | Step | Gate |
 | --- | --- |
@@ -225,8 +227,10 @@ A copy that needs retired history withdraws into recovery instead of voting
 across the gap.
 
 - A follower told `HISTORY_RETIRED` for its next needed operation closes
-  intake, quarantines itself, and recovers. Unlike `--quarantine`, full
-  transfer removes its old files first; sealed damage still goes to repair.
+  intake, quarantines itself, and recovers. The leader tells it again at
+  most once per retransmission interval, in case the notice was lost.
+  Unlike `--quarantine`, full transfer removes its old files first; sealed
+  damage still goes to repair.
 - A retained-topic restart probes the other brokers first. If both answer in
   one view and the primary's retained boundary is past the local accepted
   prefix, it persists a nonvoting marker and recovers.
@@ -281,6 +285,7 @@ wall clock. A broker whose clock disagrees with the others stops them.
 - Other writes, reads, byte retention and its carries, and deduplication continue.
   Followers need no check: only the leader proposes these.
 - A paused leader holds due records until its clock is fixed or leadership moves.
+  Once the clocks agree again, records that came due meanwhile release at once.
   A paused leader does not give up its view.
 - A disagreement lasting a sample interval warns once on stderr and in the admin
   log, and again when it ends. Startup and lost peers pause without a warning.

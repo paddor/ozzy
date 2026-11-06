@@ -4,18 +4,35 @@
 //! and submit. Checks run after every tick. `OZZY_ACTOR_SIM_TRACE` prints
 //! each broker's view and positions when they change.
 
+mod floors;
+mod nemesis;
+mod outsider;
+mod script;
+
+pub(crate) use outsider::{OUTSIDER_TICKS, Stuck};
+pub(crate) use script::Fault;
+
+use ozzy_io::simulation::Image;
+
 use crate::{
-    broker::{Broker, Lane, Shape, session},
-    check::{Checker, converged, leader},
+    broker::{Broker, Control, Lane, Shape, session},
+    chaos::{Chaos, Kind},
+    check::{Checker, converged, leader, log_end, settled},
     clock::Clock,
+    consumer::{self, Consumers},
     disk::Disk,
     network::{BROKERS, Network, Profile, Stats},
+    records::{self, Ledger, Producers},
     seeds::{Rng, Seeds, Trace},
     workload::{Counts, Workload},
 };
 
 /// Disk completion steps per 10 ms tick.
 const DISK_STEPS: u64 = 10;
+
+/// A skewed leader's clock offset, 5 s ahead: past the tolerance, and past
+/// every due time a producer picks.
+const SKEW: i64 = 5000;
 
 /// Mean disk completion delay of a slow broker, in 1 ms steps: 2 to 16 times
 /// a profile's.
@@ -28,6 +45,8 @@ pub(crate) struct Options {
     /// Further ticks to heal, settle outstanding proposals, and converge.
     pub drain: u64,
     pub clients: usize,
+    /// Partitions each broker hosts, one per group, on one device.
+    pub partitions: usize,
     /// Barrier operations per proposal.
     pub batch: usize,
     /// Journal segment limit and size.
@@ -39,134 +58,61 @@ pub(crate) struct Options {
     pub sparse: &'static [usize],
     /// Brokers whose disk takes `SLOW_DISK_MEAN` per job.
     pub slow: &'static [usize],
-    /// Vacuity floors: confirmed proposals, ops two brokers reported, the
-    /// converged op, and proposals a full journal refused.
+    /// Producers append records beside the barrier clients.
+    pub records: bool,
+    /// Random overlapping faults beside the profile's and the script's.
+    pub chaos: bool,
+    /// The safeguard a negative control turns off, if any.
+    pub control: Control,
+    /// Both partitions retire records after `RETENTION_AGE`.
+    pub retention: bool,
+    /// Vacuity floors: confirmed proposals, confirmed records per partition,
+    /// ops two brokers reported, the converged op, and proposals a full
+    /// journal refused.
     pub min_confirmed: usize,
+    pub min_records: usize,
     pub min_compared: u64,
     pub min_applied: u64,
     pub min_refused: u64,
     /// Scripted faults in tick order, on top of the profile's random ones.
     pub script: &'static [Fault],
+    /// This many ticks before the drain, every fault ends but one broker
+    /// fails for good; the other two must keep committing and converge.
+    pub outsider: Option<u64>,
 }
 
 impl Options {
     fn shape(&self, broker: usize) -> Shape {
         Shape {
+            partitions: self.partitions,
+            control: self.control,
             max_segments: self.max_segments,
             segment_bytes: self.segment_bytes,
             sparse: self.sparse.contains(&broker),
+            retention: self.retention,
         }
     }
 }
 
-/// A scripted fault.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum Fault {
-    /// From tick `at`, once a ready leader exists, cut it off from both
-    /// peers for `ticks`. The other two must elect a ready leader before it
-    /// rejoins.
-    IsolateLeader { at: u64, ticks: u64 },
-    /// From tick `at`, once a ready leader exists, cut off one of its
-    /// followers for `ticks`, a sparse one if any. The other two keep going.
-    IsolateFollower { at: u64, ticks: u64 },
-    /// As `IsolateLeader`, but the leader also loses power and restarts
-    /// over its durable disk image. Its links come back after `ticks`.
-    CrashLeader { at: u64, ticks: u64 },
-    /// As `IsolateFollower`, with a power loss and restart.
-    CrashFollower { at: u64, ticks: u64 },
-    /// From tick `at`, once a ready leader exists, every broker loses power
-    /// at once and restarts over its durable disk image. Links come back at
-    /// once. No committed operation may be lost.
-    CrashAll { at: u64 },
-    /// After the last whole-cluster power loss, every broker loses power
-    /// again at a seeded tick within `within`, without waiting for a leader:
-    /// mid election, installation, or activation.
-    Recrash { within: u64 },
-    /// As `CrashAll`, but every disk first stops completing jobs, so writes
-    /// queue up. Power fails at a seeded tick within `within`, with those
-    /// writes in flight.
-    CrashAllMidWrite { at: u64, within: u64 },
-    /// From tick `at`, once a ready leader exists, its disk completes no job
-    /// for `ticks`. Links stay up and random partitions wait. Another broker
-    /// must lead before the disk recovers.
-    StallLeader { at: u64, ticks: u64 },
-    /// From tick `at`, once a ready leader exists, its process runs no turn
-    /// for `ticks`, as a VM pause or a stopped process does. Its disk and
-    /// links keep going; random partitions wait. Another broker must lead
-    /// before it resumes.
-    PauseLeader { at: u64, ticks: u64 },
-    /// As `IsolateLeader`, but only frames to the leader stop.
-    DeafLeader { at: u64, ticks: u64 },
-    /// As `IsolateLeader`, but only frames from the leader stop.
-    MuteLeader { at: u64, ticks: u64 },
-    /// From tick `at`, once a ready leader exists, every write and sync on
-    /// its disk fails. The broker stops on one, as a broker process exits,
-    /// restarts over what its disk kept, now healthy, and rejoins `ticks`
-    /// after the fault started. Random partitions wait. Another broker must lead meanwhile.
-    FailLeaderDisk { at: u64, ticks: u64 },
-    /// As `FailLeaderDisk`, on one of its followers, a sparse one if any.
-    FailFollowerDisk { at: u64, ticks: u64 },
-    /// As `CrashLeader`, but only the process dies. The restart sees what
-    /// its disk cached, and queued writes may still land.
-    KillLeader { at: u64, ticks: u64 },
-    /// As `CrashFollower`, but only the process dies.
-    KillFollower { at: u64, ticks: u64 },
-}
-
-impl Fault {
-    /// Its start tick and length.
-    const fn window(self) -> (u64, u64) {
-        match self {
-            Self::IsolateLeader { at, ticks }
-            | Self::IsolateFollower { at, ticks }
-            | Self::CrashLeader { at, ticks }
-            | Self::CrashFollower { at, ticks }
-            | Self::StallLeader { at, ticks }
-            | Self::PauseLeader { at, ticks }
-            | Self::DeafLeader { at, ticks }
-            | Self::MuteLeader { at, ticks }
-            | Self::FailLeaderDisk { at, ticks }
-            | Self::FailFollowerDisk { at, ticks }
-            | Self::KillLeader { at, ticks }
-            | Self::KillFollower { at, ticks }
-            | Self::CrashAllMidWrite { at, within: ticks } => (at, ticks),
-            Self::CrashAll { at } => (at, 0),
-            Self::Recrash { within } => (0, within),
-        }
-    }
-
-    const fn leader(self) -> bool {
-        matches!(
-            self,
-            Self::IsolateLeader { .. }
-                | Self::CrashLeader { .. }
-                | Self::StallLeader { .. }
-                | Self::PauseLeader { .. }
-                | Self::DeafLeader { .. }
-                | Self::MuteLeader { .. }
-                | Self::FailLeaderDisk { .. }
-                | Self::KillLeader { .. }
-        )
-    }
-
-    const fn crash(self) -> bool {
-        matches!(
-            self,
-            Self::CrashLeader { .. }
-                | Self::CrashFollower { .. }
-                | Self::CrashAll { .. }
-                | Self::Recrash { .. }
-                | Self::CrashAllMidWrite { .. }
-                | Self::KillLeader { .. }
-                | Self::KillFollower { .. }
-        )
-    }
+/// What survives a broker restart.
+#[derive(Debug)]
+enum Loss {
+    /// Only the process dies; the disk cache survives.
+    Process,
+    /// Power fails; what reached media survives.
+    Power,
+    /// What an earlier `Disk::snapshot` held survives.
+    Rewind(Image),
 }
 
 #[derive(Debug, Clone, Copy)]
 struct Isolation {
     broker: usize,
+    /// The ready leader and its view when the fault started, and the
+    /// proposals confirmed by then.
+    leader: usize,
     view: u64,
+    confirmed: usize,
     until: u64,
     /// After a leader fault another broker must take over. A crashed
     /// broker has no links until the isolation ends.
@@ -191,6 +137,31 @@ pub(crate) struct Report {
     pub refused: u64,
     /// Ticks from the last whole-cluster power loss until a leader serves.
     pub outage: Option<u64>,
+    /// Random overlapping faults started.
+    pub faults: u64,
+    /// Records confirmed and read, and how many of them were scheduled.
+    pub records: usize,
+    pub scheduled: usize,
+    /// Live copies consumers read, and replay streams they canceled to go live.
+    pub live: u64,
+    pub cancels: u64,
+    /// Dedup partition: producer restarts, sessions that retired, records a
+    /// resend found stored, and records stored again after their window.
+    pub restarts: u64,
+    pub retired: u64,
+    pub duplicates: u64,
+    pub repeats: usize,
+    /// Offsets retention retired, summed over partitions, and offsets
+    /// consumers skipped as a retention gap.
+    pub retained_from: u64,
+    pub skipped: u64,
+    /// Visits only the safety sweep found work for within 1 s of a clock
+    /// step, before the guard's next look could see it.
+    pub clock_wakeups: u64,
+    /// Frames delivered after their sender died.
+    pub after_crash: u64,
+    /// The broker that failed for good, and how.
+    pub outsider: Option<(usize, Stuck)>,
     /// Below a vacuity floor, or a scripted fault never started: the run
     /// converged but proved little.
     pub vacuous: bool,
@@ -211,7 +182,12 @@ struct Sim {
     executor: Rng,
     brokers: Vec<Broker>,
     workload: Workload,
-    checker: Checker,
+    producers: Producers,
+    consumers: Consumers,
+    /// Every confirmed and read record, by partition.
+    ledgers: Vec<Ledger>,
+    /// History checks, by group.
+    checkers: Vec<Checker>,
     trace: Trace,
     options: Options,
     /// The next scripted fault and a running isolation.
@@ -223,6 +199,24 @@ struct Sim {
     /// The seeded tick of a scheduled whole-cluster power loss. It holds
     /// later faults.
     crash_due: Option<u64>,
+    /// Disk copies a scheduled power loss rewinds to.
+    snapshots: Option<Vec<Image>>,
+    chaos: Option<Chaos>,
+    /// Connections between brokers so far, by pair; each new one after a
+    /// drop gets a fresh session.
+    links: [[u64; BROKERS]; BROKERS],
+    /// Whether two brokers have a connection now.
+    connected: [[bool; BROKERS]; BROKERS],
+    /// Visits only the safety sweep found work for right after a clock step
+    /// or the guard resuming.
+    clock_wakeups: u64,
+    /// Each copy's log start at the last look, by partition and broker.
+    floors: Vec<[u64; BROKERS]>,
+    /// The run seed, which picks how an outsider fails, and its stream,
+    /// which picks the broker.
+    seed: u64,
+    outsiders: Rng,
+    outsider: Option<outsider::Outsider>,
 }
 
 pub(crate) fn run(seed: u64, profile: Profile, options: Options) -> Result<Report, Box<Failure>> {
@@ -259,19 +253,50 @@ pub(crate) fn run(seed: u64, profile: Profile, options: Options) -> Result<Repor
         executor: Rng::new(seeds.executor),
         brokers,
         workload: Workload::new(lanes, seeds.workload, options.batch),
-        checker: Checker::default(),
+        producers: Producers::new(
+            seeds.producers,
+            options.partitions,
+            options.retention.then_some(crate::broker::RETENTION_AGE),
+        ),
+        consumers: Consumers::new(
+            seeds.consumers,
+            options.partitions,
+            profile.pub_loss,
+            options.retention.then_some(crate::broker::RETENTION_AGE),
+        ),
+        ledgers: (0..options.partitions).map(|_| Ledger::default()).collect(),
+        checkers: (0..options.partitions)
+            .map(|_| Checker::default())
+            .collect(),
         trace: Trace::default(),
         options,
         next_fault: 0,
         isolation: None,
         power_loss: None,
         crash_due: None,
+        snapshots: None,
+        chaos: options.chaos.then(|| Chaos::new(seeds.chaos)),
+        links: [[0; BROKERS]; BROKERS],
+        connected: [[true; BROKERS]; BROKERS],
+        clock_wakeups: 0,
+        floors: vec![[0; BROKERS]; options.partitions],
+        seed,
+        outsiders: Rng::new(seeds.outsider),
+        outsider: None,
     };
     let result = sim.run();
     let hash = sim.trace.value();
     let tick = sim.clock.tick();
     let detail = sim.detail();
-    let view = leader(&sim.brokers).map_or(0, |(_, view)| view);
+    if matches!(result, Ok((_, true))) && std::env::var_os("OZZY_ACTOR_SIM_TRACE").is_some() {
+        eprintln!("vacuous run:\n{detail}");
+    }
+    let view = leader(&sim.brokers, 0).map_or(0, |(_, view)| view);
+    let after_crash = sim.network.stats.after_crash;
+    let outsider = sim
+        .outsider
+        .as_ref()
+        .map(|outsider| (outsider.broker, outsider.kind));
     let result = result.and_then(|applied| {
         for broker in sim.brokers {
             broker.shutdown()?;
@@ -283,11 +308,25 @@ pub(crate) fn run(seed: u64, profile: Profile, options: Options) -> Result<Repor
             hash,
             ticks: tick,
             confirmed: sim.workload.confirmed.len(),
-            compared: sim.checker.compared,
+            compared: sim.checkers.iter().map(|checker| checker.compared).sum(),
             applied,
             view,
             refused: sim.workload.counts.full,
             outage: sim.power_loss.and_then(|(_, outage)| outage),
+            faults: sim.chaos.as_ref().map_or(0, Chaos::total),
+            records: sim.ledgers.iter().map(Ledger::len).sum(),
+            scheduled: sim.ledgers.iter().map(Ledger::scheduled).sum(),
+            live: sim.consumers.counts.published,
+            cancels: sim.consumers.counts.cancels,
+            restarts: sim.producers.counts.restarts,
+            retired: sim.producers.counts.retired,
+            duplicates: sim.producers.counts.duplicates,
+            repeats: sim.ledgers.iter().map(Ledger::repeats).sum(),
+            retained_from: sim.ledgers.iter().map(Ledger::retired).sum(),
+            skipped: sim.consumers.counts.skipped,
+            clock_wakeups: sim.clock_wakeups,
+            after_crash,
+            outsider,
             vacuous,
         })
         .map_err(|reason| {
@@ -315,6 +354,17 @@ impl Sim {
                 self.network.heal();
             }
             self.script(tick)?;
+            // The liveness phase ends every fault but the outsider's.
+            let calm = self.liveness_start().is_some_and(|start| tick > start);
+            let liveness = calm && self.outsider.is_none();
+            if liveness {
+                self.network.heal();
+            }
+            self.nemesis(tick, draining || calm)?;
+            if liveness {
+                self.start_outsider(tick)?;
+            }
+            self.watch_outsider(tick);
             self.network.step(tick);
             let mut order: [usize; BROKERS] = std::array::from_fn(|index| index);
             self.executor.shuffle(&mut order);
@@ -329,16 +379,27 @@ impl Sim {
             let paused = self
                 .isolation
                 .filter(|isolation| matches!(isolation.fault, Fault::PauseLeader { .. }))
-                .map(|isolation| isolation.broker);
+                .map(|isolation| isolation.broker)
+                .or_else(|| self.stopped_outsider());
             // A broker its injected disk error stopped restarts at the end of
             // the tick.
             let mut exited = None;
+            let held_paused: [bool; BROKERS] =
+                std::array::from_fn(|index| self.held(index, Kind::Pause));
+            // Each running dispatcher samples its clock against its peers.
+            for index in order {
+                if paused != Some(index) && !held_paused[index] {
+                    self.brokers[index].sample(&mut self.network, tick, &mut self.trace);
+                }
+            }
+            // A random disk failure may surface after its fault ended.
+            let chaos = self.chaos.is_some();
             for step in 0..DISK_STEPS {
                 let at = tick * DISK_STEPS + step;
                 for index in order {
                     let broker = &mut self.brokers[index];
                     broker.disk.step(at, index, &mut self.trace);
-                    if paused == Some(index) || exited == Some(index) {
+                    if paused == Some(index) || exited == Some(index) || held_paused[index] {
                         continue;
                     }
                     let turn = broker.turn(
@@ -352,9 +413,9 @@ impl Sim {
                         Ok(None) => {}
                         Err(_)
                             if broker.disk.failed()
-                                && self.isolation.is_some_and(|isolation| {
+                                && (self.isolation.is_some_and(|isolation| {
                                     isolation.broker == index && !isolation.restarted
-                                }) =>
+                                }) || chaos) =>
                         {
                             exited = Some(index);
                         }
@@ -362,17 +423,32 @@ impl Sim {
                     }
                 }
             }
-            if let Some(broker) = exited {
+            if let Some(broker) = exited
+                && let Some(chaos) = &mut self.chaos
+            {
+                // Its supervisor restarts it over the cache, healthy.
+                chaos
+                    .active
+                    .retain(|fault| (fault.broker, fault.kind) != (broker, Kind::FailDisk));
+                self.network.drop_links(broker);
+                self.restart(broker, tick, Loss::Process)?;
+                self.relink()?;
+                self.hold_outsider();
+            } else if let Some(broker) = exited {
                 // The host stays up, so the cache does too.
-                self.crash(broker, tick, false)?;
+                self.crash(broker, tick, Loss::Process)?;
                 if let Some(isolation) = &mut self.isolation {
                     isolation.restarted = true;
                 }
             }
             self.workload
-                .step(tick, !draining, &mut self.checker, &mut self.trace)?;
-            for broker in &self.brokers {
-                let status = broker.status();
+                .step(tick, !draining, &mut self.checkers[0], &mut self.trace)?;
+            if self.options.records {
+                self.clients(tick, !draining)?;
+                self.watch_floors()?;
+            }
+            for broker in &mut self.brokers {
+                let status = broker.status(0);
                 if std::env::var_os("OZZY_ACTOR_SIM_TRACE").is_some() {
                     let shown = Some((
                         status.scope.view,
@@ -390,8 +466,13 @@ impl Sim {
                         last[broker.index] = shown;
                     }
                 }
-                self.checker.observe(broker.index, &status)?;
-                let missed = broker.shard.sweep_progress();
+                for (group, checker) in self.checkers.iter_mut().enumerate() {
+                    checker
+                        .observe(broker.index, &broker.status(group))
+                        .map_err(|reason| format!("group {group}: {reason}"))?;
+                }
+                let (after_clock, missed) = broker.missed_wakeups(tick);
+                self.clock_wakeups += after_clock;
                 if missed != 0 {
                     return Err(format!(
                         "broker {}: lost wakeup: the safety sweep found work {missed} time(s)",
@@ -400,13 +481,27 @@ impl Sim {
                 }
             }
             if let Some((at, outage @ None)) = &mut self.power_loss
-                && leader(&self.brokers).is_some()
+                && (0..self.options.partitions).all(|group| leader(&self.brokers, group).is_some())
             {
                 *outage = Some(tick - *at);
             }
             if draining
                 && self.workload.idle()
-                && let Some(applied) = converged(&self.brokers)
+                && self.producers.idle()
+                && (!self.options.records
+                    || ((0..self.options.partitions).all(|partition| {
+                        log_end(&self.brokers, partition)
+                            .is_some_and(|end| self.consumers.caught_up(partition, end))
+                    }) && self.ledgers.iter().all(|ledger| {
+                        ledger.released(
+                            crate::clock::wall_millis(self.clock.now()),
+                            self.age(),
+                            &self.producers,
+                        )
+                    }) && self.facts_ready()))
+                && (1..self.options.partitions)
+                    .all(|group| converged(&self.brokers, group, self.outsider_index()).is_some())
+                && let Some(applied) = converged(&self.brokers, 0, self.outsider_index())
             {
                 return self.finish(applied);
             }
@@ -417,11 +512,63 @@ impl Sim {
         ))
     }
 
+    /// Hand every client its replies, then let producers and consumers send.
+    fn clients(&mut self, tick: u64, submit: bool) -> Result<(), String> {
+        let now = self.clock.now();
+        for broker in 0..BROKERS {
+            while let Some(message) = self.brokers[broker].replies.pop_front() {
+                if let Some(index) = records::producer(&message) {
+                    self.producers.reply(
+                        index,
+                        broker,
+                        &message,
+                        tick,
+                        &mut self.ledgers,
+                        &mut self.trace,
+                    )?;
+                } else if let Some(index) = consumer::consumer(&message) {
+                    self.consumers.reply(
+                        index,
+                        broker,
+                        &message,
+                        tick,
+                        now,
+                        &mut self.ledgers,
+                        &self.producers,
+                    )?;
+                }
+            }
+            while let Some(message) = self.brokers[broker].publications.pop_front() {
+                self.consumers.publish(&self.brokers[broker], &message);
+            }
+        }
+        for broker in &self.brokers {
+            self.producers
+                .clock_offset(broker.host.offset().unsigned_abs());
+        }
+        self.producers
+            .step(tick, submit, &mut self.brokers, &mut self.trace)?;
+        let ends: Vec<Option<u64>> = (0..self.options.partitions)
+            .map(|partition| log_end(&self.brokers, partition))
+            .collect();
+        self.consumers.step(
+            tick,
+            now,
+            &mut self.brokers,
+            &ends,
+            &mut self.ledgers,
+            &self.producers,
+            &mut self.trace,
+        )
+    }
+
     /// End a due isolation, then start the next scripted fault once it is due
-    /// and a leader exists.
+    /// and a leader exists. A leader fault also waits until every broker is
+    /// ready in its view, so the replacement bound covers no backed-off
+    /// timeout or catch-up left from earlier faults.
     fn script(&mut self, tick: u64) -> Result<(), String> {
         if let Some(isolation) = &mut self.isolation
-            && leader(&self.brokers)
+            && leader(&self.brokers, 0)
                 .is_some_and(|(broker, view)| broker != isolation.broker && view > isolation.view)
         {
             isolation.replaced = true;
@@ -450,6 +597,27 @@ impl Sim {
                     isolation.broker
                 ));
             }
+            if isolation.fault.slow() {
+                let now = leader(&self.brokers, 0);
+                if isolation.replaced || now != Some((isolation.leader, isolation.view)) {
+                    return Err(format!(
+                        "broker {} lost view {} to {now:?} while broker {}'s link was slow",
+                        isolation.leader, isolation.view, isolation.broker
+                    ));
+                }
+                // Clients propose nothing new in the drain.
+                if tick <= self.options.ticks
+                    && self.workload.confirmed.len() == isolation.confirmed
+                {
+                    return Err(format!(
+                        "no proposal confirmed while broker {}'s link was slow",
+                        isolation.broker
+                    ));
+                }
+            }
+            if matches!(isolation.fault, Fault::SkewLeader { .. }) {
+                self.brokers[isolation.broker].step_clock(0, tick);
+            }
             self.network.rejoin();
             if isolation.restarted {
                 self.reconnect(isolation.broker)?;
@@ -476,12 +644,23 @@ impl Sim {
         if self.isolation.is_none()
             && let Some(fault) = self.options.script.get(self.next_fault).copied()
             && tick >= fault.window().0
-            && let Some((leader, view)) = leader(&self.brokers)
+            && let Some((leader, view)) = leader(&self.brokers, 0)
+            && (!(fault.leader() || fault.slow()) || settled(&self.brokers, 0, view))
         {
             self.next_fault += 1;
             self.trace.word(tick);
             match fault {
                 Fault::CrashAll { .. } => return self.crash_all(tick),
+                Fault::Rewind { ticks, .. } => {
+                    self.snapshots = Some(
+                        self.brokers
+                            .iter()
+                            .map(|broker| broker.disk.snapshot())
+                            .collect(),
+                    );
+                    self.crash_due = Some(tick + ticks);
+                    return Ok(());
+                }
                 Fault::CrashAllMidWrite { within, .. } => {
                     for broker in &mut self.brokers {
                         broker.disk.stall(u64::MAX);
@@ -491,7 +670,7 @@ impl Sim {
                 }
                 _ => {}
             }
-            let broker = if fault.leader() {
+            let broker = if fault.leader() || matches!(fault, Fault::SkewLeader { .. }) {
                 leader
             } else {
                 let followers = (0..BROKERS).filter(|&index| index != leader);
@@ -503,9 +682,13 @@ impl Sim {
             };
             match fault {
                 _ if fault.crash() => {
-                    let killed =
-                        matches!(fault, Fault::KillLeader { .. } | Fault::KillFollower { .. });
-                    self.crash(broker, tick, !killed)?;
+                    let loss =
+                        if matches!(fault, Fault::KillLeader { .. } | Fault::KillFollower { .. }) {
+                            Loss::Process
+                        } else {
+                            Loss::Power
+                        };
+                    self.crash(broker, tick, loss)?;
                 }
                 Fault::StallLeader { .. } => {
                     let until = (tick + fault.window().1) * DISK_STEPS;
@@ -517,13 +700,18 @@ impl Sim {
                     self.brokers[broker].disk.fail_writes();
                     self.network.hold_partitions(broker);
                 }
+                Fault::SkewLeader { .. } => self.brokers[broker].step_clock(SKEW, tick),
                 Fault::DeafLeader { .. } => self.network.cut_one_way(broker, false),
                 Fault::MuteLeader { .. } => self.network.cut_one_way(broker, true),
+                Fault::SlowFollowerSends { .. } => self.network.slow(broker, true),
+                Fault::SlowFollowerHears { .. } => self.network.slow(broker, false),
                 _ => self.network.isolate(broker),
             }
             self.isolation = Some(Isolation {
                 broker,
+                leader,
                 view,
+                confirmed: self.workload.confirmed.len(),
                 until: tick + fault.window().1,
                 fault,
                 replaced: false,
@@ -534,26 +722,38 @@ impl Sim {
         Ok(())
     }
 
-    /// `broker` loses power, or only its process without `power_loss`, and
-    /// restarts over what its disk kept, cut off from both peers, which drop
-    /// their links to it.
-    fn crash(&mut self, broker: usize, tick: u64, power_loss: bool) -> Result<(), String> {
-        let now = self.clock.now();
+    /// `broker` stops and restarts over what `loss` left of its disk, cut off
+    /// from both peers, which drop their links to it.
+    fn crash(&mut self, broker: usize, tick: u64, loss: Loss) -> Result<(), String> {
         self.network.crash(broker);
+        self.restart(broker, tick, loss)
+    }
+
+    /// `broker` stops and restarts over what `loss` left of its disk. Its
+    /// peers drop their links to it; the new process has none.
+    fn restart(&mut self, broker: usize, tick: u64, loss: Loss) -> Result<(), String> {
+        let now = self.clock.now();
         for peer in (0..BROKERS).filter(|peer| *peer != broker) {
             let session = session(peer, broker, self.epoch(peer, broker));
             self.brokers[peer].disconnect(broker, session, now)?;
+            self.connected[peer][broker] = false;
+            self.connected[broker][peer] = false;
         }
         let old = self.brokers.remove(broker);
         let (restarted, lanes) = old.restart(
-            power_loss,
-            &self.clock,
+            |disk| match loss {
+                Loss::Process => disk.process_crash(),
+                Loss::Power => disk.power_loss(),
+                Loss::Rewind(snapshot) => disk.rewind(snapshot),
+            },
             self.options.clients,
             self.options.shape(broker),
         )?;
         self.brokers.insert(broker, restarted);
         self.workload.restarted(broker, lanes, tick);
-        self.checker.restarted(broker);
+        for checker in &mut self.checkers {
+            checker.restarted(broker);
+        }
         Ok(())
     }
 
@@ -561,16 +761,19 @@ impl Sim {
     /// links come back at once.
     fn crash_all(&mut self, tick: u64) -> Result<(), String> {
         self.power_loss = Some((tick, None));
+        let mut snapshots = self.snapshots.take().map(Vec::into_iter);
         for broker in 0..BROKERS {
-            self.crash(broker, tick, true)?;
+            let loss = snapshots
+                .as_mut()
+                .and_then(Iterator::next)
+                .map_or(Loss::Power, Loss::Rewind);
+            self.crash(broker, tick, loss)?;
         }
+        self.network.drop_all();
         self.network.rejoin();
-        let now = self.clock.now();
         for left in 0..BROKERS {
             for right in left + 1..BROKERS {
-                let session = session(left, right, self.epoch(left, right));
-                self.brokers[left].connect(right, session, now)?;
-                self.brokers[right].connect(left, session, now)?;
+                self.connect(left, right)?;
             }
         }
         Ok(())
@@ -578,23 +781,64 @@ impl Sim {
 
     /// Establish fresh links between a restarted `broker` and its peers.
     fn reconnect(&mut self, broker: usize) -> Result<(), String> {
-        let now = self.clock.now();
         for peer in (0..BROKERS).filter(|peer| *peer != broker) {
-            let session = session(peer, broker, self.epoch(peer, broker));
-            self.brokers[peer].connect(broker, session, now)?;
-            self.brokers[broker].connect(peer, session, now)?;
+            self.connect(peer, broker)?;
         }
         Ok(())
     }
 
-    /// The link between two brokers, counted from zero: each restart of
-    /// either starts a new one.
+    /// A new connection between two brokers, under a fresh session.
+    fn connect(&mut self, left: usize, right: usize) -> Result<(), String> {
+        let now = self.clock.now();
+        self.links[left.min(right)][left.max(right)] += 1;
+        let session = session(left, right, self.epoch(left, right));
+        self.brokers[left].connect(right, session, now)?;
+        self.brokers[right].connect(left, session, now)?;
+        self.connected[left][right] = true;
+        self.connected[right][left] = true;
+        Ok(())
+    }
+
+    /// The current connection between two brokers, counted from zero.
     fn epoch(&self, left: usize, right: usize) -> u64 {
-        self.brokers[left].incarnation + self.brokers[right].incarnation
+        self.links[left.min(right)][left.max(right)]
+    }
+
+    /// Every copy but an outsider reports its partitions' facts: no journal
+    /// is busy.
+    fn facts_ready(&self) -> bool {
+        self.core().all(|broker| {
+            (0..self.options.partitions).all(|partition| broker.facts(partition).is_some())
+        })
+    }
+
+    /// Every broker but an outsider.
+    fn core(&self) -> impl Iterator<Item = &Broker> {
+        let outsider = self.outsider_index();
+        self.brokers
+            .iter()
+            .filter(move |broker| Some(broker.index) != outsider)
     }
 
     /// The converged op, and whether the run was vacuous.
     fn finish(&self, applied: ozzy_replication::Prefix) -> Result<(u64, bool), String> {
+        self.check_outsider()?;
+        for broker in self.core() {
+            for (partition, ledger) in self.ledgers.iter().enumerate() {
+                let facts = broker.facts(partition).ok_or_else(|| {
+                    format!("broker {}: no facts of partition {partition}", broker.index)
+                })?;
+                ledger
+                    .check_log(
+                        broker.index,
+                        facts.next_offset.get(),
+                        self.consumers.read_through(partition),
+                        (crate::clock::wall_millis(self.clock.now()), self.age()),
+                        &self.producers,
+                    )
+                    .map_err(|reason| format!("partition {partition}: {reason}"))?;
+            }
+        }
         for through in &self.workload.confirmed {
             if through.op > applied.op {
                 return Err(format!(
@@ -604,10 +848,17 @@ impl Sim {
             }
         }
         let vacuous = self.next_fault < self.options.script.len()
+            || self.chaos.as_ref().is_some_and(|chaos| chaos.total() < 5)
             || self.workload.counts.full < self.options.min_refused
             || applied.op.0 < self.options.min_applied
             || self.workload.confirmed.len() < self.options.min_confirmed
-            || self.checker.compared < self.options.min_compared;
+            || (self.options.records
+                && self
+                    .ledgers
+                    .iter()
+                    .any(|ledger| ledger.len() < self.options.min_records))
+            || self.checkers[0].compared < self.options.min_compared
+            || (self.options.retention && self.ledgers.iter().any(|ledger| ledger.retired() == 0));
         Ok((applied.op.0, vacuous))
     }
 
@@ -616,21 +867,50 @@ impl Sim {
         let network: Stats = self.network.stats;
         let counts: Counts = self.workload.counts;
         let mut detail = format!(
-            "network {network:?}, {} queued\nworkload {counts:?}, {} confirmed, {} compared",
+            "network {network:?}, {} queued\nworkload {counts:?}, {} confirmed, {} compared\n\
+             producers {:?}, {:?} records confirmed\nconsumers {:?}, read through {:?}",
             self.network.queued(),
             self.workload.confirmed.len(),
-            self.checker.compared,
+            self.checkers[0].compared,
+            self.producers.counts,
+            self.ledgers.iter().map(Ledger::len).collect::<Vec<_>>(),
+            self.consumers.counts,
+            (0..self.options.partitions)
+                .map(|partition| self.consumers.read_through(partition))
+                .collect::<Vec<_>>(),
         );
         if let Some(isolation) = self.isolation {
             let _ = write!(detail, "\nisolation {isolation:?}");
         }
-        for broker in &self.brokers {
-            let status = broker.status();
+        if let Some(outsider) = &self.outsider {
+            let _ = write!(detail, "\noutsider {outsider:?}");
+        }
+        if let Some(chaos) = &self.chaos {
             let _ = write!(
                 detail,
-                "\nbroker {}: restarts {} view {} ready {} normal {:?} disk {} unbound {} lanes {}/{}",
+                "\nchaos started {:?}\nchaos active {:?}",
+                chaos.summary(),
+                chaos.active
+            );
+        }
+        // Process-wide, so a campaign may show other runs' entries too.
+        for entry in ozzy_runtime::profiling::recent_logs().iter().rev().take(8) {
+            let _ = write!(detail, "\nlog {entry:?}");
+        }
+        let partitions = self.options.partitions;
+        for (broker, group) in self
+            .brokers
+            .iter()
+            .flat_map(|broker| (0..partitions).map(move |group| (broker, group)))
+        {
+            let status = broker.status(group);
+            let _ = write!(
+                detail,
+                "\nbroker {} group {group}: restarts {} clock {:+} ms paused {} view {} ready {} normal {:?} disk {} unbound {} lanes {}/{}",
                 broker.index,
                 broker.incarnation,
+                broker.host.offset(),
+                broker.trust.status().paused,
                 status.scope.view,
                 status.application_ready,
                 status.normal.map(|normal| (

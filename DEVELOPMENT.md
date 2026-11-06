@@ -116,7 +116,7 @@ system tests in that slice.
 | --- | --- | --- | --- |
 | Unit and core | Codecs, state transitions, bounds, authority fences | `src/` and `tests/` of `ozzy-proto`, `ozzy-core`, `ozzy-journal`, `ozzy-journal-segment`, `ozzy-replication`, `ozzy-config` | `default` |
 | Core simulation | Replayable protocol fault schedules with gated time, messages, and file jobs | `ozzy-sim/tests/` | `default`; `stress` in `extended` |
-| Seeded actor cluster | Production partition shards and journals of three brokers on one thread from one seed: link, disk, and client faults, scripted leader loss, power loss and restart, per-tick history checks, convergence, missed wakeups | `ozzy-sim/tests/actor_cluster/` | `default`; seed campaign in `extended` |
+| Seeded actor cluster | Production partition shards of three brokers, each with two partitions on one device, on one thread from one seed: link, disk, client, and clock faults, scripted leader loss, slow links, a permanent outsider, power loss and restart, per-tick history checks, record, release, dedup, idle expiry, and read checks, convergence, missed wakeups | `ozzy-sim/tests/actor_cluster/` | `default`; seed campaign in `extended` |
 | Inproc integration | Real SDKs and brokers over OMQ inproc and memory file jobs; owner lifecycle | `ozzy-broker/tests/journals/serving/`, `ozzy-sim/tests/broker/` | `default`; `stress` in `extended` |
 | Full-product simulator | Sustained workload and fault churn over real owners, SDKs, and brokers | `ozzy-sim` `ozzy_sim` binary | Short gate in `default`; long runs manual |
 | Backend conformance | The same owned file operations on the pool and AIO backends | `ozzy-io-pool/tests/`, `ozzy-io-aio/tests/` | `default` |
@@ -130,8 +130,9 @@ What a layer does not prove:
 
 - Unit and core: only finite state and format cases.
 - Core simulation: only within model bounds and injected faults.
-- Seeded actor cluster: modeled links with OMQ semantics, no sockets, broker
-  frontend, or SDKs.
+- Seeded actor cluster: modeled links with OMQ semantics, no sockets or
+  SDKs. Of the broker frontend, only the clock guard, client links, and
+  reader grants run.
 - Inproc: no ZMTP wire and no physical disk. Threaded scheduling stays
   nondeterministic.
 - Simulator: seed replay reproduces the fault prefix, not the transport
@@ -253,16 +254,92 @@ restarts see what the disks cached and queued writes may still land;
 with the queued writes in flight; `disk-stall`, where the leader's disk
 completes nothing for 15 s while its links stay up, and another broker must
 take over; `pause`, where the leader's process runs nothing for 15 s, then
-resumes into a newer view; and `one-way`, where the leader first hears
-nothing, then a later leader can send nothing. A power loss puts some queued
-writes in the cache unreported, even `O_DSYNC` ones, then lets a seeded share
-of cached 512-byte sectors reach media, so unsynced writes tear and land out
-of order. The power-loss fast test also bounds the outage, which grows when a
-restart refetches or replays all history. The three sparse or full scenarios
-skip `heavy` and `swarm`, which make too little progress to fill a journal.
+resumes into a newer view; `one-way`, where the leader first hears
+nothing, then a later leader can send nothing; `slow-link`, where a
+follower's frames, then the frames it receives, take 3 s longer for 10 s,
+past the election timeout, and the leader must keep its view and commit
+through the other follower; `skew`, where the leader's clock runs 5 s ahead
+for 15 s; and `chaos`, where random overlapping faults
+hit any broker: power loss, kills, pauses, disk stalls and failures, cuts
+in either direction, broker or client connection resets that drop queued
+frames, and clock steps on one host at a time, within the 1000 ms tolerance
+or far past it. Up to two brokers are down at once, so only
+safety holds until the drain ends every fault. `outsider` and
+`chaos-outsider` follow profile or random overlapping faults with
+[TigerBeetle's liveness mode](https://tigerbeetle.com/blog/2023-07-06-simulation-testing-for-liveness/):
+30 s before the drain every fault ends, but one broker stays down, paused,
+stalled, deaf, or mute for good. Clients give up on it once it stops
+answering, and the other two must keep confirming proposals and records and
+converge without it. A broker that dies loses frames sent to it, but frames
+it already sent still arrive, after its peers saw the links drop. A power
+loss puts some queued writes in the cache unreported, even `O_DSYNC` ones,
+then lets a seeded share of cached 512-byte sectors reach media, so unsynced
+writes tear and land out of order. The power-loss fast test also bounds the
+outage, which grows when a restart refetches or replays all history. The
+three sparse or full scenarios skip `heavy` and `swarm`, which make too
+little progress to fill a journal.
+`slow-link` skips them too. There a follower that hears late gets too few
+COMMITs through its full 3 s path and suspects the leader, and PUB loss can
+stall the leader's commit for 1 s while a gap repairs. Two suspicions end
+the view.
+
+Each broker's dispatcher runs the production clock guard, sampling its
+host's wall clock against its peers over the modeled control links at the
+dispatcher's own deadlines, and its journals decide clock-driven work only
+while the guard trusts that clock. The guard resuming, or seeing a forward
+step, wakes every partition, as the broker shard does. A step stays unseen
+until the guard's next look, so a safety sweep that finds work within 1 s
+of a step only counts in `Report::clock_wakeups`; any other sweep that finds
+work fails the run.
+Each broker's shard hosts two partitions on one device. Beside barrier
+proposals on the first, four producers append records through each broker's
+production native intake, and four consumers read the partitions as the SDK
+does, two of each per partition: replay through the leader's production
+reader service, then its live topic, merged by the production `LiveCursor`.
+A live copy goes only to a consumer the broker's reader grants admit and
+drops on a full queue or by the profile's PUB loss; a gap holds it and
+replays up to it. A leader change or silence replays from the next offset
+again. The first partition has delay: a third of its batches are
+scheduled, each record due between 0.5 s ago and 3 s ahead. The second
+deduplicates within 5 s, as no topic does both, and retires producer
+sessions idle for 3 s. Its producers sometimes restart with a batch in
+flight, resuming and fencing a new epoch as the SDK takeover does, and send
+the batch again from sequence zero; some pause for 1.5 to 4.5 s and resume
+a fresh epoch after NACK 6. Every confirmation and delivery goes through one
+ledger per partition: one offset and schedule sequence per record, one
+record per offset and schedule sequence, each producer's unscheduled
+records in order, scheduled ones released in order of due time, then
+schedule sequence, never more than the tolerance early by true time, and
+payloads as sent. A resend found stored names the original offset; a second
+offset is allowed only once the window, less twice the largest host clock
+offset so far, passed since the first send. No session retires before its
+idle time, less that slack, since it surely last changed. At the end the consumers
+must have read every copy's whole log, every confirmed record among it,
+scheduled ones too, and an unconfirmed record only from a batch whose
+outcome stayed unknown. In `retention`, both partitions retire records 2 s
+old in 32 KiB segments, below the latest due time, so held records are
+carried. A consumer told of a retention gap reads on from the earliest
+retained offset, and a producer whose resend finds its batch retired moves
+on. Every record a copy's log start or a gap passes must be the age old,
+less twice that slack, since its first send, or since its due time less
+the tolerance for a released one; the end check starts at the highest such
+floor.
+`sparse-rejoin` runs without records: they fill the leader, and a sparse
+copy of a full leader does not fit. Scripted cases in the fast suite host
+one partition, with two producers and two consumers, to stay near ten
+seconds; campaigns run every scenario over both. In the negative control
+`rewound_disks_fail_the_run`, every disk restarts from a copy taken 5 s
+before a power loss, and the checks must fail; in
+`unguarded_skewed_leader_releases_early`, the skewed leader decides without
+the guard and must be caught releasing early; in
+`partition_without_dedup_stores_resends_twice` a restart's resend must be
+caught at a second offset; in `early_idle_expiry_fails_the_run` sessions
+retire after 0.5 s and must be caught; in `young_retention_fails_the_run`
+records retire after 0.5 s and must be caught.
+
 A failing seed prints its parameters, schedule hash, and this command with
-`OZZY_ACTOR_SIM_SEED`, `OZZY_ACTOR_SIM_PROFILE`, and
-`OZZY_ACTOR_SIM_SCENARIO` set. A run whose faults left too little progress
+`OZZY_ACTOR_SIM_SEED`, `OZZY_ACTOR_SIM_PROFILE`,
+`OZZY_ACTOR_SIM_SCENARIO`, and `OZZY_ACTOR_SIM_PARTITIONS` set. A run whose faults left too little progress
 to prove much is vacuous: the campaign lists it and fails only above one in
 twenty. It runs 20 seeds unless `OZZY_ACTOR_SIM_SEEDS` sets another count.
 Runs spread over one thread per core; `OZZY_ACTOR_SIM_THREADS` sets the

@@ -47,10 +47,59 @@ impl ExtentReader<'_> {
     ) -> Result<DecodedOperation<'static>, IndexedReadError> {
         let location = validate_operation_location(self.source, location, self.decode)?;
         let (header, bytes) = self.extent(location).await?;
+        self.verified(&header, location, &bytes)
+    }
+
+    /// Verify several operations of this segment, in file order, from one
+    /// read of the span that holds them. Operations of one shared extent
+    /// repeat its location.
+    pub(crate) async fn operations(
+        self,
+        locations: &[OperationLocation],
+    ) -> Result<Vec<DecodedOperation<'static>>, IndexedReadError> {
+        let mut previous: Option<OperationLocation> = None;
+        let mut end = 0;
+        for location in locations {
+            let location = validate_operation_location(self.source, *location, self.decode)?;
+            let shared = previous.is_some_and(|previous| {
+                (previous.entry_offset, previous.entry_bytes)
+                    == (location.entry_offset, location.entry_bytes)
+            });
+            if location.entry_offset < end && !shared {
+                return Err(IndexedReadError::InvalidLocation);
+            }
+            end = location.entry_offset + location.entry_bytes;
+            previous = Some(location);
+        }
+        let start = locations
+            .first()
+            .ok_or(IndexedReadError::InvalidSelector)?
+            .entry_offset;
+        let length = usize::try_from(end - start).map_err(|_| IndexedReadError::InvalidLocation)?;
+        let (header, bytes) = self.span(start, length).await?;
+        locations
+            .iter()
+            .map(|location| {
+                let at = usize::try_from(location.entry_offset - start)
+                    .map_err(|_| IndexedReadError::InvalidLocation)?;
+                let count = usize::try_from(location.entry_bytes)
+                    .map_err(|_| IndexedReadError::InvalidLocation)?;
+                self.verified(&header, *location, &bytes[at..at + count])
+            })
+            .collect()
+    }
+
+    /// Decode one validated extent and check it against its location.
+    fn verified(
+        &self,
+        header: &SegmentHeader,
+        location: OperationLocation,
+        extent: &[u8],
+    ) -> Result<DecodedOperation<'static>, IndexedReadError> {
         let operation = decode_indexed_operation(
-            &header,
+            header,
             location.entry_offset,
-            &bytes,
+            extent,
             location.op_number,
             self.decode,
         )?;
@@ -108,6 +157,17 @@ impl ExtentReader<'_> {
         &self,
         location: OperationLocation,
     ) -> Result<(SegmentHeader, Vec<u8>), IndexedReadError> {
+        let count =
+            usize::try_from(location.entry_bytes).map_err(|_| IndexedReadError::InvalidLocation)?;
+        self.span(location.entry_offset, count).await
+    }
+
+    /// Load the segment header and a span of validated extents.
+    async fn span(
+        &self,
+        offset: u64,
+        count: usize,
+    ) -> Result<(SegmentHeader, Vec<u8>), IndexedReadError> {
         let file = self
             .access
             .read_handle(self.path.clone(), self.source)
@@ -119,11 +179,9 @@ impl ExtentReader<'_> {
             .await?;
         let header = decode_segment_header(&header_bytes)?;
         validate_source_header(&header, self.source, length)?;
-        let count =
-            usize::try_from(location.entry_bytes).map_err(|_| IndexedReadError::InvalidLocation)?;
         let bytes = self
             .access
-            .read_range(&file, location.entry_offset, count, self.chunk)
+            .read_range(&file, offset, count, self.chunk)
             .await?;
         Ok((header, bytes))
     }

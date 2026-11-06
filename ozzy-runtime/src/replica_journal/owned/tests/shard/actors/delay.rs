@@ -315,6 +315,112 @@ fn a_due_release_waits_for_room_in_the_pipeline() {
     );
 }
 
+/// Directory listings of the copies whose cleanup pass is captured or
+/// running.
+fn cleanup_listings(
+    controller: &mut Controller,
+    actors: &mut [ScheduledReplica],
+) -> Vec<ozzy_io::simulation::JobId> {
+    let cleaning: Vec<_> = actors
+        .iter_mut()
+        .map(|actor| {
+            // A command holding the owner also reads as cleaning.
+            let journal = actor.read_access().1;
+            journal.cleaning() && journal.available_command_slots() != 0
+        })
+        .collect();
+    let jobs = controller.jobs();
+    jobs.into_iter()
+        .filter(|(id, _)| {
+            let mut operation = controller.operation(*id);
+            while let Some(ozzy_io::Operation::Protected {
+                operation: inner, ..
+            }) = operation
+            {
+                operation = Some(inner);
+            }
+            let Some(ozzy_io::Operation::ReadDirectory { path, .. }) = operation else {
+                return false;
+            };
+            (0..cleaning.len())
+                .any(|broker| cleaning[broker] && path.starts_with(format!("/g0-b{broker}")))
+        })
+        .map(|(id, _)| id)
+        .collect()
+}
+
+#[test]
+fn copies_keep_committing_while_a_cleanup_job_runs() {
+    // Retention retires the aged segment, and each copy captures a cleanup
+    // pass for it. The pass runs as a job beside writes, so while its
+    // listings wait, an append must still commit on every copy.
+    let (mut controller, io) = setup();
+    CLOCK.with(|clock| clock.set(1_000));
+    let retention = RetentionPolicy {
+        max_age_millis: std::num::NonZeroU64::new(1_000),
+        max_bytes: None,
+    };
+    let (mut actors, mut lane, mut buffers) = delay_group(
+        &mut controller,
+        &io,
+        retention,
+        Some(Duration::from_millis(1)),
+        2,
+    );
+    let request = super::super::super::proposal::request;
+    submit(
+        &mut controller,
+        &mut actors,
+        &mut lane,
+        buffers.pop().unwrap(),
+        |buffer| buffer.prepare_append(request(12, 0, 1)).unwrap(),
+    );
+    CLOCK.with(|clock| clock.set(5_000));
+    let mut now = Duration::ZERO;
+    let mut held = Vec::new();
+    for _ in 0..10000 {
+        now += Duration::from_millis(1);
+        scheduled::round_at(&mut actors, now, false);
+        for id in cleanup_listings(&mut controller, &mut actors) {
+            if !held.contains(&id) {
+                held.push(id);
+            }
+        }
+        scheduled::settle(&mut controller, &held);
+        if !held.is_empty() {
+            break;
+        }
+    }
+    assert!(actors[0].read_access().1.cleaning());
+    let mut buffer = buffers.pop().unwrap();
+    buffer.prepare_append(request(12, 1, 1)).unwrap();
+    let mut pending = Box::pin(lane.try_submit(buffer).unwrap());
+    let committed = Some(vec![Offset::new(2); 3]);
+    let (mut confirmed, mut done) = (false, false);
+    for _ in 0..10000 {
+        now += Duration::from_millis(1);
+        scheduled::round_at(&mut actors, now, false);
+        for id in cleanup_listings(&mut controller, &mut actors) {
+            if !held.contains(&id) {
+                held.push(id);
+            }
+        }
+        scheduled::settle(&mut controller, &held);
+        confirmed |= !confirmed && poll(pending.as_mut()).is_ready();
+        if confirmed && next_offsets(&mut actors) == committed {
+            done = true;
+            break;
+        }
+    }
+    assert!(done, "the append waited for a cleanup job");
+    assert!(actors[0].read_access().1.cleaning());
+    held.clear();
+    CLOCK.with(|clock| clock.set(123));
+    for actor in actors {
+        scheduled::close(&mut controller, actor);
+    }
+}
+
 /// The leader's oldest segment file.
 fn oldest_segment(controller: &Controller) -> Option<u64> {
     (0..64).find(|id| {

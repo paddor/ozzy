@@ -71,7 +71,14 @@ fn native_index_build_yields_during_sort_and_merge_without_changing_control_loca
         assert_eq!(index.location_count(), 130);
         for number in 1..=130 {
             let id = OperationId::from_bytes(u128::from(131u64 - number).to_be_bytes());
-            assert_eq!(index.find_operation(id).unwrap().location.op_number, number);
+            assert_eq!(
+                index
+                    .find_operation(id, u64::MAX)
+                    .unwrap()
+                    .location
+                    .op_number,
+                number
+            );
             assert_eq!(
                 index.find_operation_number(number).unwrap().op_number,
                 number

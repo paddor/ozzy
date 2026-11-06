@@ -224,7 +224,7 @@ impl OwnedJournal {
         }
         self.check_room(buffer)?;
         if buffer.is_producer() && self.dedup.limits.is_some() {
-            let rewrite = self.resolve_producer_ids(ticket, buffer)?;
+            let rewrite = self.resolve_producer_ids(ticket, buffer, clock.monotonic)?;
             let mut staged = buffer.stage_dedup(rewrite);
             let (plan, records) = self.prepare_append(ticket, staged.buffer(), true).await?;
             self.prepare_held(staged.buffer()).await?;

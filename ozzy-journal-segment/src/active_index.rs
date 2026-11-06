@@ -260,12 +260,13 @@ impl ActiveSegmentIndex {
         self.image.find_message(partition, message_id)
     }
 
-    pub(crate) fn find_operation(&self, operation_id: OperationId) -> Option<OperationIndexEntry> {
-        self.image
-            .operations()
-            .binary_search_by(|entry| entry.operation_id.as_bytes().cmp(operation_id.as_bytes()))
-            .ok()
-            .map(|index| self.image.operations()[index])
+    /// The newest claim of `operation_id` at or before operation `through`.
+    pub(crate) fn find_operation(
+        &self,
+        operation_id: OperationId,
+        through: u64,
+    ) -> Option<OperationIndexEntry> {
+        crate::index_file::newest_operation(self.image.operations(), operation_id, through)
     }
 }
 

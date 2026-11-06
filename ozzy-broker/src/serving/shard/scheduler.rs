@@ -28,6 +28,7 @@ impl State {
         // Deliver input before the visits, so a partition handles it in
         // this turn. Input then marks its partition without a wakeup.
         self.actors.defer_wakes();
+        self.sync_clock();
         self.sync_sessions(cx, binding, now)?;
         self.receive_inputs(cx, binding, now)?;
         self.outbound.poll(cx, &mut binding.port, now)?;
@@ -47,6 +48,16 @@ impl State {
         }
         self.group_cursor = (self.group_cursor + 16) % self.identities.len().max(1);
         Ok(())
+    }
+
+    /// Visit every partition after the clock guard resumed or the clock
+    /// stepped forward, so each re-arms its release, age retention, and idle
+    /// expiry timers by the clock as it is now.
+    fn sync_clock(&mut self) {
+        let clock = self.config.clock.generation();
+        if self.synced_clock.replace(clock) != Some(clock) {
+            self.actors.wake_all();
+        }
     }
 
     /// Compare every partition's broker sessions with the frontend after a

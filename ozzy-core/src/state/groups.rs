@@ -1,8 +1,6 @@
 //! Durable coordinator images; source activation remains a separate boundary.
 
-use super::{
-    CanonicalState, IdentityClaim, IdentityIndex, Mutation, StateError, operation_claim, require_id,
-};
+use super::{CanonicalState, IdentityClaim, IdentityIndex, Mutation, StateError, require_id};
 use ozzy_journal::operation::{GroupDelete, GroupMember, GroupPlan, GroupTarget};
 use ozzy_proto::{ConsumerGroupId, OperationId, PartitionIncarnation, group::Start};
 use std::{collections::BTreeSet, sync::Arc};
@@ -150,7 +148,7 @@ impl CanonicalState {
         if group_targets(prior, &plan.members, &partitions, plan.revision)? != plan.targets {
             return Err(StateError::InvalidGroupPlan);
         }
-        let claims = operation_claim(plan.operation_id, op, identities)?;
+        let claims = self.operation_claim(plan.operation_id, op, identities)?;
         Ok((
             Mutation::GroupPlan {
                 value: Arc::new(CoordinatorGroup::from_plan(plan)),
@@ -196,7 +194,7 @@ impl CanonicalState {
             .group_target_count
             .checked_sub(group.targets.len())
             .ok_or(StateError::InvalidGroupPlan)?;
-        let claims = operation_claim(value.operation_id, op, identities)?;
+        let claims = self.operation_claim(value.operation_id, op, identities)?;
         Ok((
             Mutation::GroupDelete {
                 group: value.group,

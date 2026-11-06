@@ -264,6 +264,8 @@ fn duplicate_proof_retirement_does_not_follow_the_original_payload_offset() {
             partition: partition(),
             expected_floor: Offset::ZERO,
             new_floor: Offset::new(1),
+            expected_operation_floor: 0,
+            new_operation_floor: 0,
             operation_id: operation(0x62),
         }),
     );

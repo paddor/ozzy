@@ -205,6 +205,14 @@ impl IdentityIndex for Resolved {
     fn reserve(&mut self, claims: &[IdentityClaim]) -> Result<(), IdentityIndexError> {
         self.check_reserve(claims)
     }
+    fn reserve_validated(&mut self, claims: &[IdentityClaim]) -> Result<(), IdentityIndexError> {
+        // Preparation checked the claim against the operation floor; an
+        // older claim of the same identity may still resolve here.
+        if claims.len() > 1 {
+            return Err(IdentityIndexError::Conflict);
+        }
+        Ok(())
+    }
 }
 
 pub(super) fn finish_replay(result: Result<(), ReplayError<Error>>) -> Result<(), Error> {

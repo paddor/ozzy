@@ -59,7 +59,12 @@ fn retain(controller: &mut Controller, journal: &mut OwnedJournal, driver: &mut 
         let ticket = driver.begin_validation().unwrap();
         let turn = drive(
             controller,
-            journal.retention_turn(ticket, Some(now), OperationId::from_bytes([seed; 16]), true),
+            journal.retention_turn(
+                ticket,
+                now.into(),
+                OperationId::from_bytes([seed; 16]),
+                true,
+            ),
         )
         .unwrap();
         if let Some(buffer) = turn.proposal {
@@ -320,6 +325,7 @@ fn a_paused_clock_still_carries_and_stamps_no_time_of_its_own() {
     let paused = crate::replica_journal::ClockReading {
         wall_millis: AGED + 1_000_000,
         trusted: false,
+        monotonic: std::time::Duration::ZERO,
     };
     assert_eq!(journal.release_wait(|| paused), Some(0));
     let ticket = driver.begin_validation().unwrap();

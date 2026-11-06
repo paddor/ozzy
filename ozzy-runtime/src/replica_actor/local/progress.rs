@@ -35,7 +35,13 @@ impl LocalActor {
         }
         changed |= self.reply_committed()?;
         changed |= self.schedule()?;
-        if !self.closing && self.pending.is_none() && self.proposals.is_idle() {
+        // Queued ingress cannot move before a maintenance proposal that waits
+        // for room, so it asks for no round until journal progress.
+        if !self.closing
+            && self.pending.is_none()
+            && self.proposals.is_idle()
+            && self.proposals.maintenance().is_none()
+        {
             self.ingress.resume();
             changed |= self.ingress.poll_ready(cx).is_ready();
         }

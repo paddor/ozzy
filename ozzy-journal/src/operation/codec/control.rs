@@ -203,6 +203,8 @@ pub(super) fn encode_trim(
     encoder.id(value.partition.as_bytes())?;
     encoder.u64(value.expected_floor.get())?;
     encoder.u64(value.new_floor.get())?;
+    encoder.u64(value.expected_operation_floor)?;
+    encoder.u64(value.new_operation_floor)?;
     encoder.id(value.operation_id.as_bytes())
 }
 
@@ -211,6 +213,8 @@ pub(super) fn decode_trim(decoder: &mut Reader<'_>) -> Result<Trim, OperationCod
         partition: PartitionIncarnation::from_bytes(decoder.id()?),
         expected_floor: Offset::new(decoder.u64()?),
         new_floor: Offset::new(decoder.u64()?),
+        expected_operation_floor: decoder.u64()?,
+        new_operation_floor: decoder.u64()?,
         operation_id: OperationId::from_bytes(decoder.id()?),
     })
 }

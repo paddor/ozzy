@@ -100,7 +100,7 @@ fn check_index(index: &SegmentIndex) {
     );
     assert_eq!(
         index
-            .find_operation(OperationId::from_bytes([1; 16]))
+            .find_operation(OperationId::from_bytes([1; 16]), u64::MAX)
             .unwrap()
             .location
             .op_number,
@@ -718,7 +718,7 @@ fn index_publication_crash_cuts_rebuild_or_reuse_without_changing_history() {
             assert_eq!(index.operation_count(), 1);
             assert_eq!(
                 index
-                    .find_operation(OperationId::from_bytes([1; 16]))
+                    .find_operation(OperationId::from_bytes([1; 16]), u64::MAX)
                     .unwrap()
                     .location
                     .op_number,

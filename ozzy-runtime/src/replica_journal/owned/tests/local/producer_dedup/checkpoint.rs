@@ -32,7 +32,7 @@ fn trim(controller: &mut Controller, journal: &mut OwnedJournal, driver: &mut Dr
         .retention_proposal(
             partition(),
             Offset::new(3),
-            0,
+            active_operation(journal),
             OperationId::from_bytes([81; 16]),
         )
         .unwrap()
@@ -234,7 +234,7 @@ async fn empty_identity_checkpoint_keeps_the_confirmed_clock_and_record_end() {
         &mut controller,
         journal.retention_turn(
             driver.begin_validation().unwrap(),
-            Some(0),
+            0.into(),
             OperationId::from_bytes([85; 16]),
             true,
         ),

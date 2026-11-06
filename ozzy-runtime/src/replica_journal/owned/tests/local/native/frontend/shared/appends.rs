@@ -251,6 +251,13 @@ async fn replacement() {
     let old = links.session(authority.primary).unwrap();
     let openings = harness.openings.len();
     harness.hold_confirmation = Some(ProducerId::from_bytes([40; 16]));
+    // Time steps only to deadlines the SDK waits for, short of this attempt's
+    // response timeout. The SDK owner runs on its own thread, and time
+    // advanced while it lags would expire an attempt and send another: on the
+    // old session before the SDK learns of the new one, or a second one on
+    // the new session, whose confirmation the check below would take for the
+    // old one.
+    let timeout = clock.now().saturating_add(retry().response_timeout);
     let pending = writer
         .send(RecordInput::copy_from_slice(
             MessageId::from_bytes([50; 16]),
@@ -272,11 +279,12 @@ async fn replacement() {
     harness.drop_confirmation = Some(ProducerId::from_bytes([40; 16]));
     harness.service.start(link(70, 80).binding.peer).unwrap();
     let mut replaced = false;
-    for _ in 0..10000 {
+    let deadline = std::time::Instant::now() + SETTLE;
+    while std::time::Instant::now() < deadline {
         harness.pump(true);
-        clock
-            .advance(clock.now().saturating_add(Duration::from_millis(1)))
-            .unwrap();
+        if let Some(next) = clock.next_deadline().filter(|&next| next < timeout) {
+            clock.advance(next).unwrap();
+        }
         if links
             .session(authority.primary)
             .is_some_and(|current| current != old)

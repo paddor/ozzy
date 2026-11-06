@@ -2,6 +2,57 @@
 
 ## [Unreleased]
 
+### Breaking
+
+- Journals and checkpoints from earlier builds no longer open: `Trim`
+  operations carry an operation floor, and checkpoint state is snapshot
+  version 7. Format stores again. `ozzy_journal::operation::Trim` has the
+  two floor fields, and `find_operation` on segment index views and
+  builders takes the last operation to search.
+- `ozzy_runtime::replica_journal::ClockReading` has a new `monotonic` field.
+  The leader's deduplication time advances by it instead of by tokio's
+  clock, so a broker on simulated time measures dedup windows on that time.
+
+### Fixed
+
+- A partition on a delay topic no longer busy-loops its shard thread while a
+  due release waits for room. With the pipeline full and records queued behind
+  the release, the partition asked for another turn at once, again and again,
+  until the pipeline drained.
+- A leader no longer busy-loops its shard thread when a follower needs
+  history the leader already retired. It read that history again on every
+  turn and sent `HISTORY_RETIRED` each time; it now tells the follower once
+  per retransmission interval.
+- A deduplicating partition opens much faster on a long history, at restart
+  and when a copy activates a new view. Opening replays the operations since
+  the last dedup checkpoint, or all of them on a topic without retention, and
+  read each one with about three disk jobs. On a slow disk that kept the copy
+  out of the view for minutes. It now reads them in runs from each segment.
+- A follower no longer faults when a client retries a control request, such
+  as a producer open or a group assignment, after retention removed the
+  original from the leader but not yet from the follower. The leader took
+  the retry as new, and the follower refused it as a duplicate. Every copy
+  now forgets an operation ID at the same operation, the operation floor a
+  `Trim` raises, and no copy retires history past it.
+- A disk-quorum follower no longer fails a deduplicating partition with
+  "deduplication original operation N is not confirmed" when it receives an
+  append that reuses an expired message ID before it learns that the
+  original committed, as when both arrive in one received suffix. It now
+  admits the original first and validates the reuse once it learns of that
+  commit.
+- A disk-quorum partition no longer leaves work it deferred during a
+  segment roll waiting for the 100 ms safety sweep when the roll ends.
+- A disk-quorum partition with retention keeps admitting and writing while
+  a retention cleanup job removes old files. Every copy used to stop new
+  writes until the job finished, which on a slow disk stalled the partition
+  for most of a second after each retirement. Only installation and history
+  pins still wait for the job.
+- A disk-quorum follower that falls behind the leader's commit, as behind a
+  slow uplink, no longer suspects a leader it still hears. COMMIT messages
+  past the operations it held did not count as contact, so after a second
+  it asked to leave the view, and any short stall of the leader then
+  replaced a healthy leader.
+
 ## [0.10.0] - 2026-11-05
 
 ### Breaking

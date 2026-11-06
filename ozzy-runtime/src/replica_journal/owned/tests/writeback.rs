@@ -256,6 +256,44 @@ pub(super) fn initialize_writer(
     receipt
 }
 
+/// Create the test partition on both copies and confirm it, so a `Trim`
+/// can later raise the operation floor.
+pub(super) fn create_partition(
+    controller: &mut Controller,
+    primary: &mut Replica,
+    backup: &mut Replica,
+) {
+    for replica in [&mut *primary, &mut *backup] {
+        let receipt = initialize_writer(controller, replica);
+        let work = prepare(replica);
+        finish(controller, replica, work);
+        settle(replica, receipt);
+        synchronize(controller, replica);
+    }
+    confirm(primary, backup);
+}
+
+/// Commit a `Trim` that raises the operation floor to the primary's active
+/// segment on both copies, so every sealed segment may retire. Returns the
+/// accepted end.
+pub(super) fn raise_operation_floor(
+    controller: &mut Controller,
+    primary: &mut Replica,
+    backup: &mut Replica,
+    id: u8,
+) -> Prefix {
+    let trim = super::operation_floor_trim(&primary.journal, id);
+    for replica in [&mut *primary, &mut *backup] {
+        let (_, _, receipt) = admit_encoded(controller, replica, [trim.clone()]);
+        let work = prepare(replica);
+        finish(controller, replica, work);
+        settle(replica, receipt);
+        synchronize(controller, replica);
+    }
+    confirm(primary, backup);
+    primary.driver.normal().unwrap().snapshot().accepted
+}
+
 pub(super) fn packed_append_body(
     limits: ozzy_journal::operation::OperationLimits,
     payload: &[u8],

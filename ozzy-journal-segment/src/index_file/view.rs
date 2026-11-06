@@ -4,7 +4,7 @@
 use super::{
     BATCH_INDEX_ENTRY_BYTES, IndexLayout, IndexSource, MESSAGE_INDEX_ENTRY_BYTES,
     OPERATION_INDEX_ENTRY_BYTES, OPERATION_LOCATION_BYTES, SCHEDULE_INDEX_ENTRY_BYTES,
-    order::{binary_search_section, compare_schedule_key, lower_bound_section},
+    order::{compare_schedule_key, lower_bound_section},
     rows::{
         RowBase, decode_batch_entry, decode_message_row, decode_operation_entry,
         decode_operation_location, decode_row_base, decode_schedule_entry,
@@ -195,15 +195,24 @@ impl SegmentIndexView<'_> {
         ))
     }
 
-    /// Look up an exact canonical control-operation identity.
-    pub fn find_operation(&self, operation_id: OperationId) -> Option<OperationIndexEntry> {
-        binary_search_section(
-            self.operations,
-            |entry: &[u8; OPERATION_INDEX_ENTRY_BYTES]| {
-                entry.array::<0, 16>().cmp(operation_id.as_bytes())
-            },
-        )
-        .map(|entry| decode_operation_entry(entry, self.source.segment_id))
+    /// The newest claim of a control-operation identity at or before
+    /// operation `through`. Rows sort by ID, then operation, and a key is
+    /// the row's first 24 bytes.
+    pub fn find_operation(
+        &self,
+        operation_id: OperationId,
+        through: u64,
+    ) -> Option<OperationIndexEntry> {
+        let mut key = [0; 24];
+        key[..16].copy_from_slice(operation_id.as_bytes());
+        key[16..].copy_from_slice(&through.to_be_bytes());
+        let rows = self.operations.as_chunks::<OPERATION_INDEX_ENTRY_BYTES>().0;
+        let row = rows.get(
+            rows.partition_point(|row| row[..24] <= key[..])
+                .checked_sub(1)?,
+        )?;
+        (row.array::<0, 16>() == *operation_id.as_bytes())
+            .then(|| decode_operation_entry(row, self.source.segment_id))
     }
 }
 

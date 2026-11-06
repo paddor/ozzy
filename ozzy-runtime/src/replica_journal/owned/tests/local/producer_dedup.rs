@@ -21,6 +21,17 @@ fn produce(
     requests: impl IntoIterator<Item = crate::replica_journal::ProducerAppend<'static>>,
     timestamp: u64,
 ) -> ProposalValidation {
+    produce_at(controller, journal, driver, requests, timestamp.into())
+}
+
+/// As `produce`, at one explicit journal clock reading.
+fn produce_at(
+    controller: &mut Controller,
+    journal: &mut OwnedJournal,
+    driver: &Driver,
+    requests: impl IntoIterator<Item = crate::replica_journal::ProducerAppend<'static>>,
+    clock: crate::replica_journal::ClockReading,
+) -> ProposalValidation {
     let ticket = driver.begin_validation().unwrap();
     let mut buffer = journal.lease_proposal_buffer().unwrap();
     for request in requests {
@@ -35,10 +46,7 @@ fn produce(
             )
             .unwrap();
     }
-    drive(
-        controller,
-        journal.propose_append(ticket, buffer, timestamp),
-    )
+    drive(controller, journal.propose_append(ticket, buffer, clock))
 }
 
 fn ready(result: ProposalValidation) -> crate::replica_journal::ValidatedAppend {

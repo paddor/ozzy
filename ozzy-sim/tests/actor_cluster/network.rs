@@ -4,7 +4,8 @@
 //! connection: delays never reorder it, a full PEER path refuses the send
 //! with `Full`, and a full PUB path drops the newest frame. PEER traffic is
 //! never lost on a live link. Clogs and partitions stop delivery on paths;
-//! their senders then fill the paths and feel backpressure.
+//! their senders then fill the paths and feel backpressure. Frames a broker
+//! sent before it died still arrive, as frames on the wire do.
 
 use crate::seeds::{Rng, Trace};
 use bytes::Bytes;
@@ -19,6 +20,9 @@ pub(crate) const BROKERS: usize = 3;
 /// Shard input lane bounds of a receiving broker.
 const CONTROL_LANE: usize = 64;
 const DATA_LANE: usize = 32;
+/// Extra ticks each frame of a slow link takes: 3 s, past the 2 s election
+/// timeout.
+pub(crate) const SLOW_LINK: u64 = 300;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Class {
@@ -141,6 +145,8 @@ pub(crate) struct Stats {
     pub pub_dropped: u64,
     pub partitions: u64,
     pub clogs: u64,
+    /// Frames delivered after their sender died.
+    pub after_crash: u64,
 }
 
 /// Input lanes of one receiving shard, filled by the network and drained by
@@ -156,6 +162,9 @@ struct Path {
     queue: VecDeque<(u64, Message)>,
     last_due: u64,
     clogged_until: u64,
+    /// Frames at the head that were on the wire when their sender died.
+    /// They arrive through a later cut.
+    in_flight: usize,
 }
 
 #[derive(Debug)]
@@ -165,11 +174,18 @@ pub(crate) struct Network {
     paths: Vec<Path>,
     /// Directed links a partition blocks.
     blocked: [[bool; BROKERS]; BROKERS],
+    /// Directed links random overlapping faults cut, apart from partitions.
+    cut: [[bool; BROKERS]; BROKERS],
     partitioned: bool,
     /// The broker of a scripted fault. Random partitions wait for it.
     isolated: Option<usize>,
     /// The final drain stops new faults.
     healed: bool,
+    /// A scripted fault holds random partitions and clogs.
+    calm: bool,
+    /// A broker whose frames take `SLOW_LINK` longer: those it sends when
+    /// true, those it receives when false.
+    slow: Option<(usize, bool)>,
     /// Shards whose send was refused, woken when one of their paths drains.
     refused: [Option<Waker>; BROKERS],
     pub stats: Stats,
@@ -184,9 +200,12 @@ impl Network {
                 .map(|_| Path::default())
                 .collect(),
             blocked: [[false; BROKERS]; BROKERS],
+            cut: [[false; BROKERS]; BROKERS],
             partitioned: false,
             isolated: None,
             healed: false,
+            calm: false,
+            slow: None,
             refused: std::array::from_fn(|_| None),
             stats: Stats::default(),
         }
@@ -228,6 +247,24 @@ impl Network {
         Ok(())
     }
 
+    /// A dispatcher's clock sample, already routed from `from`, on the
+    /// control lane to `to`. Dropped when that lane is full, as the
+    /// dispatcher drops it; the next one replaces it.
+    pub(crate) fn sample(
+        &mut self,
+        from: usize,
+        to: usize,
+        tick: u64,
+        message: Message,
+        trace: &mut Trace,
+    ) {
+        if self.path(from, to, Class::Control).queue.len() >= self.profile.capacity(Class::Control)
+        {
+            return;
+        }
+        self.enqueue(from, to, Class::Control, tick, message, trace);
+    }
+
     fn enqueue(
         &mut self,
         from: usize,
@@ -248,7 +285,12 @@ impl Network {
             trace.word(u64::MAX);
             return;
         }
-        let delay = self.profile.delay_floor + self.rng.exponential(self.profile.delay_mean);
+        let slow = match self.slow {
+            Some((broker, true)) if broker == from => SLOW_LINK,
+            Some((broker, false)) if broker == to => SLOW_LINK,
+            _ => 0,
+        };
+        let delay = self.profile.delay_floor + self.rng.exponential(self.profile.delay_mean) + slow;
         let path = self.path(from, to, class);
         let due = (tick + delay).max(path.last_due);
         path.last_due = due;
@@ -259,7 +301,7 @@ impl Network {
 
     /// Start or heal partitions and clogs for this tick.
     pub(crate) fn step(&mut self, tick: u64) {
-        if self.healed {
+        if self.healed || self.calm {
             return;
         }
         if self.isolated.is_some() {
@@ -322,6 +364,18 @@ impl Network {
         self.isolated = Some(broker);
     }
 
+    /// Frames `broker` sends when `outbound`, else those it receives, take
+    /// `SLOW_LINK` longer until `rejoin`. Random partitions and clogs stop
+    /// meanwhile, so only the slow link can change the view.
+    pub(crate) fn slow(&mut self, broker: usize, outbound: bool) {
+        self.hold_partitions(broker);
+        for path in &mut self.paths {
+            path.clogged_until = 0;
+        }
+        self.calm = true;
+        self.slow = Some((broker, outbound));
+    }
+
     fn cut(&mut self, broker: usize, direction: u64) {
         self.split(broker, direction);
         self.partitioned = false;
@@ -329,28 +383,78 @@ impl Network {
         self.stats.partitions += 1;
     }
 
-    /// `broker` lost power: frames on its links are gone with them. It
-    /// stays cut off until `rejoin`.
+    /// `broker` died, as `drop_links` says, and stays cut off until
+    /// `rejoin`.
     pub(crate) fn crash(&mut self, broker: usize) {
-        for from in 0..BROKERS {
-            for to in (0..BROKERS).filter(|to| *to != from && (from == broker || *to == broker)) {
-                for class in CLASSES {
-                    self.paths[index(from, to, class)].queue.clear();
+        self.drop_links(broker);
+        self.isolate(broker);
+    }
+
+    /// `broker` died. Frames to it are gone, and so are those it still held
+    /// on a cut path. Frames already on the wire still arrive, even after
+    /// its peers saw the links drop or it restarted.
+    pub(crate) fn drop_links(&mut self, broker: usize) {
+        for to in (0..BROKERS).filter(|to| *to != broker) {
+            let open = !self.blocked[broker][to] && !self.cut[broker][to];
+            for class in CLASSES {
+                let path = &mut self.paths[index(broker, to, class)];
+                if open {
+                    path.in_flight = path.queue.len();
+                } else {
+                    path.queue.clear();
+                    path.in_flight = 0;
                 }
             }
+        }
+        self.drop_queued(|_, to| to == broker);
+    }
+
+    /// Every broker died at once: no frame has a receiver left.
+    pub(crate) fn drop_all(&mut self) {
+        self.drop_queued(|_, _| true);
+    }
+
+    /// The connection between `left` and `right` dropped with its queued
+    /// frames.
+    pub(crate) fn drop_link(&mut self, left: usize, right: usize) {
+        self.drop_queued(|from, to| (from, to) == (left, right) || (from, to) == (right, left));
+    }
+
+    fn drop_queued(&mut self, dropped: impl Fn(usize, usize) -> bool) {
+        for from in 0..BROKERS {
+            let mut cleared = false;
+            for to in (0..BROKERS).filter(|to| *to != from && dropped(from, *to)) {
+                for class in CLASSES {
+                    let path = &mut self.paths[index(from, to, class)];
+                    path.queue.clear();
+                    path.in_flight = 0;
+                }
+                cleared = true;
+            }
             // Senders refused on a cleared path may send again.
-            if let Some(waker) = self.refused[from].take()
-                && from != broker
-            {
+            if cleared && let Some(waker) = self.refused[from].take() {
                 waker.wake();
             }
         }
-        self.isolate(broker);
+    }
+
+    /// Cut each broker as `cuts` says: 0 both ways, 1 outbound only, 2
+    /// inbound only, `None` not at all. Partitions stay as they are.
+    pub(crate) fn set_cuts(&mut self, cuts: [Option<u64>; BROKERS]) {
+        for (from, row) in self.cut.iter_mut().enumerate() {
+            for (to, cut) in row.iter_mut().enumerate() {
+                let outbound = cuts[from].is_some_and(|direction| direction != 2);
+                let inbound = cuts[to].is_some_and(|direction| direction != 1);
+                *cut = from != to && (outbound || inbound);
+            }
+        }
     }
 
     pub(crate) fn rejoin(&mut self) {
         self.blocked = [[false; BROKERS]; BROKERS];
         self.isolated = None;
+        self.calm = false;
+        self.slow = None;
     }
 
     /// Clear every random fault and start no new ones. A scripted
@@ -371,9 +475,11 @@ impl Network {
     pub(crate) fn deliver(&mut self, to: usize, tick: u64, inbox: &mut Inbox, trace: &mut Trace) {
         for offset in 0..BROKERS {
             let from = (to + offset + tick as usize) % BROKERS;
-            if from == to || self.blocked[from][to] {
+            if from == to {
                 continue;
             }
+            // A cut path still delivers what was on the wire.
+            let open = !self.blocked[from][to] && !self.cut[from][to];
             let mut drained = false;
             for class in CLASSES {
                 let path = &mut self.paths[index(from, to, class)];
@@ -382,6 +488,7 @@ impl Network {
                 }
                 while let Some((due, _)) = path.queue.front()
                     && *due <= tick
+                    && (open || path.in_flight > 0)
                 {
                     let lane = match class {
                         Class::Control => &mut inbox.control,
@@ -397,6 +504,8 @@ impl Network {
                         break;
                     }
                     let (_, message) = path.queue.pop_front().unwrap();
+                    let orphan = path.in_flight > 0;
+                    path.in_flight = path.in_flight.saturating_sub(1);
                     drained = true;
                     trace.word(tick);
                     trace.word(index(from, to, class) as u64);
@@ -405,6 +514,7 @@ impl Network {
                         trace.word(u64::MAX);
                     } else {
                         self.stats.delivered += 1;
+                        self.stats.after_crash += u64::from(orphan);
                         lane.push_back((from, message));
                     }
                 }

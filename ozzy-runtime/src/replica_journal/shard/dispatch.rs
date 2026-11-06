@@ -196,9 +196,7 @@ async fn maintenance(
             leader,
             done,
         } => {
-            let turn = state
-                .owner
-                .retention_turn(ticket, time.decision(), seed, leader);
+            let turn = state.owner.retention_turn(ticket, time, seed, leader);
             finish_read(done, turn.await, permit)
         }
         MaintenanceAction::RetainIdentities {
@@ -207,7 +205,9 @@ async fn maintenance(
             done,
         } => finish_read(
             done,
-            state.owner.retain_identities_turn(ticket, leader),
+            state
+                .owner
+                .retain_identities_turn(ticket, leader, time.monotonic),
             permit,
         ),
         MaintenanceAction::Release { ticket, done } => {

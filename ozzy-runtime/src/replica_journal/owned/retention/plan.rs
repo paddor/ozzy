@@ -1,5 +1,5 @@
 //! Retention planning from sealed-segment summaries, and the retry-floor and
-//! trim proposal that advances the record floor.
+//! trim proposal that advances the record and operation floors.
 
 use super::super::{JournalError, OwnedJournal};
 use crate::replica_journal::ProposalBuffer;
@@ -138,7 +138,8 @@ impl OwnedJournal {
         Ok(segments)
     }
 
-    /// Expire bounded producer retry ranges before advancing the record floor.
+    /// Expire bounded producer retry ranges before advancing the record and
+    /// operation floors.
     /// The caller submits this through the ordinary mode's proposal/commit path.
     pub fn retention_proposal(
         &self,
@@ -147,12 +148,12 @@ impl OwnedJournal {
         operation_floor: u64,
         seed: OperationId,
     ) -> Result<Option<ProposalBuffer>, JournalError> {
-        let state = self
-            .images()?
-            .committed()
+        let committed = self.images()?.committed();
+        let state = committed
             .partition(partition)
             .ok_or(JournalError::Configuration)?;
         let floor = floor.max(state.retained_from);
+        let operation_floor = operation_floor.max(committed.operation_floor());
         let mut buffer = self
             .lease_proposal_buffer()
             .map_err(|_| JournalError::AppendCapacity)?;
@@ -186,7 +187,7 @@ impl OwnedJournal {
             )?;
         }
         if complete
-            && floor > state.retained_from
+            && (floor > state.retained_from || operation_floor > committed.operation_floor())
             && buffer.len() < self.append_limits.max_operations
         {
             let id = operation_id(seed, buffer.len());
@@ -196,6 +197,8 @@ impl OwnedJournal {
                     partition,
                     expected_floor: state.retained_from,
                     new_floor: floor,
+                    expected_operation_floor: committed.operation_floor(),
+                    new_operation_floor: operation_floor,
                     operation_id: id,
                 }),
                 self.limits.operations,

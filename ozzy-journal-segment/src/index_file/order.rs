@@ -5,8 +5,8 @@ use crate::{
     BatchIndexEntry, MessageRow, OperationIndexEntry, OperationLocation, ScheduleIndexEntry,
 };
 use ozzy_journal::operation::ReleaseKey;
-use ozzy_proto::PartitionIncarnation;
 use ozzy_proto::layout::Fixed;
+use ozzy_proto::{OperationId, PartitionIncarnation};
 use std::cmp::Ordering;
 
 pub(crate) fn compare_locations(left: &OperationLocation, right: &OperationLocation) -> Ordering {
@@ -31,6 +31,24 @@ pub(crate) fn compare_operation_entries(
     left.operation_id
         .as_bytes()
         .cmp(right.operation_id.as_bytes())
+        .then_with(|| left.location.op_number.cmp(&right.location.op_number))
+}
+
+/// The newest of `entries`, sorted by `compare_operation_entries`, that
+/// claims `id` at or before operation `through`. An identity retried after
+/// the operation floor forgot it appears once per claim.
+pub(crate) fn newest_operation(
+    entries: &[OperationIndexEntry],
+    id: OperationId,
+    through: u64,
+) -> Option<OperationIndexEntry> {
+    let end = entries.partition_point(|entry| {
+        (*entry.operation_id.as_bytes(), entry.location.op_number) <= (*id.as_bytes(), through)
+    });
+    entries
+        .get(end.checked_sub(1)?)
+        .filter(|entry| entry.operation_id == id)
+        .copied()
 }
 
 pub(crate) fn compare_schedule_entries(
@@ -58,14 +76,6 @@ pub(super) fn compare_schedule_key(
         .cmp(partition.as_bytes())
         .then_with(|| entry.u64_at::<16>().cmp(&key.millis))
         .then_with(|| entry.u64_at::<24>().cmp(&key.schedule))
-}
-
-pub(super) fn binary_search_section<const W: usize>(
-    section: &[u8],
-    compare: impl Fn(&[u8; W]) -> Ordering,
-) -> Option<&[u8; W]> {
-    let rows = section.as_chunks::<W>().0;
-    rows.get(rows.binary_search_by(compare).ok()?)
 }
 
 pub(super) fn lower_bound_section<const W: usize>(

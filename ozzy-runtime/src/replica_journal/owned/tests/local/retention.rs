@@ -17,7 +17,7 @@ fn retention_waits_for_partition_creation_before_disabling_an_unlimited_policy()
         &mut controller,
         journal.retention_turn(
             driver.begin_validation().unwrap(),
-            Some(999),
+            999.into(),
             OperationId::from_bytes([93; 16]),
             true,
         ),
@@ -34,7 +34,7 @@ fn retention_waits_for_partition_creation_before_disabling_an_unlimited_policy()
         &mut controller,
         journal.retention_turn(
             driver.begin_validation().unwrap(),
-            Some(999),
+            999.into(),
             OperationId::from_bytes([94; 16]),
             true,
         ),
@@ -159,7 +159,7 @@ fn retention_reclaims_bounded_orphans_without_advancing_the_record_floor() {
     for remaining in [11, 3, 0] {
         let turn = drive(
             &mut controller,
-            journal.retention_turn(ticket, Some(999), OperationId::from_bytes([91; 16]), true),
+            journal.retention_turn(ticket, 999.into(), OperationId::from_bytes([91; 16]), true),
         )
         .unwrap();
         assert!(turn.enabled);
@@ -211,7 +211,7 @@ fn a_clean_storage_pass_repeats_only_after_the_next_manifest_publication() {
             controller,
             journal.retention_turn(
                 driver.begin_validation().unwrap(),
-                Some(999),
+                999.into(),
                 OperationId::from_bytes([92; 16]),
                 true,
             ),
@@ -261,7 +261,7 @@ fn a_released_pin_reopens_cleanup_without_a_manifest_publication() {
             controller,
             journal.retention_turn(
                 driver.begin_validation().unwrap(),
-                Some(999),
+                999.into(),
                 OperationId::from_bytes([93; 16]),
                 true,
             ),
@@ -482,7 +482,7 @@ fn retirement_restores_independent_retry_floors_for_interleaved_producers() {
         .retention_proposal(
             partition(),
             Offset::new(3),
-            0,
+            active_operation(&journal),
             OperationId::from_bytes([94; 16]),
         )
         .unwrap()
@@ -562,7 +562,7 @@ fn capture_cleanup_beside_writes(
             controller,
             journal.retention_turn(
                 driver.begin_validation().unwrap(),
-                Some(999),
+                999.into(),
                 OperationId::from_bytes([94; 16]),
                 true,
             ),

@@ -114,7 +114,20 @@ impl OwnedJournal {
                 records,
                 dedup,
             }),
-            Err(JournalError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(error) => self.refused_received(error, ticket, buffer),
+        }
+    }
+
+    /// Map a refused received suffix to a retry, a split, or a rejection.
+    fn refused_received(
+        &mut self,
+        error: JournalError,
+        ticket: ValidationTicket,
+        buffer: AppendBuffer,
+    ) -> super::super::turn::ReceivedValidation {
+        use super::super::turn::ReceivedValidation;
+        match error {
+            JournalError::Io(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 if let Err(error) = self.retain_validation_pressure() {
                     return ReceivedValidation::Rejected(error);
                 }
@@ -127,11 +140,11 @@ impl OwnedJournal {
             // capacity. A follower that has not applied that commit, or not
             // yet learned of it, still holds rows its expiry will drop. Retry
             // once it applies more.
-            Err(JournalError::Dedup(
+            JournalError::Dedup(
                 ozzy_core::dedup::Error::Capacity
                 | ozzy_core::dedup::Error::PendingCapacity
                 | ozzy_core::dedup::Error::SnapshotCapacity,
-            )) if !self.pending.is_empty() => {
+            ) if !self.pending.is_empty() => {
                 self.dedup.apply_wait.set(Some(self.applied.op.0));
                 ReceivedValidation::Deferred {
                     validation: ticket,
@@ -142,15 +155,37 @@ impl OwnedJournal {
             // suffix. The leader admitted its first operation against a
             // commit this replica has applied, so it fits alone; the rest
             // waits for it. A single operation that does not fit is invalid.
-            Err(JournalError::Dedup(
+            JournalError::Dedup(
                 ozzy_core::dedup::Error::Capacity
                 | ozzy_core::dedup::Error::PendingCapacity
                 | ozzy_core::dedup::Error::SnapshotCapacity,
-            )) if buffer.len() > 1 => ReceivedValidation::Split {
+            ) if buffer.len() > 1 => ReceivedValidation::Split {
                 validation: ticket,
                 buffer,
             },
-            Err(error) => ReceivedValidation::Rejected(error),
+            // The leader reused an expired ID once the original operation
+            // committed. A follower that holds the original but has not
+            // learned of that commit retries once it applies more.
+            JournalError::Dedup(ozzy_core::dedup::Error::PendingOriginal(original))
+                if original <= ticket.accepted().op.0 =>
+            {
+                self.dedup.apply_wait.set(Some(self.applied.op.0));
+                ReceivedValidation::Deferred {
+                    validation: ticket,
+                    buffer,
+                }
+            }
+            // The original is in this suffix, so its commit cannot be known
+            // yet. Admit the suffix one operation at a time until it is.
+            JournalError::Dedup(ozzy_core::dedup::Error::PendingOriginal(_))
+                if buffer.len() > 1 =>
+            {
+                ReceivedValidation::Split {
+                    validation: ticket,
+                    buffer,
+                }
+            }
+            error => ReceivedValidation::Rejected(error),
         }
     }
 

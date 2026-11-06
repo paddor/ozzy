@@ -1,5 +1,5 @@
 use super::replay::persist;
-use super::writeback::{Replica, confirm, replica};
+use super::writeback::{Replica, confirm, create_partition, raise_operation_floor, replica};
 use super::*;
 mod checkpoint;
 mod faults;
@@ -410,15 +410,17 @@ fn owned_checkpoint_recovery_after_retirement_preserves_confirmed_anchor_and_acc
     let (mut controller, io) = setup();
     let mut primary = replica(&mut controller, io.clone(), 0, 8192);
     let mut backup = replica(&mut controller, io.clone(), 2, 8192);
+    create_partition(&mut controller, &mut primary, &mut backup);
     let old = persist(&mut controller, &mut primary);
     persist(&mut controller, &mut backup);
     confirm(&mut primary, &backup);
     let roll = primary.journal.begin_roll(8).unwrap();
     let done = drive(&mut controller, roll.publish());
     primary.journal.complete_roll(done).unwrap();
-    let committed = persist(&mut controller, &mut primary);
+    persist(&mut controller, &mut primary);
     persist(&mut controller, &mut backup);
     confirm(&mut primary, &backup);
+    let committed = raise_operation_floor(&mut controller, &mut primary, &mut backup, 96);
     let ticket = primary.driver.begin_validation().unwrap();
     let retired = drive(
         &mut controller,
@@ -508,12 +510,14 @@ fn owned_checkpoint_recovery_at_the_accepted_tail_needs_no_operations() {
     let (mut controller, io) = setup();
     let mut primary = replica(&mut controller, io.clone(), 0, 8192);
     let mut backup = replica(&mut controller, io.clone(), 2, 8192);
-    let accepted = persist(&mut controller, &mut primary);
+    create_partition(&mut controller, &mut primary, &mut backup);
+    let predecessor = persist(&mut controller, &mut primary);
     persist(&mut controller, &mut backup);
     confirm(&mut primary, &backup);
     let roll = primary.journal.begin_roll(8).unwrap();
     let done = drive(&mut controller, roll.publish());
     primary.journal.complete_roll(done).unwrap();
+    let accepted = raise_operation_floor(&mut controller, &mut primary, &mut backup, 96);
     let retired = drive(
         &mut controller,
         primary.journal.retire_confirmed_history(
@@ -544,7 +548,7 @@ fn owned_checkpoint_recovery_at_the_accepted_tail_needs_no_operations() {
     let (mut recovery, ticket, pin) =
         authorize(&mut controller, &mut primary, &backup, startup, 98);
     let anchor = ticket.checkpoint().unwrap();
-    assert_eq!(anchor.predecessor, accepted);
+    assert_eq!(anchor.predecessor, predecessor);
     assert_eq!(anchor.position, accepted);
     let plan = drive(&mut controller, receiver.begin_recovery(ticket, physical())).unwrap();
     transfer(

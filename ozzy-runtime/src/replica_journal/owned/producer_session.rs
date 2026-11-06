@@ -93,7 +93,8 @@ impl OwnedJournal {
     ) -> Result<((u64, u64, u64), bool), JournalError> {
         let key = IdentityKey::operation(request.operation);
         let claim = {
-            let identities = self.images()?.speculative_identities();
+            let images = self.images()?;
+            let identities = images.speculative_identities();
             identities
                 .resolve(&[key])
                 .await
@@ -101,7 +102,9 @@ impl OwnedJournal {
                     IdentityResolveError::Lookup(error) => JournalError::Index(error),
                     IdentityResolveError::Identity(error) => identity_error(error),
                 })?;
-            identities.lookup(key).map_err(identity_error)?
+            images
+                .speculative()
+                .live_claim(identities.lookup(key).map_err(identity_error)?)
         };
         if let Some(claim) = claim {
             let original = if let Some(open) = self.writeback.producer_open(

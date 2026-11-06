@@ -1,49 +1,61 @@
 //! One simulated broker: a production `PartitionActors` shard hosting one
-//! replicated group over production shard journals on its own device. A turn
-//! mirrors the broker's shard turn (`ozzy-broker/src/serving/shard/
-//! scheduler.rs`): deliver input first, then visit partitions until the
-//! shard waker stays quiet.
+//! or two replicated groups, each over its own production shard journal on
+//! the broker's one device. A turn mirrors the broker's shard turn
+//! (`ozzy-broker/src/serving/shard/scheduler.rs`): deliver input first, then
+//! visit partitions until the shard waker stays quiet.
+
+mod setup;
+
+pub(crate) use setup::{DEDUP_GROUP, DEDUP_WINDOW, PRODUCER_IDLE, RETENTION_AGE};
+use setup::{actor_config, generation, journal_clock, journal_config, lanes, readers, services};
 
 use crate::{
-    clock::Clock,
+    check::leads,
+    clock::{Clock, Host},
+    consumer,
     disk::{Disk, Flag},
     network::{BROKERS, Inbox, Network, node, opcode},
+    records,
     seeds::Trace,
 };
 use bytes::Bytes;
 use omq_tokio::Message;
 use ozzy_io::Local;
-use ozzy_journal_segment::{
-    BodyEncoding, CanonicalRecoveryLimits, CheckpointLimits, DecodeLimits, GroupIdentity,
-    IndexBuildLimits, JournalLimits, MetadataLimits, PartitionReadLimits, SegmentOptions,
-    SegmentWriteMode,
+use ozzy_proto::{
+    Envelope, EnvelopeLimits, GroupId, LinkSessionId, Opcode, PartitionIncarnation,
+    clock as samples,
 };
-use ozzy_proto::{EnvelopeLimits, GroupId, LinkSessionId, Opcode, StoreId, VolumeId};
 use ozzy_replication::{
-    ConfigurationRecord, ConfiguredVoter, Digest, JournalGeneration, PipelineLimits,
-    driver::Timing,
-    flow::{Channel, ProbeTiming},
-    wire::{CompactState, WireLimits, flow_state_route},
+    PipelineLimits,
+    flow::Channel,
+    wire::{self, CompactState, flow_state_route},
 };
 use ozzy_runtime::{
+    frontend::{ClockNow, ClockSampling, ClockTrust, Links, ReaderGrants},
     replica_actor::{
-        ActorConfig, ActorIds, ActorStatus, PartitionActor, PartitionActors, PartitionStatus,
-        ProposalSubmitter, ReceiptHandles, ReplicaActor, ScheduledReplica, SessionReplacement,
-        SyncBatchTarget,
+        ActorIds, ActorStatus, NativeReceive, PartitionActor, PartitionActors, PartitionStatus,
+        PendingProposal, ProposalOutcome, ProposalSubmitter, ReceiptHandles, ReplicaActor,
+        ScheduledReplica, SessionReplacement,
     },
-    replica_journal::{
-        InstallationConfig, JournalStartup, OwnedConfig, OwnedJournal, ProposalBuffer,
-        ShardJournalConfig,
-    },
-    replica_transport::QueueLimits,
+    replica_journal::{JournalStartup, OwnedJournal, ProposalBuffer, ShardJournalConfig},
 };
 use std::{
+    collections::{BTreeMap, VecDeque},
+    pin::Pin,
     sync::Arc,
     task::{Context, Poll, Waker},
     time::Duration,
 };
 
-pub(crate) const GROUP: GroupId = GroupId::from_bytes([7; 16]);
+/// The groups a broker can host in its one shard, and their partitions; a
+/// run hosts the first `Shape::partitions`. Barrier clients use the first,
+/// and scripted faults target its leader.
+pub(crate) const GROUPS: [GroupId; 2] =
+    [GroupId::from_bytes([7; 16]), GroupId::from_bytes([6; 16])];
+pub(crate) const PARTITIONS: [PartitionIncarnation; 2] = [
+    PartitionIncarnation::from_bytes([8; 16]),
+    PartitionIncarnation::from_bytes([5; 16]),
+];
 pub(crate) const PIPELINE: PipelineLimits = PipelineLimits {
     max_operations: 8,
     max_body_bytes: 8192,
@@ -52,15 +64,74 @@ pub(crate) const PIPELINE: PipelineLimits = PipelineLimits {
 pub(crate) const SEGMENT_BYTES: u64 = 256 * 1024;
 /// The broker's journal segment limit.
 pub(crate) const MAX_SEGMENTS: usize = 256;
+/// Clock disagreement that clock-driven decisions allow, as the broker's
+/// default `cluster.max_clock_offset_millis`.
+pub(crate) const CLOCK_TOLERANCE: u64 = 1000;
+/// Ticks after a clock step in which a safety sweep may find due work: a
+/// step is unseen until the guard's next look, within a sample interval,
+/// and a partition that read the stepped clock rechecks within one too.
+const CLOCK_WAKE: u64 = 100;
 
-/// A broker's journal: segment limit and size, and whether it writes one
-/// operation per physical group.
+/// A broker's shard: the partitions it hosts, and its journals' segment
+/// limit and size, and whether they write one operation per physical group.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Shape {
+    pub partitions: usize,
+    /// The safeguard a negative control turns off, if any.
+    pub control: Control,
     pub max_segments: usize,
     pub segment_bytes: u64,
     pub sparse: bool,
+    /// Both partitions retire records after `RETENTION_AGE`.
+    pub retention: bool,
 }
+/// A negative control: one safeguard off, so the checks must fail.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum Control {
+    #[default]
+    None,
+    /// Clock-driven decisions skip the clock guard.
+    Unguarded,
+    /// The dedup partition stores every resend.
+    NoDedup,
+    /// Producer sessions retire after a sixth of `PRODUCER_IDLE`.
+    EarlyIdle,
+    /// Records retire after a quarter of `RETENTION_AGE`.
+    YoungRetention,
+}
+
+impl Shape {
+    /// Clock-driven decisions wait for the clock guard.
+    pub(crate) fn guarded(self) -> bool {
+        self.control != Control::Unguarded
+    }
+
+    /// The dedup partition deduplicates.
+    pub(crate) fn dedup(self) -> bool {
+        self.control != Control::NoDedup
+    }
+
+    /// When the dedup partition retires an idle producer session.
+    pub(crate) fn idle(self) -> Duration {
+        let millis = if self.control == Control::EarlyIdle {
+            PRODUCER_IDLE / 6
+        } else {
+            PRODUCER_IDLE
+        };
+        Duration::from_millis(millis)
+    }
+
+    /// The age at which both partitions retire records, if they do.
+    pub(crate) fn max_age(self) -> Option<std::num::NonZeroU64> {
+        let millis = if self.control == Control::YoungRetention {
+            RETENTION_AGE / 4
+        } else {
+            RETENTION_AGE
+        };
+        std::num::NonZeroU64::new(millis).filter(|_| self.retention)
+    }
+}
+
 /// Partition visits per shard poll and polls per broker per tick.
 const TURN_ACTORS: usize = 16;
 const POLL_BUDGET: usize = 1000;
@@ -70,6 +141,17 @@ const LIMITS: EnvelopeLimits = EnvelopeLimits {
     max_metadata_bytes: 64 * 1024,
     max_payload_bytes: 1024 * 1024,
 };
+
+/// The lane that creates the partition once its broker leads, as the
+/// broker's bootstrap does at every startup
+/// (`ozzy-broker/src/serving/shard/scheduler.rs` `poll_bootstrap`).
+#[derive(Debug)]
+struct Bootstrap {
+    submitter: ProposalSubmitter,
+    buffer: Option<ProposalBuffer>,
+    pending: Option<Pin<Box<PendingProposal>>>,
+    done: bool,
+}
 
 /// One proposal lane of a partition actor with its leased arena.
 #[derive(Debug)]
@@ -83,20 +165,49 @@ pub(crate) struct Broker {
     pub index: usize,
     /// Restarts so far.
     pub incarnation: u64,
+    /// What each start builds.
+    shape: Shape,
     pub shard: PartitionActors,
     pub disk: Disk,
     pub inbox: Inbox,
     woken: Arc<Flag>,
-    /// Latest receipt alias bound per sending broker, as the receiving
-    /// frontend binds it (`ozzy-runtime/src/frontend/flow.rs`).
-    aliases: [Option<(u32, Channel)>; BROKERS],
+    /// The host's wall clock; a restart keeps it.
+    pub host: Host,
+    /// The dispatcher's clock guard and what it last published.
+    sampling: ClockSampling,
+    pub trust: ClockTrust,
+    /// The session of each peer link, zero while down.
+    sessions: [LinkSessionId; BROKERS],
+    /// The last tick this host's clock stepped.
+    stepped: Option<u64>,
+    /// Clock guard generation every partition's timers reflect.
+    synced_clock: Option<u64>,
+    /// Sweep-found visits so far.
+    swept: u64,
+    /// Latest receipt alias per group of each sending broker, as the
+    /// receiving frontend binds it (`ozzy-runtime/src/frontend/flow.rs`).
+    aliases: [BTreeMap<GroupId, (u32, Channel)>; BROKERS],
     /// Compact receipts without a bound alias and refused alias bindings.
     pub unbound: u64,
+    /// One per group.
+    bootstrap: Vec<Bootstrap>,
+    /// Client links as the dispatcher publishes them.
+    links: Links,
+    /// Client requests not yet taken, with their partition.
+    pub requests: VecDeque<(usize, Message)>,
+    /// Replies to clients, in send order.
+    pub replies: VecDeque<Message>,
+    /// Live reader publications for the reader PUB, in publish order.
+    pub publications: VecDeque<Message>,
+    /// Readers the live topic admits, as the reader PUB checks them.
+    pub grants: ReaderGrants,
+    /// Client connection resets so far; each starts fresh client sessions.
+    client_resets: u64,
 }
 
 impl Broker {
-    /// Format, open, and schedule the broker's partition. Returns one lane per
-    /// client.
+    /// Format, open, and schedule the broker's partitions. Returns one lane
+    /// per barrier client, on the first group.
     pub(crate) fn start(
         index: usize,
         clock: &Clock,
@@ -104,28 +215,29 @@ impl Broker {
         clients: usize,
         shape: Shape,
     ) -> Result<(Self, Vec<Lane>), String> {
-        let (owner, startup) = disk
-            .drive(OwnedJournal::format_new(
-                journal_config(index, shape),
-                io,
-                generation(index, 0),
-                shape.segment_bytes,
-            ))
-            .map_err(|error| format!("broker {index}: format: {error}"))?;
+        let mut journals = Vec::new();
+        for group in 0..shape.partitions {
+            journals.push(
+                disk.drive(OwnedJournal::format_new(
+                    journal_config(index, shape, group),
+                    io.clone(),
+                    generation(index, 0, group),
+                    shape.segment_bytes,
+                ))
+                .map_err(|error| format!("broker {index}: format group {group}: {error}"))?,
+            );
+        }
         let sessions = std::array::from_fn(|peer| session(index, peer, 0));
-        Self::serve(
-            index, 0, clock, disk, owner, startup, sessions, clients, shape,
-        )
+        let host = Host::new(clock);
+        Self::serve(index, 0, host, disk, journals, sessions, clients, shape)
     }
 
-    /// Lose power, or only the process without `power_loss`, then start
-    /// again over what the disk kept: reopen the journal under a fresh writer
-    /// generation and ID namespace. The new actor has no links until
-    /// `connect`.
+    /// Stop, let `loss` turn the disk into what survives, then start again
+    /// over it: reopen the journals under fresh writer generations and ID
+    /// namespace. The new actor has no links until `connect`.
     pub(crate) fn restart(
         self,
-        power_loss: bool,
-        clock: &Clock,
+        loss: impl FnOnce(Disk) -> (Disk, Local),
         clients: usize,
         shape: Shape,
     ) -> Result<(Self, Vec<Lane>), String> {
@@ -134,30 +246,30 @@ impl Broker {
             incarnation,
             shard,
             disk,
+            host,
             ..
         } = self;
         drop(shard);
         let incarnation = incarnation + 1;
-        let (mut disk, io) = if power_loss {
-            disk.power_loss()
-        } else {
-            disk.process_crash()
-        };
-        let (owner, startup) = disk
-            .drive(OwnedJournal::open(
-                journal_config(index, shape),
-                io,
-                generation(index, incarnation),
-            ))
-            .map_err(|error| format!("broker {index}: reopen: {error}"))?;
+        let (mut disk, io) = loss(disk);
+        let mut journals = Vec::new();
+        for group in 0..shape.partitions {
+            journals.push(
+                disk.drive(OwnedJournal::open(
+                    journal_config(index, shape, group),
+                    io.clone(),
+                    generation(index, incarnation, group),
+                ))
+                .map_err(|error| format!("broker {index}: reopen group {group}: {error}"))?,
+            );
+        }
         let sessions = [LinkSessionId::from_bytes([0; 16]); BROKERS];
         Self::serve(
             index,
             incarnation,
-            clock,
+            host,
             disk,
-            owner,
-            startup,
+            journals,
             sessions,
             clients,
             shape,
@@ -167,49 +279,108 @@ impl Broker {
     fn serve(
         index: usize,
         incarnation: u64,
-        clock: &Clock,
+        host: Host,
         disk: Disk,
-        owner: OwnedJournal,
-        startup: JournalStartup,
+        journals: Vec<(OwnedJournal, JournalStartup)>,
         sessions: [LinkSessionId; BROKERS],
         clients: usize,
         shape: Shape,
     ) -> Result<(Self, Vec<Lane>), String> {
-        let clock = clock.clone();
-        let journal = owner
-            .into_shard_journal(ShardJournalConfig::default(), move || clock.unix_millis())
-            .map_err(|error| format!("broker {index}: journal: {error}"))?;
-        // One ID namespace per actor startup.
-        let ids = ActorIds::deterministic(
-            std::num::NonZeroU64::new(incarnation * BROKERS as u64 + index as u64 + 1).unwrap(),
-            ReceiptHandles::default(),
-        );
-        let mut actor = ReplicaActor::new_with_ids(
-            journal,
-            startup,
-            actor_config(sessions, shape.segment_bytes),
-            ids,
-        )
-        .map_err(|error| format!("broker {index}: actor: {error}"))?;
-        actor.enable_recovery();
-        let mut actor = PartitionActor::Replicated(
-            ScheduledReplica::new(actor).map_err(|error| format!("broker {index}: {error}"))?,
-        );
-        actor.enable_publication();
-        let lanes = lanes(&mut actor, clients)?;
-        let shard = PartitionActors::new(vec![actor], 1, TURN_ACTORS)
+        // A broker with peers starts paused until their samples arrive.
+        let peers = (0..BROKERS).filter(|&peer| peer != index).map(node);
+        let trust = ClockTrust::guarded(peers.clone(), CLOCK_TOLERANCE);
+        let sampling = {
+            let host = host.clone();
+            ClockSampling::new(peers, trust.clone(), move || ClockNow {
+                wall_millis: host.wall_millis(),
+                monotonic: host.now(),
+            })
+        };
+        // Every actor of a broker draws receipt aliases from one source.
+        let receipts = ReceiptHandles::default();
+        let mut actors = Vec::new();
+        let mut lanes_out = Vec::new();
+        let mut services_out = Vec::new();
+        for (group, (owner, startup)) in journals.into_iter().enumerate() {
+            let journal = owner
+                .into_shard_journal(
+                    ShardJournalConfig::default(),
+                    journal_clock(&host, shape.guarded().then_some(&trust)),
+                )
+                .map_err(|error| format!("broker {index}: journal: {error}"))?;
+            // One ID namespace per actor startup.
+            let namespace = (incarnation * BROKERS as u64 + index as u64) * GROUPS.len() as u64
+                + group as u64
+                + 1;
+            let ids = ActorIds::deterministic(
+                std::num::NonZeroU64::new(namespace).unwrap(),
+                receipts.clone(),
+            );
+            let mut actor = ReplicaActor::new_with_ids(
+                journal,
+                startup,
+                actor_config(sessions, shape.segment_bytes, clients),
+                ids,
+            )
+            .map_err(|error| format!("broker {index}: actor: {error}"))?;
+            actor.enable_recovery();
+            let mut actor = PartitionActor::Replicated(
+                ScheduledReplica::new(actor).map_err(|error| format!("broker {index}: {error}"))?,
+            );
+            actor.enable_publication();
+            if group == 0 {
+                lanes_out = lanes(&mut actor, clients)?;
+            }
+            services_out.push(services(&mut actor, index, group, shape)?);
+            actors.push(actor);
+        }
+        let mut shard = PartitionActors::new(actors, GROUPS.len(), TURN_ACTORS)
             .and_then(|shard| shard.with_safety_sweep(SAFETY_SWEEP))
             .map_err(|error| format!("broker {index}: shard: {error}"))?;
+        let links = Links::simulated();
+        let grants = ReaderGrants::new([0]);
+        let mut bootstrap = Vec::new();
+        for (group, (boot, intake)) in services_out.into_iter().enumerate() {
+            shard
+                .install_native(intake, links.clone())
+                .and_then(|()| {
+                    shard.install_readers(
+                        GROUPS[group],
+                        readers(group),
+                        links.clone(),
+                        grants.shard(0),
+                    )
+                })
+                .map_err(|error| format!("broker {index}: client services: {error}"))?;
+            bootstrap.push(boot);
+        }
+        let lanes = lanes_out;
         let broker = Self {
             index,
             incarnation,
+            shape,
             shard,
             disk,
             inbox: Inbox::default(),
             woken: Arc::new(Flag::default()),
-            aliases: [None; BROKERS],
+            host,
+            sampling,
+            trust,
+            sessions,
+            stepped: None,
+            synced_clock: None,
+            swept: 0,
+            aliases: std::array::from_fn(|_| BTreeMap::new()),
             unbound: 0,
+            bootstrap,
+            links,
+            requests: VecDeque::new(),
+            replies: VecDeque::new(),
+            publications: VecDeque::new(),
+            grants,
+            client_resets: 0,
         };
+        broker.link_clients();
         Ok((broker, lanes))
     }
 
@@ -231,32 +402,61 @@ impl Broker {
         let mut input = false;
         while let Some((from, message)) = self.inbox.control.pop_front() {
             input = true;
-            if let Some(message) = self.admit(from, message) {
-                self.shard.receive(GROUP, &message, now).map_err(failure)?;
+            if let Some((message, group)) = self.admit(from, message) {
+                self.shard.receive(group, &message, now).map_err(failure)?;
             }
         }
         while let Some((_, message)) = self.inbox.data.front() {
+            let Some(group) = group_of(message) else {
+                self.inbox.data.pop_front();
+                continue;
+            };
             let code = opcode(message);
             if code == Some(Opcode::PrepareFlow as u8) || code == Some(Opcode::PreparePub as u8) {
                 // False keeps the frame at the lane head, pausing the lane.
                 let taken = self
                     .shard
-                    .receive_data(GROUP, message, now)
+                    .receive_data(group, message, now)
                     .map_err(failure)?;
                 if !taken {
                     break;
                 }
             } else {
-                self.shard.receive(GROUP, message, now).map_err(failure)?;
+                self.shard.receive(group, message, now).map_err(failure)?;
             }
             self.inbox.data.pop_front();
             input = true;
+        }
+        let ready: Vec<bool> = (0..self.bootstrap.len())
+            .map(|group| self.client_ready(group))
+            .collect();
+        while let Some((partition, message)) = self.requests.front() {
+            let group = GROUPS[*partition];
+            let received = if ready[*partition] {
+                self.shard.receive_client(group, message, now)
+            } else {
+                self.shard.defer_client(group, message, now)
+            };
+            match received.map_err(failure)? {
+                // The partition retries a busy request after its next turn.
+                NativeReceive::Busy => break,
+                NativeReceive::Accepted | NativeReceive::Ignored => {}
+            }
+            self.requests.pop_front();
+            input = true;
+        }
+        // As the broker's `sync_clock`: the guard resumed or the clock
+        // stepped forward, so every partition re-arms its timers.
+        let generation = self.trust.generation();
+        let retime = self.synced_clock.replace(generation) != Some(generation);
+        if retime {
+            self.shard.wake_all();
         }
         let due = self
             .shard
             .next_deadline()
             .is_some_and(|deadline| now >= deadline);
-        if !(input || due || self.woken.is_set()) {
+        if !(input || retime || due || self.woken.is_set()) {
             return Ok(None);
         }
         let waker = Waker::from(self.woken.clone());
@@ -265,7 +465,19 @@ impl Broker {
         let mut quiet = false;
         for _ in 0..POLL_BUDGET {
             self.woken.take();
+            self.poll_bootstrap(&mut cx)?;
+            let replies = &mut self.replies;
+            let publications = &mut self.publications;
             let progress = self.shard.poll_progress(&mut cx, now, |cx, message| {
+                if records::producer(&message).is_some() || consumer::consumer(&message).is_some() {
+                    replies.push_back(message);
+                    return Ok(());
+                }
+                // A partition's live reader topic: its group and incarnation.
+                if message.part_slice(0).is_some_and(|route| route.len() == 32) {
+                    publications.push_back(message);
+                    return Ok(());
+                }
                 network.submit(index, tick, cx, message, trace)
             });
             match progress {
@@ -293,42 +505,269 @@ impl Broker {
                 .map_err(failure)?
                 .ok_or_else(|| format!("broker {index}: unpublished recovery handoff"))?;
             actor.enable_publication();
-            replaced = Some(lanes(actor, clients)?);
+            let slot = GROUPS
+                .iter()
+                .position(|known| *known == group)
+                .ok_or_else(|| format!("broker {index}: unknown recovered group"))?;
+            let fresh = if slot == 0 {
+                Some(lanes(actor, clients)?)
+            } else {
+                None
+            };
+            let (bootstrap, intake) = services(actor, index, slot, self.shape)?;
+            self.shard
+                .install_native(intake, self.links.clone())
+                .map_err(failure)?;
+            self.shard
+                .install_readers(
+                    group,
+                    readers(slot),
+                    self.links.clone(),
+                    self.grants.shard(0),
+                )
+                .map_err(failure)?;
+            self.bootstrap[slot] = bootstrap;
+            if fresh.is_some() {
+                replaced = fresh;
+            }
         }
         Ok(replaced)
     }
 
+    /// Create each partition once this broker leads its group, until that
+    /// committed.
+    fn poll_bootstrap(&mut self, cx: &mut Context<'_>) -> Result<(), String> {
+        for group in 0..self.bootstrap.len() {
+            self.poll_bootstrap_group(group, cx)?;
+        }
+        Ok(())
+    }
+
+    fn poll_bootstrap_group(&mut self, group: usize, cx: &mut Context<'_>) -> Result<(), String> {
+        let bootstrap = &mut self.bootstrap[group];
+        if let Some(pending) = &mut bootstrap.pending {
+            let Poll::Ready(reply) = pending.as_mut().poll(cx) else {
+                return Ok(());
+            };
+            bootstrap.pending = None;
+            // A stopped actor gave way to recovery, which brings a new lane.
+            let Ok(reply) = reply else {
+                return Ok(());
+            };
+            match reply.outcome {
+                ProposalOutcome::Committed { .. } => bootstrap.done = true,
+                ProposalOutcome::NotAdmitted | ProposalOutcome::Unknown => {
+                    bootstrap.buffer = Some(reply.buffer);
+                }
+                ProposalOutcome::Invalid(error) => {
+                    return Err(format!(
+                        "broker {}: create partition {group}: {error}",
+                        self.index
+                    ));
+                }
+            }
+        }
+        if bootstrap.done
+            || !self
+                .shard
+                .status(GROUPS[group])
+                .is_some_and(|status| match status {
+                    PartitionStatus::Replicated(status) => leads(&status),
+                    PartitionStatus::Local(_) => false,
+                })
+        {
+            return Ok(());
+        }
+        let bootstrap = &mut self.bootstrap[group];
+        if let Some(buffer) = bootstrap.buffer.take() {
+            match bootstrap.submitter.try_submit(buffer) {
+                Ok(pending) => {
+                    bootstrap.pending = Some(Box::pin(pending));
+                    cx.waker().wake_by_ref();
+                }
+                Err(refused) => bootstrap.buffer = Some(refused.buffer),
+            }
+        }
+        Ok(())
+    }
+
+    /// As the broker's `client_ready`: serve a partition's clients once this
+    /// broker created it, or while another broker leads it.
+    fn client_ready(&self, group: usize) -> bool {
+        self.bootstrap[group].done
+            || self
+                .shard
+                .route_state(GROUPS[group], PARTITIONS[group])
+                .and_then(|route| route.leader)
+                .is_some_and(|leader| leader != node(self.index))
+    }
+
+    /// The session of producer `index`'s link to this broker incarnation.
+    pub(crate) fn client_session(&self, index: usize) -> LinkSessionId {
+        let mut bytes = [0xd0 + index as u8; 16];
+        bytes[1] = self.index as u8;
+        bytes[2..8].copy_from_slice(&self.client_resets.to_be_bytes()[2..]);
+        bytes[8..].copy_from_slice(&self.incarnation.to_be_bytes());
+        LinkSessionId::from_bytes(bytes)
+    }
+
+    /// The session of consumer `index`'s link to this broker incarnation.
+    pub(crate) fn consumer_session(&self, index: usize) -> LinkSessionId {
+        let mut bytes = [0xf0 + index as u8; 16];
+        bytes[1] = self.index as u8;
+        bytes[2..8].copy_from_slice(&self.client_resets.to_be_bytes()[2..]);
+        bytes[8..].copy_from_slice(&self.incarnation.to_be_bytes());
+        LinkSessionId::from_bytes(bytes)
+    }
+
+    /// Every client connection drops; clients reconnect at once under fresh
+    /// sessions. Requests on the old ones are fenced.
+    pub(crate) fn reset_clients(&mut self) {
+        self.client_resets += 1;
+        self.link_clients();
+    }
+
+    /// Publish every client's link to this broker incarnation.
+    pub(crate) fn link_clients(&self) {
+        for index in 0..records::PRODUCERS {
+            self.links.set(
+                records::client(index),
+                Some(records::link(index, self.client_session(index))),
+            );
+        }
+        for index in 0..consumer::CONSUMERS {
+            self.links.set(
+                consumer::client(index),
+                Some(consumer::link(index, self.consumer_session(index))),
+            );
+        }
+    }
+
     /// The receiving frontend's part: bind receipt aliases from full flow
-    /// states, and route compact receipts by their bound alias.
-    fn admit(&mut self, from: usize, message: Message) -> Option<Message> {
+    /// states, one per group of each sender, route compact receipts by their
+    /// bound alias, and route everything else by its packet's group.
+    fn admit(&mut self, from: usize, message: Message) -> Option<(Message, GroupId)> {
+        if opcode(&message) == Some(Opcode::ClockSample as u8) {
+            self.observe_sample(from, &message);
+            return None;
+        }
         if message.len() == 2 {
             let state = message.part_slice(1)?;
             let compact = CompactState::decode(state).ok()?;
-            if self.aliases[from].map(|(handle, _)| handle) != Some(compact.handle) {
+            let Some((&group, _)) = self.aliases[from]
+                .iter()
+                .find(|(_, (handle, _))| *handle == compact.handle)
+            else {
                 self.unbound += 1;
                 return None;
-            }
-            return Some(Message::multipart([
+            };
+            let routed = Message::multipart([
                 Bytes::copy_from_slice(node(from).as_bytes()),
-                Bytes::copy_from_slice(GROUP.as_bytes()),
+                Bytes::copy_from_slice(group.as_bytes()),
                 Bytes::copy_from_slice(state),
-            ]));
+            ]);
+            return Some((routed, group));
         }
+        let group = group_of(&message)?;
         if opcode(&message) == Some(Opcode::ReplicaState as u8) {
             let frames: [&[u8]; 3] =
                 std::array::from_fn(|index| message.part_slice(index + 1).unwrap_or_default());
             let packet = ozzy_proto::decode_packet(&frames, LIMITS).ok()?;
-            let state = flow_state_route(packet, LIMITS).ok()?;
-            // A lower alias, or the same alias on another channel, is stale.
-            if self.aliases[from].is_some_and(|(handle, channel)| {
-                handle > state.handle || (handle == state.handle && channel != state.report.channel)
-            }) {
+            let flow = flow_state_route(packet, LIMITS).ok()?;
+            let channel_group = flow.report.channel.scope.group_id;
+            let aliases = &mut self.aliases[from];
+            // An alias bound to another group, a lower alias, or the same
+            // alias on another channel is stale.
+            let taken = aliases
+                .iter()
+                .any(|(old, (handle, _))| *handle == flow.handle && *old != channel_group);
+            let superseded = aliases
+                .get(&channel_group)
+                .is_some_and(|(handle, channel)| {
+                    *handle > flow.handle
+                        || (*handle == flow.handle && *channel != flow.report.channel)
+                });
+            if taken || superseded {
                 self.unbound += 1;
                 return None;
             }
-            self.aliases[from] = Some((state.handle, state.report.channel));
+            aliases.insert(channel_group, (flow.handle, flow.report.channel));
         }
-        Some(message)
+        Some((message, group))
+    }
+
+    /// As the dispatcher's `receive_clock`: keep a peer's sample sent on its
+    /// current link session.
+    fn observe_sample(&mut self, from: usize, message: &Message) {
+        let frames: [&[u8]; 3] =
+            std::array::from_fn(|index| message.part_slice(index + 1).unwrap_or_default());
+        let Ok(packet) = ozzy_proto::decode_packet(&frames, LIMITS) else {
+            return;
+        };
+        let current = self.sessions[from];
+        if packet.envelope.sender != node(from)
+            || current == LinkSessionId::from_bytes([0; 16])
+            || packet.envelope.session != Some(current)
+        {
+            return;
+        }
+        if let Ok(wall) = samples::decode_sample(packet, LIMITS) {
+            self.sampling.observe(node(from), wall);
+        }
+    }
+
+    /// As the dispatcher's `clock_tick` at its deadline: age out samples, and
+    /// send each linked peer this host's wall time. A sample that does not
+    /// fit its lane is dropped.
+    pub(crate) fn sample(&mut self, network: &mut Network, tick: u64, trace: &mut Trace) {
+        if self.host.now() < self.sampling.deadline() {
+            return;
+        }
+        let Some(wall) = self.sampling.tick() else {
+            return;
+        };
+        for peer in (0..BROKERS).filter(|&peer| peer != self.index) {
+            let session = self.sessions[peer];
+            if session == LinkSessionId::from_bytes([0; 16]) {
+                continue;
+            }
+            let envelope = Envelope {
+                opcode: Opcode::ClockSample,
+                response: false,
+                request_id: None,
+                sender: node(self.index),
+                session: Some(session),
+            };
+            let Ok((header, wall)) = samples::encode_sample(envelope, wall, LIMITS) else {
+                continue;
+            };
+            let message = Message::multipart([
+                Bytes::copy_from_slice(node(self.index).as_bytes()),
+                Bytes::copy_from_slice(&header),
+                Bytes::copy_from_slice(&wall),
+                Bytes::new(),
+            ]);
+            network.sample(self.index, peer, tick, message, trace);
+        }
+    }
+
+    /// Step this host's wall clock to `offset` from true time.
+    pub(crate) fn step_clock(&mut self, offset: i64, tick: u64) {
+        self.host.step(offset);
+        self.stepped = Some(tick);
+    }
+
+    /// Visits only the safety sweep found work for since the last look:
+    /// those within `CLOCK_WAKE` of a clock step, then the rest, each a
+    /// missed wakeup.
+    pub(crate) fn missed_wakeups(&mut self, tick: u64) -> (u64, u64) {
+        let swept = self.shard.sweep_progress();
+        let missed = swept - std::mem::replace(&mut self.swept, swept);
+        if self.stepped.is_some_and(|at| tick <= at + CLOCK_WAKE) {
+            (missed, 0)
+        } else {
+            (0, missed)
+        }
     }
 
     /// Bind a newly established link to `peer`. Receipt aliases do not
@@ -339,15 +778,20 @@ impl Broker {
         session: LinkSessionId,
         now: Duration,
     ) -> Result<(), String> {
-        self.aliases[peer] = None;
+        self.aliases[peer].clear();
+        self.sessions[peer] = session;
+        // A new broker link sends its first sample at once.
+        self.sampling.sample_soon();
         let sessions = SessionReplacement {
             expected: LinkSessionId::from_bytes([0; 16]),
             replacement: session,
         };
-        self.shard
-            .replace_session(GROUP, node(peer), sessions, now)
-            .map(drop)
-            .map_err(|error| format!("broker {}: connect {peer}: {error}", self.index))
+        for &group in self.groups() {
+            self.shard
+                .replace_session(group, node(peer), sessions, now)
+                .map_err(|error| format!("broker {}: connect {peer}: {error}", self.index))?;
+        }
+        Ok(())
     }
 
     /// Fence the link to `peer`, which went down.
@@ -357,18 +801,35 @@ impl Broker {
         session: LinkSessionId,
         now: Duration,
     ) -> Result<(), String> {
-        self.aliases[peer] = None;
-        self.shard
-            .disconnect_session(GROUP, node(peer), session, now)
-            .map(drop)
-            .map_err(|error| format!("broker {}: disconnect {peer}: {error}", self.index))
+        self.aliases[peer].clear();
+        self.sessions[peer] = LinkSessionId::from_bytes([0; 16]);
+        for &group in self.groups() {
+            self.shard
+                .disconnect_session(group, node(peer), session, now)
+                .map_err(|error| format!("broker {}: disconnect {peer}: {error}", self.index))?;
+        }
+        Ok(())
     }
 
-    pub(crate) fn status(&self) -> ActorStatus {
-        match self.shard.status(GROUP) {
+    /// The groups this broker hosts.
+    fn groups(&self) -> &'static [GroupId] {
+        &GROUPS[..self.bootstrap.len()]
+    }
+
+    /// Group `group`'s status.
+    pub(crate) fn status(&self, group: usize) -> ActorStatus {
+        match self.shard.status(GROUPS[group]) {
             Some(PartitionStatus::Replicated(status)) => status,
             other => panic!("broker {}: unexpected status {other:?}", self.index),
         }
+    }
+
+    /// Group `group`'s partition facts, `None` while busy.
+    pub(crate) fn facts(
+        &self,
+        group: usize,
+    ) -> Option<ozzy_runtime::replica_journal::PartitionFacts> {
+        self.shard.facts(GROUPS[group], PARTITIONS[group])
     }
 
     /// Close intake and drain admitted journal work.
@@ -393,21 +854,6 @@ impl Broker {
     }
 }
 
-fn lanes(actor: &mut PartitionActor, clients: usize) -> Result<Vec<Lane>, String> {
-    (0..clients)
-        .map(|_| {
-            let submitter = actor.take_submitter().ok_or("missing proposal lane")?;
-            let buffer = actor
-                .lease_proposal_buffer_with_limits(PIPELINE)
-                .map_err(|error| format!("proposal arena: {error}"))?;
-            Ok(Lane {
-                submitter,
-                buffer: Some(buffer),
-            })
-        })
-        .collect()
-}
-
 /// Both ends of a link use one session, fresh for each `epoch` of that
 /// link. Zero means no link, as for the local slot.
 pub(crate) fn session(local: usize, peer: usize, epoch: u64) -> LinkSessionId {
@@ -420,122 +866,10 @@ pub(crate) fn session(local: usize, peer: usize, epoch: u64) -> LinkSessionId {
     LinkSessionId::from_bytes(bytes)
 }
 
-/// A writer generation no other startup in the run uses.
-fn generation(index: usize, incarnation: u64) -> JournalGeneration {
-    JournalGeneration(u128::from(incarnation) * BROKERS as u128 + index as u128 + 1)
-}
-
-/// Production timing, flow probes, and queue bounds from
-/// `ozzy-broker/src/actors.rs`, with a small pipeline.
-fn actor_config(sessions: [LinkSessionId; BROKERS], segment_bytes: u64) -> ActorConfig {
-    let message_bytes = WireLimits::for_transfer(PIPELINE.max_operations, PIPELINE.max_body_bytes)
-        .and_then(WireLimits::message_bytes)
-        .expect("replica packet bound");
-    ActorConfig {
-        retention_interval: Some(Duration::from_millis(200)),
-        sessions,
-        timing: Timing {
-            heartbeat: Duration::from_millis(100),
-            retransmit: Duration::from_millis(100),
-            primary_timeout: Duration::from_secs(1),
-            election_timeout: Duration::from_secs(2),
-            max_election_timeout: Duration::from_secs(8),
-        },
-        flow_probe: ProbeTiming {
-            initial: Duration::from_millis(10),
-            maximum: Duration::from_millis(100),
-        },
-        pipeline: PIPELINE,
-        replay_cache: PIPELINE,
-        transfer: PIPELINE,
-        sync_batch_target: SyncBatchTarget::half_window(PIPELINE),
-        evidence_quiet: Duration::from_millis(20),
-        proposal_lanes: 3,
-        proposal_capacity: PIPELINE.max_operations,
-        control: QueueLimits {
-            messages: 8,
-            bytes: 8192,
-            message_bytes: 1024,
-        },
-        data: QueueLimits {
-            messages: 4,
-            bytes: message_bytes * 4,
-            message_bytes,
-        },
-        installation: InstallationConfig {
-            segment_capacity: segment_bytes,
-            body_encoding: BodyEncoding::Raw,
-            max_staged_bytes: segment_bytes * MAX_SEGMENTS as u64,
-            max_orphan_probes: 16,
-        },
-    }
-}
-
-fn journal_config(index: usize, shape: Shape) -> OwnedConfig {
-    let configuration = ConfigurationRecord::new(
-        GROUP,
-        1,
-        std::array::from_fn(|voter| ConfiguredVoter {
-            node_id: node(voter),
-            principal: Digest::from_bytes([voter as u8 + 20; 32]),
-        }),
-    )
-    .expect("configuration");
-    OwnedConfig {
-        root: "/group".into(),
-        identity: GroupIdentity {
-            group_id: GROUP,
-            replica_node_id: node(index),
-            volume_id: VolumeId::from_bytes([9; 16]),
-            store_id: StoreId::from_bytes([index as u8 + 10; 16]),
-            store_generation: 1,
-        },
-        configuration,
-        limits: JournalLimits {
-            metadata: MetadataLimits {
-                max_manifest_bytes: 256 * 1024,
-                max_segments: shape.max_segments,
-            },
-            decode: DecodeLimits::default(),
-            operations: ozzy_journal::operation::OperationLimits::default(),
-            checkpoint: CheckpointLimits {
-                max_manifest_bytes: 64 * 1024,
-                max_chunks: 64,
-                max_chunk_bytes: 4096,
-                max_state_bytes: 256 * 1024,
-            },
-            io: SegmentOptions {
-                max_segment_bytes: shape.segment_bytes,
-                // As the broker: a quarter of the progress share, at most 64 KiB,
-                // and at most a segment.
-                chunk_bytes: (64 * 1024).min(shape.segment_bytes as usize),
-                direct: false,
-                write_mode: SegmentWriteMode::DataSync,
-            },
-            directory_entries: 128,
-            directory_name_bytes: 16384,
-        },
-        recovery: CanonicalRecoveryLimits {
-            // As the broker; a small overlay refreshes, and stops intake, often.
-            retained_identities: 4096,
-            accepted_transitions: PIPELINE.backup().max_operations,
-            ..CanonicalRecoveryLimits::default()
-        },
-        append_buffers: 12,
-        delay: None,
-        deduplication: None,
-        append_limits: PIPELINE,
-        writeback: PIPELINE,
-        // One byte ends each group after its first operation.
-        write_group_bytes: if shape.sparse { 1 } else { 8192 },
-        reads: PartitionReadLimits {
-            index: IndexBuildLimits::default(),
-            max_resident_operations: 128,
-            // Several sealed indexes, as the broker's resident share allows.
-            cached_index_bytes: 256 * 1024,
-            cached_indexes: 4,
-            concurrent_reads: 2,
-        },
-        producer_idle: None,
-    }
+/// The group a broker frame names in its packet, as the frontend routes it.
+fn group_of(message: &Message) -> Option<GroupId> {
+    let frames: [&[u8]; 3] =
+        std::array::from_fn(|index| message.part_slice(index + 1).unwrap_or_default());
+    let packet = ozzy_proto::decode_packet(&frames, LIMITS).ok()?;
+    wire::route(packet, LIMITS).ok().map(|scope| scope.group_id)
 }

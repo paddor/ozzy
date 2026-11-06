@@ -238,6 +238,104 @@ fn payload_free_results_read_by_number_across_cold_sources_and_snapshot_boundari
 }
 
 #[test]
+fn operation_runs_read_one_segment_at_once_and_match_single_reads() {
+    let (mut controller, mut journal) = empty_journal();
+    for body in [create(), open_producer(1), append(1, 0, 0)] {
+        drive(&mut controller, write(&mut journal, &body));
+    }
+    drive(&mut controller, confirm(&mut journal));
+    drive(&mut controller, journal.roll_active(32768, 4)).unwrap();
+    let outcomes = [outcome(AppendDisposition::Duplicate, 0)];
+    for sequence in 1..=5 {
+        let proofs = [RetryFingerprint::from_bytes([sequence as u8; 32])];
+        drive(
+            &mut controller,
+            write(
+                &mut journal,
+                &resolved(sequence, 1, 100 + sequence, &outcomes, &proofs),
+            ),
+        );
+    }
+    drive(&mut controller, confirm(&mut journal));
+    let snapshot = drive(
+        &mut controller,
+        journal.build_index_snapshot(
+            crate::JournalIndexBoundary::Committed,
+            resolved_recovery_limits().index,
+        ),
+    )
+    .unwrap();
+    assert_eq!(snapshot.through().op_number, 8);
+    let numbers = |run: &[crate::DecodedOperation<'_>]| {
+        run.iter()
+            .map(|operation| operation.op_number)
+            .collect::<Vec<_>>()
+    };
+    // A run stops where its segment ends.
+    let run = drive(
+        &mut controller,
+        snapshot.read_operation_run(2, 256, 1 << 20),
+    )
+    .unwrap();
+    assert_eq!(numbers(&run), [2, 3]);
+    let mut location = |number| {
+        drive(&mut controller, snapshot.find_operation_number(number))
+            .unwrap()
+            .unwrap()
+            .location
+    };
+    let (first, last) = (location(4), location(8));
+    let span = last.entry_offset + last.entry_bytes - first.entry_offset;
+    let (mut lengths, mut read_bytes) = (0, 0);
+    let run = drive_with(
+        &mut controller,
+        snapshot.read_operation_run(4, 256, 1 << 20),
+        |job| {
+            match job {
+                Operation::Metadata { .. } => lengths += 1,
+                Operation::Read { length, .. } => read_bytes += *length as u64,
+                _ => {}
+            }
+            Effect::Normal
+        },
+    )
+    .unwrap();
+    assert_eq!(numbers(&run), [4, 5, 6, 7, 8]);
+    // One length check and one read of the header and the span, not one
+    // of each per operation.
+    assert_eq!(
+        (lengths, read_bytes),
+        (1, crate::SEGMENT_HEADER_BYTES as u64 + span)
+    );
+    for operation in &run {
+        let single = drive(
+            &mut controller,
+            snapshot.read_operation_number(operation.op_number),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            (operation.digest, operation.body.as_ref()),
+            (single.digest, single.body.as_ref())
+        );
+    }
+    let run = drive(&mut controller, snapshot.read_operation_run(4, 2, 1 << 20)).unwrap();
+    assert_eq!(numbers(&run), [4, 5]);
+    // The first operation comes even past the byte bound.
+    let run = drive(&mut controller, snapshot.read_operation_run(5, 256, 1)).unwrap();
+    assert_eq!(numbers(&run), [5]);
+    for outside in [0, 9, u64::MAX] {
+        let run = drive(
+            &mut controller,
+            snapshot.read_operation_run(outside, 256, 1 << 20),
+        )
+        .unwrap();
+        assert_eq!(numbers(&run), [0_u64; 0]);
+    }
+    assert_eq!(controller.jobs().len(), 0);
+}
+
+#[test]
 fn numeric_retry_reads_refuse_modified_authoritative_operation_bytes() {
     let (mut controller, mut journal) = empty_journal();
     for body in [create(), open_producer(1), append(1, 0, 0)] {

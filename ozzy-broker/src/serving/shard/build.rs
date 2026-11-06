@@ -51,6 +51,7 @@ pub(super) async fn build(
         sessions: BTreeMap::new(),
         synced_links: None,
         unsynced: 0,
+        synced_clock: None,
         routes,
         publisher: None,
         outbound: outbound(&config),

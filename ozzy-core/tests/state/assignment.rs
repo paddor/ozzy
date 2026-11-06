@@ -197,6 +197,8 @@ fn retention_before_first_acknowledgment_preserves_the_persisted_resume_cursor()
                 partition: partition(),
                 expected_floor: Offset::ZERO,
                 new_floor: Offset::new(1),
+                expected_operation_floor: 0,
+                new_operation_floor: 0,
                 operation_id: operation(0xa2),
             }),
         )

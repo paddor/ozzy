@@ -65,6 +65,14 @@ pub(crate) struct Seeds {
     pub executor: u64,
     /// Parameters of the `swarm` profile.
     pub swarm: u64,
+    /// Record producers.
+    pub producers: u64,
+    /// Random overlapping faults.
+    pub chaos: u64,
+    /// Live copies consumers lose.
+    pub consumers: u64,
+    /// The broker that fails for good.
+    pub outsider: u64,
 }
 
 impl Seeds {
@@ -76,6 +84,10 @@ impl Seeds {
             workload: parent.next(),
             executor: parent.next(),
             swarm: parent.next(),
+            producers: parent.next(),
+            chaos: parent.next(),
+            consumers: parent.next(),
+            outsider: parent.next(),
         }
     }
 }
