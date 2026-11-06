@@ -20,6 +20,13 @@ impl ReplicaActor {
         };
         // A missing predecessor cannot be supplied by waiting on this frame.
         // Drop the gap and let the next correlated probe request the prefix.
+        // OPTIMIZE: every publication after one lost copy is dropped too, and
+        // each catch-up stops at its probe's tail, so publications that beat
+        // it need another round. At ~300 ms probe round trips (sim `heavy`)
+        // one loss chains for 1-2 s and stalls the leader's commit near the
+        // 1 s primary timeout. Hold one bounded window of later publications
+        // here so one loss needs one repair. Widening the catch-up instead
+        // made slow-link runs worse.
         if batch.predecessor().op > self.work.receive_report().received.op {
             if publication {
                 crate::profiling::event(crate::profiling::Event::ReplicaPublicationGap);
