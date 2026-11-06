@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-06
+
 ### Breaking
 
 - Journals and checkpoints from earlier builds no longer open: `Trim`
