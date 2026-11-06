@@ -392,6 +392,10 @@ fn scenario(name: &str) -> Option<Scenario> {
 fn options(profile: &str, scenario: &str, partitions: usize) -> Options {
     let scenario = self::scenario(scenario).expect("known scenario");
     let floor = match profile {
+        // A slow disk takes 8 ms per file operation and a roll about 50 of
+        // them, so a small segment, full after about ten operations, keeps
+        // its journal rolling half the time.
+        "slow" if scenario.segment_bytes < SEGMENT_BYTES => 40,
         "none" | "slow" => 100,
         "light" => 20,
         _ => 5,
