@@ -184,6 +184,8 @@ pub(crate) struct Producers {
     slack: u64,
     /// The age at which retention may retire records, if it does.
     age: Option<u64>,
+    /// A broker producers gave up on.
+    avoid: Option<usize>,
     pub counts: Counts,
 }
 
@@ -221,6 +223,7 @@ impl Producers {
             draining: false,
             slack: 0,
             age,
+            avoid: None,
             counts: Counts::default(),
         };
         for (index, producer) in producers.writers.iter_mut().enumerate() {
@@ -277,6 +280,26 @@ impl Producers {
         self.writers[producer].scheduled.get(&sequence).copied()
     }
 
+    /// Producers give up on `broker` for good, as an SDK does once its
+    /// requests time out. Requests outstanding there have unknown outcomes.
+    pub(crate) fn avoid(&mut self, broker: usize, tick: u64) {
+        self.avoid = Some(broker);
+        for producer in &mut self.writers {
+            if producer
+                .pending
+                .is_some_and(|request| request.broker == broker)
+            {
+                self.counts.timeouts += 1;
+                producer.pending = None;
+                producer.uncertain |= producer.phase == Phase::Append;
+                producer.next_at = tick;
+            }
+            if producer.target == broker {
+                producer.target = other(&mut self.rng, broker, self.avoid);
+            }
+        }
+    }
+
     /// No request is outstanding, and no batch that may be stored awaits its
     /// confirmation, unless a full journal keeps refusing it.
     pub(crate) fn idle(&self) -> bool {
@@ -317,7 +340,7 @@ impl Producers {
                 self.counts.timeouts += 1;
                 producer.pending = None;
                 producer.uncertain |= producer.phase == Phase::Append;
-                producer.target = other(&mut self.rng, request.broker);
+                producer.target = other(&mut self.rng, request.broker, self.avoid);
                 producer.next_at = tick;
             }
             let dedup = self.dedup(index);
@@ -642,9 +665,13 @@ impl Producers {
                         {
                             Some((view, primary)) if view >= producer.view => {
                                 producer.view = view;
-                                producer.target = primary;
+                                producer.target = if Some(primary) == self.avoid {
+                                    other(&mut self.rng, primary, self.avoid)
+                                } else {
+                                    primary
+                                };
                             }
-                            _ => producer.target = other(&mut self.rng, broker),
+                            _ => producer.target = other(&mut self.rng, broker, self.avoid),
                         }
                         producer.next_at = tick + REDIRECT;
                     }
@@ -659,7 +686,7 @@ impl Producers {
                     RetryClass::UnknownOutcome | RetryClass::AfterReconnect => {
                         self.counts.unknown += 1;
                         producer.uncertain |= producer.phase == Phase::Append;
-                        producer.target = other(&mut self.rng, broker);
+                        producer.target = other(&mut self.rng, broker, self.avoid);
                         producer.next_at = tick + RESEND;
                     }
                     // The session retired, or retired between a restart's
@@ -822,6 +849,12 @@ fn plan(rng: &mut Rng, producer: &mut Producer, tick: u64, scheduling: bool) {
     }
 }
 
-fn other(rng: &mut Rng, broker: usize) -> usize {
-    (broker + 1 + rng.below(BROKERS as u64 - 1) as usize) % BROKERS
+/// A random broker other than `broker` and `avoid`.
+fn other(rng: &mut Rng, broker: usize, avoid: Option<usize>) -> usize {
+    match avoid {
+        Some(avoid) if avoid != broker => (0..BROKERS)
+            .find(|index| *index != broker && *index != avoid)
+            .expect("three brokers"),
+        _ => (broker + 1 + rng.below(BROKERS as u64 - 1) as usize) % BROKERS,
+    }
 }

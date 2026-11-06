@@ -1,8 +1,8 @@
 //! Scripted faults: one at a time, each from a tick once a ready leader
-//! exists. A fault on the leader also waits until every broker is ready in
-//! its view: the others must replace it within the fault, and a timeout
-//! backed off by earlier views or a copy still catching up would stretch
-//! that past any fixed bound.
+//! exists. A fault on the leader or a slow follower link also waits until
+//! every broker is ready in its view: the others must replace the leader
+//! within the fault, or keep it, and a timeout backed off by earlier views
+//! or a copy still catching up would change views on its own.
 
 /// A scripted fault.
 #[derive(Debug, Clone, Copy)]
@@ -44,6 +44,14 @@ pub(crate) enum Fault {
     DeafLeader { at: u64, ticks: u64 },
     /// As `IsolateLeader`, but only frames from the leader stop.
     MuteLeader { at: u64, ticks: u64 },
+    /// From tick `at`, once every broker is ready in a leader's view, frames
+    /// from one of its followers, a sparse one if any, take `SLOW_LINK`
+    /// longer for `ticks`. Random partitions and clogs wait. The leader must
+    /// keep its view and commit through the other follower.
+    SlowFollowerSends { at: u64, ticks: u64 },
+    /// As `SlowFollowerSends`, but frames to the follower are slow, so it
+    /// hears the leader late.
+    SlowFollowerHears { at: u64, ticks: u64 },
     /// From tick `at`, once a ready leader exists, every write and sync on
     /// its disk fails. The broker stops on one, as a broker process exits,
     /// restarts over what its disk kept, now healthy, and rejoins `ticks`
@@ -79,6 +87,8 @@ impl Fault {
             | Self::PauseLeader { at, ticks }
             | Self::DeafLeader { at, ticks }
             | Self::MuteLeader { at, ticks }
+            | Self::SlowFollowerSends { at, ticks }
+            | Self::SlowFollowerHears { at, ticks }
             | Self::FailLeaderDisk { at, ticks }
             | Self::FailFollowerDisk { at, ticks }
             | Self::KillLeader { at, ticks }
@@ -102,6 +112,14 @@ impl Fault {
                 | Self::MuteLeader { .. }
                 | Self::FailLeaderDisk { .. }
                 | Self::KillLeader { .. }
+        )
+    }
+
+    /// A slow follower link, under which the leader must keep its view.
+    pub(super) const fn slow(self) -> bool {
+        matches!(
+            self,
+            Self::SlowFollowerSends { .. } | Self::SlowFollowerHears { .. }
         )
     }
 

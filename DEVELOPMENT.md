@@ -116,7 +116,7 @@ system tests in that slice.
 | --- | --- | --- | --- |
 | Unit and core | Codecs, state transitions, bounds, authority fences | `src/` and `tests/` of `ozzy-proto`, `ozzy-core`, `ozzy-journal`, `ozzy-journal-segment`, `ozzy-replication`, `ozzy-config` | `default` |
 | Core simulation | Replayable protocol fault schedules with gated time, messages, and file jobs | `ozzy-sim/tests/` | `default`; `stress` in `extended` |
-| Seeded actor cluster | Production partition shards of three brokers, each with two partitions on one device, on one thread from one seed: link, disk, client, and clock faults, scripted leader loss, power loss and restart, per-tick history checks, record, release, dedup, idle expiry, and read checks, convergence, missed wakeups | `ozzy-sim/tests/actor_cluster/` | `default`; seed campaign in `extended` |
+| Seeded actor cluster | Production partition shards of three brokers, each with two partitions on one device, on one thread from one seed: link, disk, client, and clock faults, scripted leader loss, slow links, a permanent outsider, power loss and restart, per-tick history checks, record, release, dedup, idle expiry, and read checks, convergence, missed wakeups | `ozzy-sim/tests/actor_cluster/` | `default`; seed campaign in `extended` |
 | Inproc integration | Real SDKs and brokers over OMQ inproc and memory file jobs; owner lifecycle | `ozzy-broker/tests/journals/serving/`, `ozzy-sim/tests/broker/` | `default`; `stress` in `extended` |
 | Full-product simulator | Sustained workload and fault churn over real owners, SDKs, and brokers | `ozzy-sim` `ozzy_sim` binary | Short gate in `default`; long runs manual |
 | Backend conformance | The same owned file operations on the pool and AIO backends | `ozzy-io-pool/tests/`, `ozzy-io-aio/tests/` | `default` |
@@ -255,18 +255,32 @@ with the queued writes in flight; `disk-stall`, where the leader's disk
 completes nothing for 15 s while its links stay up, and another broker must
 take over; `pause`, where the leader's process runs nothing for 15 s, then
 resumes into a newer view; `one-way`, where the leader first hears
-nothing, then a later leader can send nothing; `skew`, where the leader's
-clock runs 5 s ahead for 15 s; and `chaos`, where random overlapping faults
+nothing, then a later leader can send nothing; `slow-link`, where a
+follower's frames, then the frames it receives, take 3 s longer for 10 s,
+past the election timeout, and the leader must keep its view and commit
+through the other follower; `skew`, where the leader's clock runs 5 s ahead
+for 15 s; and `chaos`, where random overlapping faults
 hit any broker: power loss, kills, pauses, disk stalls and failures, cuts
 in either direction, broker or client connection resets that drop queued
 frames, and clock steps on one host at a time, within the 1000 ms tolerance
 or far past it. Up to two brokers are down at once, so only
-safety holds until the drain ends every fault. A power loss puts some queued
-writes in the cache unreported, even `O_DSYNC` ones, then lets a seeded share
-of cached 512-byte sectors reach media, so unsynced writes tear and land out
-of order. The power-loss fast test also bounds the outage, which grows when a
-restart refetches or replays all history. The three sparse or full scenarios
-skip `heavy` and `swarm`, which make too little progress to fill a journal.
+safety holds until the drain ends every fault. `outsider` and
+`chaos-outsider` follow profile or random overlapping faults with
+[TigerBeetle's liveness mode](https://tigerbeetle.com/blog/2023-07-06-simulation-testing-for-liveness/):
+30 s before the drain every fault ends, but one broker stays down, paused,
+stalled, deaf, or mute for good. Clients give up on it once it stops
+answering, and the other two must keep confirming proposals and records and
+converge without it. A broker that dies loses frames sent to it, but frames
+it already sent still arrive, after its peers saw the links drop. A power
+loss puts some queued writes in the cache unreported, even `O_DSYNC` ones,
+then lets a seeded share of cached 512-byte sectors reach media, so unsynced
+writes tear and land out of order. The power-loss fast test also bounds the
+outage, which grows when a restart refetches or replays all history. The
+three sparse or full scenarios skip `heavy` and `swarm`, which make too
+little progress to fill a journal.
+`slow-link` skips them too: their PUB loss stalls commits now and then, and
+the slow follower's standing suspicion turns such a stall into a view
+change.
 
 Each broker's dispatcher runs the production clock guard, sampling its
 host's wall clock against its peers over the modeled control links at the

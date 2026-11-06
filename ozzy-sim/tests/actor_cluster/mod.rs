@@ -34,9 +34,10 @@ use sim::{
     Fault::{
         self, CrashAll, CrashAllMidWrite, CrashFollower, CrashLeader, DeafLeader, FailFollowerDisk,
         FailLeaderDisk, IsolateFollower, IsolateLeader, KillFollower, KillLeader, MuteLeader,
-        PauseLeader, Recrash, Rewind, SkewLeader, StallLeader,
+        PauseLeader, Recrash, Rewind, SkewLeader, SlowFollowerHears, SlowFollowerSends,
+        StallLeader,
     },
-    Options, Report,
+    OUTSIDER_TICKS, Options, Report, Stuck,
 };
 
 /// One scenario: ticks of proposals, scripted faults, and journal shape.
@@ -59,6 +60,8 @@ struct Scenario {
     control: Control,
     /// Both partitions retire records after `RETENTION_AGE`.
     retention: bool,
+    /// One broker fails for good this many ticks before the drain.
+    outsider: Option<u64>,
     /// Caps the profile's floors for confirmed proposals, records, and
     /// compared ops, where a full journal bounds them.
     max_floor: usize,
@@ -80,6 +83,7 @@ const RANDOM: Scenario = Scenario {
     chaos: false,
     control: Control::None,
     retention: false,
+    outsider: None,
     max_floor: usize::MAX,
     max_record_floor: usize::MAX,
     min_applied: 0,
@@ -367,6 +371,40 @@ fn scenario(name: &str) -> Option<Scenario> {
             }],
             ..RANDOM
         },
+        // A follower's frames take 3 s longer for 10 s, then a follower hears
+        // everything 3 s late for 10 s, past the 2 s election timeout. The
+        // leader keeps its view and commits through the other follower.
+        "slow-link" => Scenario {
+            ticks: 3000,
+            script: &[
+                SlowFollowerSends {
+                    at: 500,
+                    ticks: 1000,
+                },
+                SlowFollowerHears {
+                    at: 1800,
+                    ticks: 1000,
+                },
+            ],
+            ..RANDOM
+        },
+        // Profile faults for 5 s, then one broker stays down, paused,
+        // stalled, deaf, or mute for good while the rest of the network
+        // heals. The other two must keep confirming for 30 s and converge
+        // without it.
+        "outsider" => Scenario {
+            ticks: 3500,
+            outsider: Some(OUTSIDER_TICKS),
+            ..RANDOM
+        },
+        // As `outsider`, after 20 s of random overlapping faults.
+        "chaos-outsider" => Scenario {
+            ticks: 5000,
+            chaos: true,
+            outsider: Some(OUTSIDER_TICKS),
+            max_floor: 20,
+            ..RANDOM
+        },
         // The leader first hears nothing, then a later leader can send
         // nothing. Each must be replaced while its other direction works.
         "one-way" => Scenario {
@@ -421,6 +459,7 @@ fn options(profile: &str, scenario: &str, partitions: usize) -> Options {
         min_applied: scenario.min_applied,
         min_refused: scenario.min_refused,
         script: scenario.script,
+        outsider: scenario.outsider,
     }
 }
 
@@ -594,10 +633,12 @@ fn lagging_sparse_follower_installs_a_long_suffix_at_the_limit() {
 }
 
 /// A follower, then the leader, lose power and restart over their durable
-/// disks. Each rejoins without losing a confirmed operation.
+/// disks. Each rejoins without losing a confirmed operation, and frames it
+/// sent before it died still arrive.
 #[test]
 fn crashed_brokers_restart_and_rejoin() {
-    one_partition(1, "none", "crash");
+    let report = one_partition(1, "none", "crash");
+    assert!(report.after_crash >= 1, "{report:?}");
 }
 
 /// A broker whose disk fails writes and syncs stops, restarts over what its
@@ -611,7 +652,8 @@ fn failed_disk_stops_and_restarts_its_broker() {
 /// disks. Each rejoins without losing a confirmed operation.
 #[test]
 fn killed_brokers_restart_and_rejoin() {
-    one_partition(1, "none", "kill");
+    let report = one_partition(1, "none", "kill");
+    assert!(report.after_crash >= 1, "{report:?}");
 }
 
 /// All three brokers lose power at once and elect again over their durable
@@ -661,6 +703,36 @@ fn paused_leader_is_replaced_and_resumes_as_follower() {
 #[test]
 fn one_way_cut_leaders_are_replaced() {
     one_partition(1, "none", "one-way");
+}
+
+/// A follower whose frames arrive 3 s late, then one that hears 3 s late,
+/// leaves the leader in its view, committing through the other follower.
+#[test]
+fn slow_follower_links_keep_the_leader() {
+    for seed in [1, 2] {
+        one_partition(seed, "light", "slow-link");
+    }
+}
+
+/// One broker stops for good, down or paused, as leader or follower. The
+/// other two keep confirming proposals and records and converge without it.
+#[test]
+fn a_core_of_two_keeps_committing_without_a_stopped_outsider() {
+    // The seed picks the kind in turn.
+    for (seed, kind) in [(5, Stuck::Down), (1, Stuck::Pause)] {
+        let report = one_partition(seed, "light", "outsider");
+        assert_eq!(report.outsider.map(|(_, stuck)| stuck), Some(kind));
+    }
+}
+
+/// As `a_core_of_two_keeps_committing_without_a_stopped_outsider`, with an
+/// outsider that still runs: its disk stalls, or it hears or sends nothing.
+#[test]
+fn a_core_of_two_keeps_committing_without_a_stuck_outsider() {
+    for (seed, kind) in [(2, Stuck::Stall), (3, Stuck::Deaf), (4, Stuck::Mute)] {
+        let report = one_partition(seed, "light", "outsider");
+        assert_eq!(report.outsider.map(|(_, stuck)| stuck), Some(kind));
+    }
 }
 
 /// A leader whose clock runs 5 s ahead releases nothing early, and releases
@@ -804,8 +876,10 @@ mod seeded {
 
         const PROFILES: [&str; 5] = ["none", "light", "heavy", "swarm", "slow"];
         /// Each scenario with its profiles. Heavy and swarm faults leave too
-        /// little progress to fill a journal, or to retire a segment.
-        const SCENARIOS: [(&str, &[&str]); 18] = [
+        /// little progress to fill a journal, or to retire a segment. Their
+        /// PUB loss also stalls commits now and then, which a slow link's
+        /// standing suspicion turns into a view change.
+        const SCENARIOS: [(&str, &[&str]); 21] = [
             ("random", &PROFILES),
             ("failover", &PROFILES),
             ("slow-follower", &PROFILES),
@@ -821,6 +895,9 @@ mod seeded {
             ("disk-stall", &PROFILES),
             ("pause", &PROFILES),
             ("one-way", &PROFILES),
+            ("slow-link", &["none", "light", "slow"]),
+            ("outsider", &PROFILES),
+            ("chaos-outsider", &PROFILES),
             ("chaos", &PROFILES),
             ("skew", &PROFILES),
             ("retention", &["none", "light", "slow"]),

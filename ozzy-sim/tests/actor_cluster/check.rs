@@ -137,9 +137,18 @@ pub(crate) fn settled(brokers: &[Broker], group: usize, view: u64) -> bool {
 }
 
 /// `group`'s common applied prefix once one ready leader leads the newest
-/// view and every broker is ready in that view with the same applied prefix.
-pub(crate) fn converged(brokers: &[Broker], group: usize) -> Option<Prefix> {
-    let statuses: Vec<_> = brokers.iter().map(|broker| broker.status(group)).collect();
+/// view and every broker but `outsider` is ready in that view with the same
+/// applied prefix.
+pub(crate) fn converged(
+    brokers: &[Broker],
+    group: usize,
+    outsider: Option<usize>,
+) -> Option<Prefix> {
+    let statuses: Vec<_> = brokers
+        .iter()
+        .filter(|broker| Some(broker.index) != outsider)
+        .map(|broker| broker.status(group))
+        .collect();
     let leader = statuses
         .iter()
         .filter(|status| leads(status))
