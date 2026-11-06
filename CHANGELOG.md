@@ -34,6 +34,8 @@
   the retry as new, and the follower refused it as a duplicate. Every copy
   now forgets an operation ID at the same operation, the operation floor a
   `Trim` raises, and no copy retires history past it.
+- A disk-quorum partition no longer leaves work it deferred during a
+  segment roll waiting for the 100 ms safety sweep when the roll ends.
 
 ## [0.10.0] - 2026-11-05
 

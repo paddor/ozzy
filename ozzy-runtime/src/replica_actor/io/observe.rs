@@ -87,6 +87,12 @@ impl ReplicaActor {
             }
             changed = self.journal.availability_changed(available) => {
                 changed?;
+                // `schedule` defers work while no slot is free, such as
+                // during a roll. One that frees inside this wait wakes
+                // nobody, so let a scheduler schedule again.
+                if wait_for_work && !available {
+                    return Ok(false);
+                }
                 continue;
             }
             () = std::future::ready(()), if wait_for_work && self.more_work => return Ok(false),

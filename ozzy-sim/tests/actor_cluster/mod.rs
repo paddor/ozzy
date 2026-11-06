@@ -776,6 +776,10 @@ fn regression_seeds() {
     // A leader retired the segment of a barrier, then took its resend as
     // new. A follower that retired later still held the claim and faulted.
     checked(7, "heavy", "retention");
+    // A catching-up follower scheduled while its journal rolled a segment,
+    // so no command slot was free. The roll ended inside its journal wait,
+    // which woke nobody: the safety sweep started the deferred work.
+    checked(2, "heavy", "retention");
 }
 
 /// Process-wide state would leak from one run into the next one.
