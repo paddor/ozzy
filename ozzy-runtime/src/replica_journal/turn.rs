@@ -69,9 +69,10 @@ pub enum ReceivedValidation {
         /// Unadmitted canonical bytes, still within the original receive window.
         buffer: AppendBuffer,
     },
-    /// Identity capacity is full with nothing left to apply. No operations
-    /// were admitted. The first one fits alone; later ones may reuse capacity
-    /// its commit frees, so they validate after it applies.
+    /// Identity capacity is full with nothing left to apply, or an ID reuses
+    /// one whose original is in the same suffix. No operations were
+    /// admitted. The first one validates alone; later ones may need capacity
+    /// or a commit after it, so they validate once it is admitted.
     Split {
         /// Authority that owned the staged suffix before preparation stopped.
         validation: ValidationTicket,
