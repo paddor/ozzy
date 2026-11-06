@@ -47,6 +47,11 @@
   writes until the job finished, which on a slow disk stalled the partition
   for most of a second after each retirement. Only installation and history
   pins still wait for the job.
+- A disk-quorum follower that falls behind the leader's commit, as behind a
+  slow uplink, no longer suspects a leader it still hears. COMMIT messages
+  past the operations it held did not count as contact, so after a second
+  it asked to leave the view, and any short stall of the leader then
+  replaced a healthy leader.
 
 ## [0.10.0] - 2026-11-05
 

@@ -876,9 +876,11 @@ mod seeded {
 
         const PROFILES: [&str; 5] = ["none", "light", "heavy", "swarm", "slow"];
         /// Each scenario with its profiles. Heavy and swarm faults leave too
-        /// little progress to fill a journal, or to retire a segment. Their
-        /// PUB loss also stalls commits now and then, which a slow link's
-        /// standing suspicion turns into a view change.
+        /// little progress to fill a journal, or to retire a segment. Under a
+        /// slow link they also change views for real: a follower that hears
+        /// late gets too few COMMITs through its full 3 s path and suspects
+        /// the leader, and their PUB loss can stall the leader's commit for
+        /// 1 s while a gap repairs. Two suspicions end the view.
         const SCENARIOS: [(&str, &[&str]); 21] = [
             ("random", &PROFILES),
             ("failover", &PROFILES),

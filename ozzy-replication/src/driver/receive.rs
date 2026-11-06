@@ -106,9 +106,18 @@ impl ReplicaDriver {
             return Ok(());
         };
         let committed = normal.snapshot().committed;
+        let mut behind = false;
         match message {
             Control::Commit(commit) => {
-                normal.receive_commit(from, commit)?;
+                match normal.receive_commit(from, commit) {
+                    Ok(()) => {}
+                    // A backup behind the commit cannot check it yet, and the
+                    // caller retries it after catch-up. Its primary still
+                    // spoke, so a backup kept behind by a slow uplink does
+                    // not suspect a primary it hears.
+                    Err(ReplicationError::HistoryGap) => behind = true,
+                    Err(error) => return Err(error.into()),
+                }
                 self.contact_deadline = now.saturating_add(self.timing.primary_timeout);
             }
             Control::PrepareOk { ack, .. } => normal.receive_ack(from, ack)?,
@@ -129,6 +138,9 @@ impl ReplicaDriver {
         }
         if normal.snapshot().committed != committed {
             self.progress_deadline = now.saturating_add(self.progress_timeout());
+        }
+        if behind {
+            return Err(ReplicationError::HistoryGap.into());
         }
         Ok(())
     }

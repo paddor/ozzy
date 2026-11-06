@@ -278,9 +278,10 @@ writes tear and land out of order. The power-loss fast test also bounds the
 outage, which grows when a restart refetches or replays all history. The
 three sparse or full scenarios skip `heavy` and `swarm`, which make too
 little progress to fill a journal.
-`slow-link` skips them too: their PUB loss stalls commits now and then, and
-the slow follower's standing suspicion turns such a stall into a view
-change.
+`slow-link` skips them too. There a follower that hears late gets too few
+COMMITs through its full 3 s path and suspects the leader, and PUB loss can
+stall the leader's commit for 1 s while a gap repairs. Two suspicions end
+the view.
 
 Each broker's dispatcher runs the production clock guard, sampling its
 host's wall clock against its peers over the modeled control links at the

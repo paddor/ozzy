@@ -376,6 +376,44 @@ fn idle_heartbeats_do_not_hide_stalled_outstanding_operations() {
     assert_eq!(backup.scope().view, 1);
 }
 
+/// A backup behind its primary's commit cannot check the COMMIT yet, but it
+/// still hears its primary. One kept behind by a slow uplink suspected a
+/// primary it heard every heartbeat.
+#[test]
+fn a_backup_behind_the_commit_still_hears_its_primary() {
+    let operation = operation();
+    let mut primary = normal(0);
+    let mut other = normal(2);
+    for replica in [&mut primary, &mut other] {
+        let Admission::Write { ticket, .. } = replica
+            .prepare(node(0), configuration().scope(), &[operation])
+            .unwrap()
+        else {
+            panic!("new operation");
+        };
+        replica.complete_durable_write(ticket).unwrap();
+    }
+    primary
+        .receive_ack(node(2), other.acknowledgment().unwrap())
+        .unwrap();
+    assert_eq!(primary.snapshot().committed, operation.prefix());
+    let mut primary = driver(primary);
+    let mut behind = driver(normal(1));
+    let now = Duration::from_millis(10);
+    let Some(Action::Broadcast(heartbeat @ Control::Commit(_))) = primary.poll(now).unwrap() else {
+        panic!("primary heartbeat");
+    };
+    for millis in [10, 60, 110, 160, 210] {
+        let now = Duration::from_millis(millis);
+        assert_eq!(
+            behind.receive(node(0), heartbeat, now),
+            Err(DriverError::Replication(ReplicationError::HistoryGap))
+        );
+        assert_eq!(behind.poll(now).unwrap(), None);
+    }
+    assert!(behind.normal().is_some());
+}
+
 /// A voter whose promise is not durable yet has no evidence about the view,
 /// so its election deadline passes without an exit vote. With stalled
 /// storage that vote ended views the others were installing.

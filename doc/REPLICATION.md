@@ -100,7 +100,8 @@ sequenceDiagram
 ## Leader change
 
 A broker suspects the leader when contact, commit progress, or storage
-progress times out. Storage stalls when an admitted write stays undurable,
+progress times out. Any current-view COMMIT from the leader is contact,
+even one past the operations this copy holds. Storage stalls when an admitted write stays undurable,
 or when a journal command, such as a sync or maintenance step, is pending
 and the shard's storage lane completes no job for the primary timeout; such
 a command can hold new writes back. A long command whose jobs complete is
