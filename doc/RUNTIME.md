@@ -227,6 +227,9 @@ Scalar failures use caller-owned output storage, including on virtual threads.
   keeps it.
 - `TopicReaderConfig::refresh` sets how long a quiet partition waits before
   it checks for a lost final record.
+- Closing a known subscription waits for earlier replay cancellation, then
+  requests full release even if the earlier request failed. Close fails if
+  the full release cannot be confirmed.
 - Reader ACK observes delivery, not application processing. Save a
   checkpoint only after processing.
 

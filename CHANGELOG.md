@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Consumer close now releases its subscription after an earlier replay
+  cancellation timed out. The old timeout could abort close before the full
+  unsubscribe was attempted, even after the broker was reachable again.
+
 ## [0.11.0] - 2026-11-06
 
 ### Breaking

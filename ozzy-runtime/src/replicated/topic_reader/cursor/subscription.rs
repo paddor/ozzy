@@ -104,12 +104,15 @@ impl Cursor {
         }
         let links = links.clone();
         Some(Box::pin(async move {
-            if let Some(canceling) = canceling {
-                canceling.await?;
-            }
-            let Some((broker, session, selected)) = selected else {
-                return Ok(());
+            let replay = match canceling {
+                Some(canceling) => canceling.await,
+                None => Ok(()),
             };
+            let Some((broker, session, selected)) = selected else {
+                return replay;
+            };
+            // Full release also cancels replay. Order it after the earlier
+            // request, including a timeout, and observe its own cleanup result.
             let unsubscribe = reader::Unsubscribe {
                 selected,
                 cancel: reader::Cancel::Subscription,
