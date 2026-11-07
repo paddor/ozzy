@@ -202,6 +202,123 @@ A change keeps or adds cases for each area it touches:
 - **Retention:** confirmed retry and record floors; repeated retirement;
   checkpoints; cold replay; ancient replicas.
 
+## Jepsen
+
+`jepsen/` tests the production DQ broker through the packaged Java SDK. It
+uses Jepsen 0.3.14 Kafka/Elle analysis plus an independent record checker.
+The lab has a controller and three broker VMs, separate management/test
+networks, and disposable ext4 volumes. It requires Linux x86_64, KVM,
+membership in the `kvm` and `libvirt` groups, `virt-install`,
+`qemu-img`, `cloud-localds`, curl, jq, SSH, JDK 22+, Maven, and Leiningen.
+Debian 13 host setup:
+
+```sh
+sudo apt-get install qemu-system-x86 qemu-utils libvirt-daemon-system \
+  libvirt-clients virt-install cloud-image-utils curl jq openssh-client \
+  openjdk-25-jdk-headless maven leiningen
+sudo usermod -aG kvm,libvirt "$USER"
+sudo systemctl enable --now libvirtd.socket
+sudo loginctl enable-linger "$USER"
+```
+
+VM defaults require 20 GiB available RAM and 256 GiB free artifact space.
+The controller gets 4 GiB with a 2 GiB Java heap; each broker gets 2 GiB.
+Jepsen history scratch files use the controller's results disk through
+`OZZY_JEPSEN_TMPDIR`; Debian's RAM-backed `/tmp` can exhaust a small guest
+while saving a pressure history. Local runs default Java scratch files to
+`OZZY_ARTIFACT_ROOT`.
+The controller's sparse results disk is 256 GiB; each broker's data disk is
+64 GiB. Keep room for binary histories and both text exports across the matrix.
+Each QEMU process has a hard limit of guest RAM plus 1 GiB.
+Preflight reserves another 6 GiB for the host. Guests boot and finish package
+installation one at a time. These limits protect the host; a VM hitting its
+limit fails the run. Startup verifies the actual cgroup limit and zero swapped
+bytes. A host memory watcher stops this lab's owned VMs if available host RAM
+falls below 6 GiB or machine-slice host swap usage becomes nonzero. The watcher
+runs as a systemd user service, independently of the SSH or terminal session;
+preflight requires a running systemd user manager.
+Start a fresh login after changing groups. The runner uses `qemu:///system`
+and shares caller-owned images with QEMU through its service group.
+Guests require KVM explicitly. They have a virtual VGA device for the Debian
+cloud image's BIOS boot and expose no graphical listener.
+If QEMU or unrelated host processes stay in `D` state at
+`kvm_async_pf_task_wait_schedule`, collect the outer kernel's task stacks.
+That is a KVM asynchronous page-fault stall, which can occur with normal guest
+memory counters. Booting the outer VM with
+[`no-kvmapf`](https://docs.kernel.org/admin-guide/kernel-parameters.html)
+disables this paravirtualized path. It requires an outer VM reboot; changing a
+broker guest's command line does not configure its host.
+Set `OZZY_JEPSEN_LAB` to a disk-backed filesystem with enough space; the
+default artifact root may be tmpfs. Provisioning fetches the Debian 13 cloud
+image, verifies its published SHA-512, and retains it;
+set `OZZY_JEPSEN_IMAGE_URL` to an immutable image URL for repeat campaigns.
+
+```sh
+scripts/ozzy-jepsen build
+scripts/ozzy-jepsen local-test
+scripts/ozzy-jepsen adapter-test       # physical I/O, TCP, three child brokers
+scripts/ozzy-jepsen preflight
+scripts/ozzy-jepsen up
+scripts/ozzy-jepsen test --backend aio --fault network --time-limit 600
+scripts/ozzy-jepsen witness
+scripts/ozzy-jepsen qualify
+scripts/ozzy-jepsen campaign
+scripts/ozzy-jepsen collect
+scripts/ozzy-jepsen down
+```
+
+`--fault` selects `none`, `process`, `network`, `clock`, `storage`,
+`recovery`, `combined`, or `power`. `--inflight 16 --rate 500 --slow-readers`
+adds bounded pressure. Every run provisions fresh stores; restarts preserve
+them. Before creating a cluster, broker clocks are aligned to the controller.
+Clock faults and healing preserve fractional seconds so repeated cuts do not
+accumulate rounding drift. Witnesses test each serving pair, overlapping-pair failover, minority
+and lone-copy confirmation, nonvoting recovery, and producer resume/takeover.
+Recovery faults block a donor, verify the nonvoting marker and the live actor's
+admin row after all shards load, then kill, resume, or pause that recovering
+copy before healing the cut.
+Process kill faults send SIGKILL immediately. Restart and cache loss wait for
+the entire old process to exit; a zombie leader alone does not release its
+worker threads' journal locks. Combined storage stalls are healed before that
+restart wait.
+Final scans must reach per-partition markers before and after a full restart.
+Each final scan emits bounded poll results into the history as it progresses.
+The harness writes history chunks of 256 operations; the upstream 16K default
+can retain gigabytes of multipart reads in one decoded chunk. The record
+checker traverses evidence without caching the expanded history or final scans.
+Writer generators retain their position instead of caching emitted payloads.
+Kafka/Elle receives operation intervals, IDs, and offsets; the record oracle
+checks every payload and part boundary.
+`--recovery-timeout` sets each final confirmation/scan deadline (300 seconds).
+Each SSH node command has a separate 360-second controller deadline; a stalled
+guest fails the run instead of holding its control channel indefinitely.
+SDK cleanup attempts every handle even when one close fails. A failed drain
+remains an availability failure, and teardown still permits history analysis.
+Unknown write outcomes remain possible records. Separate reader sessions
+may intentionally replay them.
+
+Power tests require `--backend pool --lazyfs`. Qualification uses actual pool
+operations and checks loss of unsynced overwrites and preservation of
+`O_DSYNC`, data/file syncs, preallocation, and a synchronized rename. A failed
+qualification blocks power tests without weakening broker I/O. The pinned
+LazyFS 0.3.0 rejects the pool's required `fallocate` operation; its qualification
+currently fails before broker startup. LazyFS 0.3.1 also lacks an allocation
+handler. Power tests require an injector that passes the complete qualifier.
+LazyFS models file cache loss; it does not establish namespace rollback,
+AIO power-loss, or hardware behavior. Process kills retain the OS page cache. A passing run
+is bounded evidence, not an independent Jepsen audit or an exactly-once claim.
+
+VMs, build products, histories, source archives, and logs use
+`OZZY_ARTIFACT_ROOT/ozzy-jepsen/`; command results append to
+`~/.cache/ozzy/jepsen.jsonl`. `OZZY_JEPSEN_LAB` selects the lab directory.
+Collection preserves logs and VM definitions; `down` retains disk images.
+Use a fresh lab directory after `down`. On the controller, `check` invokes
+Jepsen's offline `analyze` command and returns nonzero unless the history passes.
+`check --test DIR` takes the controller-side
+run directory containing `test.jepsen`. Keep failures and reduce them into the
+controlled Rust harness before changing replication. Jepsen is outside the
+default Nextest suite; no charts are rendered by the checker.
+
 ## Verification
 
 ```sh

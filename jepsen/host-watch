@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -euo pipefail
+lab=${1:?}
+uri=${2:?}
+reserve_kib=${3:?}
+test -f "$lab/owned"
+[[ $reserve_kib =~ ^[0-9]+$ ]]
+exec 9>"$lab/host-watch.lock"
+flock -n 9 || exit 0
+mkdir -p "$HOME/.cache/ozzy"
+
+while [[ ! -f $lab/stopped ]]; do
+    running=$(virsh -c "$uri" list --name)
+    [[ $running == *ozzy-jepsen-* ]] || exit 0
+    available_kib=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
+    machine_bytes=$(cat /sys/fs/cgroup/machine.slice/memory.current)
+    machine_swap_bytes=$(cat /sys/fs/cgroup/machine.slice/memory.swap.current)
+    jq -cn --arg time "$(date --iso-8601=seconds)" \
+        --argjson available_kib "$available_kib" --argjson machine_bytes "$machine_bytes" \
+        --argjson machine_swap_bytes "$machine_swap_bytes" \
+        --arg lab "$lab" \
+        '{time:$time,kind:"jepsen-host-memory",available_kib:$available_kib,machine_bytes:$machine_bytes,machine_swap_bytes:$machine_swap_bytes,lab:$lab}' \
+        >> "$HOME/.cache/ozzy/jepsen.jsonl"
+    if (( available_kib < reserve_kib || machine_swap_bytes > 0 )); then
+        echo "Host memory guard: $available_kib KiB available, $machine_swap_bytes VM swap bytes; stopping owned lab VMs." >&2
+        for role in controller n0 n1 n2; do
+            name="ozzy-jepsen-$role"
+            file="$lab/$role.uuid"
+            if test -r "$file"; then
+                expected=$(cat "$file")
+                actual=$(virsh -c "$uri" domuuid "$name" 2>/dev/null) || continue
+                if [[ $actual == "$expected" ]]; then
+                    timeout 10 virsh -c "$uri" destroy "$name" || true
+                fi
+            fi
+        done
+        exit 1
+    fi
+    sleep 2
+done

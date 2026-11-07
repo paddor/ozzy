@@ -1,0 +1,345 @@
+#!/usr/bin/env bash
+set -euo pipefail
+repo=${OZZY_JEPSEN_ROOT:?}
+lab=${OZZY_JEPSEN_LAB:?}
+bundle="$OZZY_ARTIFACT_ROOT/ozzy-jepsen/bundle"
+prefix=ozzy-jepsen
+uri=${OZZY_JEPSEN_LIBVIRT_URI:-qemu:///system}
+management=192.168.152
+traffic=192.168.153
+controller_mib=4096
+broker_mib=2048
+qemu_overhead_mib=1024
+host_reserve_mib=6144
+lab_budget_mib=$((controller_mib+3*broker_mib+4*qemu_overhead_mib))
+mkdir -p "$lab" "$HOME/.cache/ozzy"
+virsh_lab() { virsh -c "$uri" "$@"; }
+ssh_lab() {
+    ssh -i "$lab/key" -o BatchMode=yes -o StrictHostKeyChecking=yes \
+        -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 \
+        -o UserKnownHostsFile="$lab/known_hosts" "root@$management.$1" "${@:2}"
+}
+copy_lab() {
+    scp -q -i "$lab/key" -o BatchMode=yes -o StrictHostKeyChecking=yes \
+        -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 \
+        -o UserKnownHostsFile="$lab/known_hosts" "$@"
+}
+
+preflight() {
+    local failed=0
+    for tool in virsh virt-install qemu-system-x86_64 qemu-img cloud-localds curl jq ssh scp sha512sum \
+        flock systemctl systemd-run systemd-escape timeout; do
+        if ! command -v "$tool" >/dev/null; then echo "Missing tool: $tool" >&2; failed=1; fi
+    done
+    if ! test -r /dev/kvm || ! test -w /dev/kvm; then
+        echo 'KVM access requires membership in kvm; start a fresh login after adding it.' >&2
+        failed=1
+    fi
+    if command -v virsh >/dev/null && ! virsh_lab capabilities >/dev/null; then failed=1; fi
+    if ! systemctl --user show-environment >/dev/null; then
+        echo 'Lab requires a running systemd user manager for its memory guard.' >&2; failed=1
+    fi
+    if [[ $(getconf LONG_BIT) != 64 || $(uname -m) != x86_64 ]]; then
+        echo 'This lab template requires Linux x86_64.' >&2; failed=1
+    fi
+    if [[ ! -r /sys/fs/cgroup/cgroup.controllers ]] ||
+       [[ " $(</sys/fs/cgroup/cgroup.controllers) " != *" memory "* ]]; then
+        echo 'Lab requires cgroup v2 memory accounting for VM hard limits.' >&2; failed=1
+    fi
+    local available_kib free_kib required_kib
+    available_kib=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
+    free_kib=$(df -Pk "$lab" | awk 'NR == 2 {print $4}')
+    required_kib=$(((lab_budget_mib+host_reserve_mib)*1024))
+    if (( available_kib < required_kib || free_kib < 256*1024*1024 )); then
+        echo 'Lab requires 20 GiB available RAM and 256 GiB free artifact space.' >&2; failed=1
+    fi
+    echo "VM artifacts: $lab"
+    return "$failed"
+}
+
+network() {
+    local name=$1 subnet=$2 forward=$3
+    cat > "$lab/$name.xml" <<EOF
+<network><name>$prefix-$name</name>$forward
+<bridge name="ozzy-$name"/><ip address="$subnet.1" netmask="255.255.255.0"/>
+</network>
+EOF
+    virsh_lab net-define "$lab/$name.xml"
+    virsh_lab net-start "$prefix-$name"
+}
+
+check_memory_limits() {
+    local role=$1 hard_kib=$2 domain_id unit cgroup
+    domain_id=$(virsh_lab domid "$prefix-$role") || return 1
+    unit="machine-$(systemd-escape "qemu-$domain_id-$prefix-$role").scope" || return 1
+    cgroup=$(systemctl show "$unit" --property=ControlGroup --value) || return 1
+    [[ -n $cgroup ]] || return 1
+    [[ $(cat "/sys/fs/cgroup$cgroup/libvirt/memory.max") == "$((hard_kib*1024))" ]] || return 1
+    [[ $(cat "/sys/fs/cgroup$cgroup/libvirt/memory.swap.current") == 0 ]]
+}
+
+start_memory_watch() {
+    local unit
+    unit="ozzy-jepsen-host-watch-$(printf '%s' "$lab" | sha256sum | cut -c1-16)"
+    if ! systemctl --user is-active --quiet "$unit"; then
+        systemd-run --user --unit="$unit" --collect --property=Type=exec \
+            --property=Restart=on-failure --property=RestartSec=2s \
+            --property="StandardOutput=append:$lab/host-watch.log" \
+            --property="StandardError=append:$lab/host-watch.log" \
+            bash "$repo/jepsen/host-watch" "$lab" "$uri" "$((host_reserve_mib*1024))"
+    fi
+}
+
+cloud_config() {
+    local role=$1 number=$2
+    local pubkey
+    pubkey=$(cat "$lab/key.pub")
+    cat > "$lab/$role-user.yaml" <<EOF
+#cloud-config
+hostname: $role
+disable_root: false
+ssh_pwauth: false
+ssh_authorized_keys:
+  - $pubkey
+package_update: true
+packages: [ca-certificates, jq, iptables, iproute2, dmsetup, chrony, fuse3, git, g++, cmake, libfuse3-dev, openjdk-25-jdk-headless, leiningen, unzip]
+runcmd:
+  - [systemctl, disable, --now, chrony]
+EOF
+    cat > "$lab/$role-network.yaml" <<EOF
+version: 2
+ethernets:
+  management:
+    match: {macaddress: '52:54:00:6f:00:$number'}
+    set-name: management
+    addresses: [$management.$number/24]
+    routes: [{to: default, via: $management.1}]
+    nameservers: {addresses: [$management.1]}
+  traffic:
+    match: {macaddress: '52:54:00:6f:01:$number'}
+    set-name: traffic
+    addresses: [$traffic.$number/24]
+EOF
+    cloud-localds --network-config="$lab/$role-network.yaml" \
+        "$lab/$role-seed.iso" "$lab/$role-user.yaml"
+}
+
+up() {
+    preflight
+    test -x "$bundle/ozzy" && test -x "$bundle/ozzy_jepsen_probe" && test -f "$bundle/ozzy-java.jar"
+    test ! -e "$lab/owned" || { echo 'Lab exists; collect/down before recreating.' >&2; return 1; }
+    for name in controller n0 n1 n2; do
+        if virsh_lab dominfo "$prefix-$name" >/dev/null 2>&1; then
+            echo "Existing domain $prefix-$name; refusing to adopt it." >&2; return 1
+        fi
+    done
+    for name in mgmt test; do
+        if virsh_lab net-info "$prefix-$name" >/dev/null 2>&1; then
+            echo "Existing network $prefix-$name; refusing to adopt it." >&2; return 1
+        fi
+    done
+    ssh-keygen -q -t ed25519 -N '' -f "$lab/key"
+    touch "$lab/owned"
+    local image_url=${OZZY_JEPSEN_IMAGE_URL:-https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2}
+    curl -fL "$image_url" -o "$lab/base.qcow2"
+    curl -fL "${image_url%/*}/SHA512SUMS" -o "$lab/image-SHA512SUMS"
+    local expected
+    expected=$(awk -v file="${image_url##*/}" '$2 == file || $2 == "*"file {print $1}' "$lab/image-SHA512SUMS")
+    test ${#expected} -eq 128
+    printf '%s  %s\n' "$expected" "$lab/base.qcow2" | sha512sum -c -
+    local qemu_group
+    qemu_group=$(id -gn libvirt-qemu)
+    chgrp "$qemu_group" "$lab/base.qcow2"
+    chmod g+r "$lab/base.qcow2"
+    network mgmt "$management" '<forward mode="nat"/>'
+    network test "$traffic" ''
+    : > "$lab/known_hosts"
+    for index in 0 1 2 3; do
+        local role=n$((index-1)) number=$((10+index)) memory=$broker_mib data_gib=64
+        if [[ $index == 0 ]]; then role=controller; memory=$controller_mib; data_gib=256; fi
+        local hard_kib=$(((memory+qemu_overhead_mib)*1024))
+        cloud_config "$role" "$number"
+        qemu-img create -f qcow2 -F qcow2 -b "$lab/base.qcow2" "$lab/$role-root.qcow2" 24G
+        qemu-img create -f qcow2 "$lab/$role-data.qcow2" "${data_gib}G"
+        # Touch only new images; libvirt may change ownership after launch.
+        chgrp "$qemu_group" "$lab/$role-root.qcow2" "$lab/$role-data.qcow2" "$lab/$role-seed.iso"
+        chmod g+rw "$lab/$role-root.qcow2" "$lab/$role-data.qcow2" "$lab/$role-seed.iso"
+        chmod o+x "$lab" "$(dirname "$lab")"
+        virt-install --connect "$uri" --virt-type kvm --name "$prefix-$role" --memory "$memory" \
+            --memtune "hard_limit=$hard_kib" \
+            --vcpus 2 --cpu host-passthrough --import --os-variant debian13 \
+            --graphics none --video vga --noautoconsole \
+            --disk "path=$lab/$role-root.qcow2,format=qcow2,cache=none,bus=virtio" \
+            --disk "path=$lab/$role-data.qcow2,format=qcow2,cache=none,bus=virtio" \
+            --disk "path=$lab/$role-seed.iso,device=cdrom" \
+            --network "network=$prefix-mgmt,mac=52:54:00:6f:00:$number" \
+            --network "network=$prefix-test,mac=52:54:00:6f:01:$number"
+        virsh_lab domuuid "$prefix-$role" > "$lab/$role.uuid"
+        if ! check_memory_limits "$role" "$hard_kib"; then
+            virsh_lab destroy "$prefix-$role"
+            echo "Memory limits were not enforced for $role." >&2
+            return 1
+        fi
+        start_memory_watch
+        # Finish boot/package installation before starting the next guest.
+        local n=$number deadline=$((SECONDS+600))
+        local found=false
+        while (( SECONDS < deadline )); do
+            if [[ $(virsh_lab domstate "$prefix-$role") != running ]]; then
+                echo "Guest $role stopped before SSH became available." >&2
+                return 1
+            fi
+            if ssh-keyscan -T 2 "$management.$n" >> "$lab/known_hosts" 2>/dev/null; then found=true; break; fi
+            sleep 1
+        done
+        "$found"
+        ssh_lab "$n" timeout 900 cloud-init status --wait
+        copy_lab "$lab/key" "root@$management.$n:/root/.ssh/id_ed25519"
+        copy_lab "$lab/known_hosts" "root@$management.$n:/root/.ssh/known_hosts"
+        ssh_lab "$n" chmod 600 /root/.ssh/id_ed25519
+    done
+    for n in 10 11 12 13; do
+        copy_lab "$lab/known_hosts" "root@$management.$n:/root/.ssh/known_hosts"
+    done
+    deploy
+}
+
+deploy() {
+    for n in 10 11 12 13; do
+        ssh_lab "$n" mkdir -p /opt/ozzy-jepsen
+        copy_lab "$bundle/ozzy" "$bundle/ozzy_jepsen_probe" "$repo/jepsen/node" \
+            "root@$management.$n:/opt/ozzy-jepsen/"
+        ssh_lab "$n" chmod +x /opt/ozzy-jepsen/node
+        ssh_lab "$n" "printf 'OZZY_NODE=n$((n-11))\nOZZY_TEST_PREFIX=$traffic\nOZZY_TEST_IF=traffic\n' > /opt/ozzy-jepsen/lab.env"
+    done
+    ssh_lab 10 'set -eu; mkfs.ext4 -q /dev/vdb; mkdir -p /var/lib/ozzy-results; mount /dev/vdb /var/lib/ozzy-results; mkdir /var/lib/ozzy-results/store /var/lib/ozzy-results/tmp; ln -s /var/lib/ozzy-results/store /opt/ozzy-jepsen/store'
+    for n in 11 12 13; do
+        # Guest variables expand in the guest shell.
+        # shellcheck disable=SC2016
+        ssh_lab "$n" 'set -eu; sectors=$(blockdev --getsz /dev/vdb); printf "0 %s linear /dev/vdb 0\n" "$sectors" | dmsetup create ozzy-jepsen-data; mkfs.ext4 -q /dev/mapper/ozzy-jepsen-data; mkdir -p /var/lib/ozzy-data; mount /dev/mapper/ozzy-jepsen-data /var/lib/ozzy-data; touch /var/lib/ozzy-data/.ozzy-jepsen'
+        ssh_lab "$n" 'set -eu; git clone --branch 0.3.0 --depth 1 https://github.com/dsrhaslab/lazyfs /opt/lazyfs; cd /opt/lazyfs/libs/libpcache; ./build.sh; cd /opt/lazyfs/lazyfs; ./build.sh; echo user_allow_other >> /etc/fuse.conf'
+    done
+    # Explicit stable IDs let the controller connect before provisioning completes.
+    for n in 0 1 2; do
+        id=$(cat /proc/sys/kernel/random/uuid)
+        printf '%s\n' "$id" >> "$lab/broker-ids"
+    done
+    for n in 11 12 13; do
+        copy_lab "$lab/broker-ids" "root@$management.$n:/opt/ozzy-jepsen/broker-ids"
+    done
+    cat > "$lab/inventory.edn" <<EOF
+{:nodes ["$management.11" "$management.12" "$management.13"]
+ :ssh {:username "root" :private-key-path "/root/.ssh/id_ed25519" :strict-host-key-checking true}
+ :test-ips {"$management.11" "$traffic.11" "$management.12" "$traffic.12" "$management.13" "$traffic.13"}
+ :addresses [
+EOF
+    for n in 0 1 2; do
+        id=$(sed -n "$((n+1))p" "$lab/broker-ids")
+        printf ' {:id "%s" :peer "tcp://%s.%s:7200" :data-peer "tcp://%s.%s:7203"}\n' \
+            "$id" "$traffic" "$((n+11))" "$traffic" "$((n+11))" >> "$lab/inventory.edn"
+    done
+    echo ']}' >> "$lab/inventory.edn"
+    copy_lab -r "$repo/jepsen/src" "$repo/jepsen/test" "$repo/jepsen/project.clj" "$repo/jepsen/probe-net" \
+        "$lab/inventory.edn" "$bundle/ozzy-java.jar" "root@$management.10:/opt/ozzy-jepsen/"
+    copy_lab "$bundle/revision" "$bundle/tree.patch" "$bundle/SHA256SUMS" "root@$management.10:/opt/ozzy-jepsen/"
+    # shellcheck disable=SC2016
+    ssh_lab 10 'cd /opt/ozzy-jepsen; OZZY_JAVA_JAR=$PWD/ozzy-java.jar OZZY_ARTIFACT_ROOT=/var/tmp/ozzy-artifacts OZZY_JEPSEN_TMPDIR=/var/lib/ozzy-results/tmp lein test'
+}
+
+run_test() {
+    local command=${1:?}; shift
+    local args=""
+    if [[ $command == test ]]; then args=' --inventory inventory.edn'; fi
+    for arg in "$@"; do printf -v arg '%q' "$arg"; args+=" $arg"; done
+    local status=0
+    ssh_lab 10 "set -eu; mountpoint -q /var/lib/ozzy-results; mkdir -p /var/lib/ozzy-results/tmp; cd /opt/ozzy-jepsen; export OZZY_JAVA_JAR=\$PWD/ozzy-java.jar OZZY_ARTIFACT_ROOT=/var/tmp/ozzy-artifacts OZZY_JEPSEN_TMPDIR=/var/lib/ozzy-results/tmp; lein run $command$args" || status=$?
+    jq -cn --arg time "$(date --iso-8601=seconds)" --arg command "$command$args" \
+        --argjson exit "$status" --arg lab "$lab" \
+        '{time:$time,command:$command,exit:$exit,lab:$lab}' >> "$HOME/.cache/ozzy/jepsen.jsonl"
+    return "$status"
+}
+
+collect() {
+    test -f "$lab/owned"
+    local destination
+    destination="$lab/collected-$(date +%Y%m%dT%H%M%S)"
+    mkdir -p "$destination"
+    # Preserve Jepsen's current/latest links instead of copying each history
+    # repeatedly through scp's recursive symlink traversal.
+    ssh_lab 10 'tar -C /var/lib/ozzy-results -cf - store' | tar -xf - -C "$destination"
+    mkdir "$destination/controller"
+    ssh_lab 10 'tar -C /opt/ozzy-jepsen -cf - src test project.clj probe-net inventory.edn revision tree.patch SHA256SUMS' \
+        | tar -xf - -C "$destination/controller"
+    virsh_lab dumpxml "$prefix-controller" > "$destination/controller.xml"
+    for n in 11 12 13; do
+        copy_lab -r "root@$management.$n:/opt/ozzy-jepsen/run" "$destination/n$((n-11))"
+        virsh_lab dumpxml "$prefix-n$((n-11))" > "$destination/n$((n-11)).xml"
+    done
+    echo "$destination"
+}
+
+active_lab() {
+    if [[ ! -f $lab/owned || -f $lab/stopped ]]; then
+        echo 'No active lab at this path.' >&2; return 1
+    fi
+    for role in controller n0 n1 n2; do
+        if test -f "$lab/$role.uuid"; then
+            test "$(virsh_lab domuuid "$prefix-$role")" = "$(cat "$lab/$role.uuid")" || {
+                echo "Domain identity changed: $role" >&2; return 1;
+            }
+        fi
+    done
+}
+
+case "${1:?}" in
+    preflight|up) ;;
+    *) active_lab; start_memory_watch ;;
+esac
+
+case "${1:?}" in
+    preflight) preflight ;;
+    up) up ;;
+    test) shift; run_test test --time-limit 120 "$@" ;;
+    check) shift; run_test analyze "$@" ;;
+    qualify) shift; run_test test --backend pool --lazyfs --fault none --time-limit 10 "$@" ;;
+    witness) shift; run_test test --time-limit 10 --witnesses "$@" ;;
+    campaign)
+        for backend in aio pool; do
+            run_test test --backend "$backend" --fault none --time-limit 120
+            run_test test --backend "$backend" --witnesses --time-limit 10
+            for family in process network clock storage recovery; do
+                for seed in 1 2 3; do
+                    run_test test --backend "$backend" --fault "$family" --seed "$seed" --time-limit 600
+                done
+            done
+            run_test test --backend "$backend" --fault network --inflight 16 --rate 500 --slow-readers --time-limit 600
+            run_test test --backend "$backend" --fault combined --time-limit 3600
+        done
+        if run_test test --backend pool --lazyfs --fault none --time-limit 10; then
+            for seed in 1 2 3 4; do
+                run_test test --backend pool --lazyfs --fault power --witnesses --seed "$seed" --time-limit 900
+            done
+        else
+            echo 'Power-loss suite blocked: pool/LazyFS qualification or smoke failed.' >&2
+            exit 1
+        fi
+        ;;
+    collect) collect ;;
+    down)
+        collect || echo 'Collection incomplete; original VM images will remain available.' >&2
+        for role in controller n0 n1 n2; do
+            if virsh_lab dominfo "$prefix-$role" >/dev/null 2>&1; then
+                virsh_lab destroy "$prefix-$role" || true
+                virsh_lab undefine "$prefix-$role" --nvram
+            fi
+        done
+        for name in test mgmt; do
+            if virsh_lab net-info "$prefix-$name" >/dev/null 2>&1; then
+                virsh_lab net-destroy "$prefix-$name" || true
+                virsh_lab net-undefine "$prefix-$name"
+            fi
+        done
+        touch "$lab/stopped"
+        echo "Stopped lab images retained in $lab. Use a fresh OZZY_JEPSEN_LAB for another lab."
+        ;;
+esac

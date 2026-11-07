@@ -1,0 +1,339 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd /opt/ozzy-jepsen
+# shellcheck source=/dev/null
+source lab.env
+export OZZY_ARTIFACT_ROOT=${OZZY_ARTIFACT_ROOT:-/var/tmp/ozzy-artifacts}
+mkdir -p "$OZZY_ARTIFACT_ROOT" run
+data=/var/lib/ozzy-data
+store="$data/store"
+probe="$PWD/ozzy_jepsen_probe"
+admin="ipc:///run/ozzy-jepsen-$OZZY_NODE.sock"
+
+event() {
+    jq -cn --arg action "$1" --arg detail "${2:-}" \
+        --arg time "$(date --iso-8601=ns)" \
+        '{time:$time,action:$action,detail:$detail}' >> run/events.jsonl
+}
+
+set_clock_ns() {
+    local clock_ns=${1:?} clock_time
+    printf -v clock_time '%d.%09d' "$((clock_ns/1000000000))" "$((clock_ns%1000000000))"
+    date -s "@$clock_time" >/dev/null
+}
+
+shift_clock() {
+    local clock_ns
+    clock_ns=$(date +%s%N)
+    set_clock_ns "$((clock_ns + ${1:?}*1000000000))"
+}
+
+broker() {
+    ./ozzy --config run/deployment.toml "$@" --broker "$OZZY_NODE" \
+        --identity run/shared.identity --local-identity run/local.identity
+}
+
+alive() { test -f run/pid && kill -0 "$(cat run/pid)" 2>/dev/null; }
+wait_broker_exit() {
+    if test -f run/pid; then
+        local pid deadline
+        pid=$(cat run/pid)
+        deadline=$((SECONDS+30))
+        while kill -0 "$pid" 2>/dev/null; do
+            if (( SECONDS >= deadline )); then
+                echo "Broker thread group $pid did not exit." >&2
+                ps -p "$pid" -o pid,stat,nlwp,wchan >&2 || true
+                return 1
+            fi
+            sleep 0.05
+        done
+    fi
+    rm -f run/pid run/killed
+}
+
+kill_broker() {
+    if alive; then
+        local pid
+        pid=$(cat run/pid)
+        touch run/killed
+        kill -KILL "$pid" 2>/dev/null || ! kill -0 "$pid" 2>/dev/null
+        event kill "$pid"
+    fi
+    if [[ ${1:-wait} == wait ]]; then
+        # A zombie leader can still have live threads holding journal locks.
+        # Wait until the whole process is gone before touching its files.
+        wait_broker_exit
+    fi
+}
+
+start() {
+    if test -f run/killed; then wait_broker_exit; fi
+    if alive; then return; fi
+    rm -f "/run/ozzy-jepsen-$OZZY_NODE.sock"
+    nohup ./ozzy --config run/deployment.toml "$@" --broker "$OZZY_NODE" \
+        --identity run/shared.identity --local-identity run/local.identity \
+        --trusted-transport >>run/broker.log 2>&1 </dev/null &
+    echo "$!" > run/pid
+    event start "$*"
+}
+
+heal() {
+    dmsetup resume ozzy-jepsen-data 2>/dev/null || true
+    if alive; then
+        local pid
+        pid=$(cat run/pid)
+        kill -CONT "$pid" 2>/dev/null || ! kill -0 "$pid" 2>/dev/null
+    fi
+    iptables -F OZZY_JEPSEN 2>/dev/null || true
+    tc qdisc del dev "$OZZY_TEST_IF" root 2>/dev/null || true
+    if test -f run/clock-offset; then
+        local offset
+        offset=$(cat run/clock-offset)
+        shift_clock "$((-offset))"
+        rm run/clock-offset
+    fi
+    event heal
+}
+
+clear_cache() {
+    # Submission to the FIFO is not completion. Start the reader first.
+    # The child shell expands its own arguments.
+    # shellcheck disable=SC2016
+    timeout 30 bash -c '
+        read -r answer < "$1"
+        test "$answer" = finished::clear-cache
+    ' _ "$data/completed.fifo" &
+    local waiter=$!
+    # shellcheck disable=SC2016
+    if ! timeout 10 bash -c 'echo lazyfs::clear-cache > "$1"' _ "$data/faults.fifo"; then
+        kill "$waiter" 2>/dev/null || true
+        wait "$waiter" || true
+        return 1
+    fi
+    wait "$waiter"
+    event cache-loss
+}
+
+mount_lazyfs() {
+    mkdir -p "$data/backing" "$store"
+    cat > "$data/lazyfs.toml" <<EOF
+[faults]
+fifo_path="$data/faults.fifo"
+fifo_path_completed="$data/completed.fifo"
+[cache]
+apply_eviction=false
+[cache.simple]
+custom_size="512mb"
+blocks_per_page=1
+[filesystem]
+logfile="$PWD/run/lazyfs.log"
+log_all_operations=true
+EOF
+    (cd /opt/lazyfs/lazyfs
+     scripts/mount-lazyfs.sh -c "$data/lazyfs.toml" -m "$store" -r "$data/backing")
+    for ((i=0; i<300; i++)); do
+        if mountpoint -q "$store"; then return; fi
+        sleep 0.1
+    done
+    return 1
+}
+
+configuration() {
+    local backend=$1
+    cat > run/deployment.toml <<EOF
+[cluster]
+mode = "three"
+[topics.log]
+partitions = 6
+segment_bytes = 16777216
+max_append_bytes = 1048576
+producer_idle_secs = 604800
+[topics.dedup]
+partitions = 6
+segment_bytes = 16777216
+max_append_bytes = 1048576
+producer_idle_secs = 604800
+[topics.dedup.deduplication]
+window_millis = 172800000
+max_entries = 131072
+max_bytes = 268435456
+EOF
+    for n in 0 1 2; do
+        local ip="${OZZY_TEST_PREFIX}.$((11+n))"
+        cat >> run/deployment.toml <<EOF
+[brokers.n$n]
+id = "$(sed -n "$((n+1))p" broker-ids)"
+[brokers.n$n.endpoints]
+peer = "tcp://$ip:7200"
+data_peer = "tcp://$ip:7203"
+reader_pub = "tcp://$ip:7201"
+follower_pub = "tcp://$ip:7202"
+admin = "ipc:///run/ozzy-jepsen-n$n.sock"
+[brokers.n$n.devices.data]
+root = "$store"
+controller = "data"
+[brokers.n$n.devices.data.workers]
+backend = "$backend"
+write_threads = 1
+[[brokers.n$n.topology.shards]]
+id = 0
+device = "data"
+[[brokers.n$n.topology.shards]]
+id = 1
+device = "data"
+EOF
+    done
+}
+
+case "${1:-}" in
+    setup)
+        test -f "$data/.ozzy-jepsen" || { echo 'Unowned data volume' >&2; exit 1; }
+        heal
+        kill_broker
+        if mountpoint -q "$store"; then fusermount3 -u "$store"; fi
+        rm -rf "$store" "$data/backing"
+        rm -f run/shared.identity run/local.identity run/pid run/recovery
+        : > run/events.jsonl
+        : > run/broker.log
+        : > run/lazyfs.log
+        echo '{}' > run/status.json
+        : > run/snapshots.jsonl
+        : > run/qualification.json
+        mkdir -p "$store"
+        uname -a > run/environment.txt
+        findmnt -J --target "$store" >> run/environment.txt
+        git -C /opt/lazyfs rev-parse HEAD >> run/environment.txt
+        fusermount3 --version >> run/environment.txt
+        configuration "$2"
+        if [[ ${3:-false} == true ]]; then
+            test "$2" = pool
+            mount_lazyfs
+            "$probe" prepare "$store/qualification" >run/qualification.json
+            clear_cache
+            "$probe" verify "$store/qualification" >>run/qualification.json
+            rm -rf "$store/qualification"
+        fi
+        ./ozzy --config run/deployment.toml validate --broker "$OZZY_NODE"
+        iptables -N OZZY_JEPSEN 2>/dev/null || true
+        iptables -C INPUT -i "$OZZY_TEST_IF" -j OZZY_JEPSEN 2>/dev/null || \
+            iptables -I INPUT -i "$OZZY_TEST_IF" -j OZZY_JEPSEN
+        event setup "$2 ${3:-false}"
+        ;;
+    init) ./ozzy --config run/deployment.toml init --identity run/shared.identity ;;
+    fetch-identity)
+        scp -q -o StrictHostKeyChecking=yes "root@$2:$PWD/run/shared.identity" run/shared.identity ;;
+    format)
+        for step in init-broker init-volumes format; do broker "$step"; done ;;
+    identity) "$probe" identity run/shared.identity ;;
+    start)
+        if test -f run/recovery; then
+            mapfile -t recovery < run/recovery
+            path="$store/topics/${recovery[1]%/*}/partitions/${recovery[1]##*/}"
+            if test -f "$path/CONFIGURATION" && [[ $(head -c 8 "$path/CONFIGURATION") == OZYRECOV ]]; then
+                start recover --resume "${recovery[1]}"
+            elif test -f "$path/CONFIGURATION"; then
+                rm run/recovery
+                start serve
+            else start recover "${recovery[@]}"; fi
+        else start serve; fi ;;
+    kill) kill_broker ;;
+    # A combined storage stall may keep dying threads in kernel I/O. Healing
+    # releases that I/O, then start waits for the old process before reopening.
+    kill-nowait) kill_broker nowait ;;
+    pause)
+        kill -STOP "$(cat run/pid)"
+        deadline=$((SECONDS+10))
+        until [[ $(ps -o stat= -p "$(cat run/pid)") == T* ]]; do
+            (( SECONDS < deadline )) || exit 1
+            sleep 0.05
+        done
+        event pause ;;
+    resume) kill -CONT "$(cat run/pid)"; event resume ;;
+    status)
+        "$probe" admin "$admin" | tee run/status.json ;;
+    snapshot)
+        if timeout 2 "$probe" admin "$admin" >run/status.tmp 2>/dev/null; then
+            mv run/status.tmp run/status.json
+            jq -c --arg time "$(date --iso-8601=ns)" '. + {observed_at:$time}' run/status.json >>run/snapshots.jsonl
+        else
+            jq -cn --arg time "$(date --iso-8601=ns)" '{observed_at:$time,unavailable:true}' >>run/snapshots.jsonl
+        fi ;;
+    cut)
+        iptables -A OZZY_JEPSEN -s "$2" -j DROP
+        iptables -C OZZY_JEPSEN -s "$2" -j DROP
+        event cut "$2" ;;
+    netem)
+        tc qdisc replace dev "$OZZY_TEST_IF" root netem delay 150ms 50ms loss 5%
+        tc qdisc show dev "$OZZY_TEST_IF" | grep -q netem
+        event netem ;;
+    clock)
+        test ! -f run/clock-offset
+        timedatectl set-ntp false
+        shift_clock "$2"
+        echo "$2" > run/clock-offset
+        event clock "$2" ;;
+    clock-set)
+        test ! -f run/clock-offset
+        timedatectl set-ntp false
+        set_clock_ns "$2"
+        event clock-set "$2" ;;
+    stall)
+        dmsetup suspend --noflush ozzy-jepsen-data
+        dmsetup info -c --noheadings -o attr ozzy-jepsen-data | grep -q s
+        event storage-stall ;;
+    heal) heal ;;
+    power-loss) kill_broker; clear_cache ;;
+    recover)
+        kill_broker
+        topic=${2:?}; partition=${3:?}
+        [[ $topic == log || $topic == dedup ]] && [[ $partition =~ ^[0-5]$ ]]
+        path="$store/topics/$topic/partitions/$partition"
+        test -d "$path"
+        # Keep the old files outside the store for diagnosis; never format a replacement.
+        mv "$path" "$data/lost-$topic-$partition-$(date +%s%N)"
+        printf '%s\n' --replace "$topic/$partition" > run/recovery
+        start recover --replace "$topic/$partition"
+        event recover "$topic/$partition" ;;
+    resume-recovery)
+        kill_broker
+        mapfile -t recovery < run/recovery
+        printf '%s\n' --resume "${recovery[1]}" > run/recovery
+        start recover --resume "${recovery[1]}" ;;
+    normal)
+        kill_broker
+        rm -f run/recovery
+        start serve ;;
+    wait-normal)
+        deadline=$((SECONDS+300))
+        while (( SECONDS < deadline )); do
+            if timeout 5 "$probe" admin "$admin" >run/status.json 2>/dev/null && \
+                jq -e '.missing_shards == 0 and (.partitions | length == 12) and (.partitions | all(.state == "Normal" and .ready and .leader != null))' run/status.json >/dev/null; then
+                exit 0
+            fi
+            sleep 0.1
+        done
+        exit 1 ;;
+    wait-nonvoting)
+        path="$store/topics/$2/partitions/$3/CONFIGURATION"
+        deadline=$((SECONDS+300))
+        while (( SECONDS < deadline )); do
+            if ! alive; then
+                echo 'Broker exited before publishing a nonvoting recovery marker.' >&2
+                tail -n 8 run/broker.log >&2
+                exit 1
+            fi
+            if test -f "$path" && [[ $(head -c 8 "$path") == OZYRECOV ]] && \
+                timeout 5 "$probe" admin "$admin" >run/status.json 2>/dev/null && \
+                jq -e --arg topic "$2" --argjson partition "$3" \
+                    '.missing_shards == 0 and (.partitions | length == 12) and
+                     any(.partitions[]; .topic == $topic and .partition == $partition and
+                         .state == "Electing" and (.ready | not) and .leader == null)' \
+                    run/status.json >/dev/null; then
+                event nonvoting-active "$2/$3"
+                exit 0
+            fi
+            sleep 0.1
+        done
+        exit 1 ;;
+    *) echo 'node: setup|init|fetch-identity|format|identity|start|kill|pause|resume|status|cut|netem|clock|clock-set|stall|heal|power-loss|recover|resume-recovery|normal' >&2; exit 2 ;;
+esac
