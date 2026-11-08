@@ -123,11 +123,11 @@ fifo_path_completed="$data/completed.fifo"
 [cache]
 apply_eviction=false
 [cache.simple]
-custom_size="512mb"
+custom_size="128mb"
 blocks_per_page=1
 [filesystem]
 logfile="$PWD/run/lazyfs.log"
-log_all_operations=true
+log_all_operations=false
 EOF
     (cd /opt/lazyfs/lazyfs
      scripts/mount-lazyfs.sh -c "$data/lazyfs.toml" -m "$store" -r "$data/backing")

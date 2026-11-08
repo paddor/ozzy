@@ -318,6 +318,9 @@ not forward `fallocate`. The lab pins `lazyfs_commit` from the `paddor/lazyfs`
 fork of 0.3.1. It adds `FALLOC_FL_KEEP_SIZE` preallocation, directory sync,
 native backing-path translation, and fault-worker shutdown on unmount.
 Power tests require an injector that passes the complete qualifier.
+LazyFS memory grows to about twice its cache size, so 2 GiB brokers use a
+128 MiB cache without eviction. Synced pages stay cached; a full cache writes
+through until the next cache loss. LazyFS does not log each file operation.
 LazyFS models file cache loss; it does not establish namespace rollback,
 AIO power-loss, or hardware behavior. Process kills retain the OS page cache. A passing run
 is bounded evidence, not an independent Jepsen audit or an exactly-once claim.
