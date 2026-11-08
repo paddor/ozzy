@@ -7,6 +7,9 @@ prefix=ozzy-jepsen
 uri=${OZZY_JEPSEN_LIBVIRT_URI:-qemu:///system}
 management=192.168.152
 traffic=192.168.153
+# Fork of LazyFS 0.3.1 with preallocation, directory sync, and clean unmount.
+lazyfs_repo=https://github.com/paddor/lazyfs
+lazyfs_commit=40a550bc1dd524a1e446f6adc6745e26ddc42ea6
 controller_mib=4096
 broker_mib=2048
 qemu_overhead_mib=1024
@@ -217,7 +220,7 @@ deploy() {
         # Guest variables expand in the guest shell.
         # shellcheck disable=SC2016
         ssh_lab "$n" 'set -eu; sectors=$(blockdev --getsz /dev/vdb); printf "0 %s linear /dev/vdb 0\n" "$sectors" | dmsetup create ozzy-jepsen-data; mkfs.ext4 -q /dev/mapper/ozzy-jepsen-data; mkdir -p /var/lib/ozzy-data; mount /dev/mapper/ozzy-jepsen-data /var/lib/ozzy-data; touch /var/lib/ozzy-data/.ozzy-jepsen'
-        ssh_lab "$n" 'set -eu; git clone --branch 0.3.0 --depth 1 https://github.com/dsrhaslab/lazyfs /opt/lazyfs; cd /opt/lazyfs/libs/libpcache; ./build.sh; cd /opt/lazyfs/lazyfs; ./build.sh; echo user_allow_other >> /etc/fuse.conf'
+        ssh_lab "$n" "set -eu; git init -q /opt/lazyfs; cd /opt/lazyfs; git fetch -q --depth 1 $lazyfs_repo $lazyfs_commit; git checkout -q --detach FETCH_HEAD; test \"\$(git rev-parse HEAD)\" = $lazyfs_commit; cd libs/libpcache; ./build.sh; cd ../../lazyfs; ./build.sh; echo user_allow_other >> /etc/fuse.conf"
     done
     # Explicit stable IDs let the controller connect before provisioning completes.
     for n in 0 1 2; do
@@ -252,7 +255,7 @@ run_test() {
     if [[ $command == test ]]; then args=' --inventory inventory.edn'; fi
     for arg in "$@"; do printf -v arg '%q' "$arg"; args+=" $arg"; done
     local status=0
-    ssh_lab 10 "set -eu; mountpoint -q /var/lib/ozzy-results; mkdir -p /var/lib/ozzy-results/tmp; cd /opt/ozzy-jepsen; export OZZY_JAVA_JAR=\$PWD/ozzy-java.jar OZZY_ARTIFACT_ROOT=/var/tmp/ozzy-artifacts OZZY_JEPSEN_TMPDIR=/var/lib/ozzy-results/tmp; lein run $command$args" || status=$?
+    ssh_lab 10 "set -eu; mountpoint -q /var/lib/ozzy-results; mkdir -p /var/lib/ozzy-results/tmp; cd /opt/ozzy-jepsen; export OZZY_JAVA_JAR=\$PWD/ozzy-java.jar OZZY_ARTIFACT_ROOT=/var/tmp/ozzy-artifacts OZZY_JEPSEN_TMPDIR=/var/lib/ozzy-results/tmp; lein trampoline run $command$args" || status=$?
     jq -cn --arg time "$(date --iso-8601=seconds)" --arg command "$command$args" \
         --argjson exit "$status" --arg lab "$lab" \
         '{time:$time,command:$command,exit:$exit,lab:$lab}' >> "$HOME/.cache/ozzy/jepsen.jsonl"

@@ -203,6 +203,9 @@ case "${1:-}" in
         uname -a > run/environment.txt
         findmnt -J --target "$store" >> run/environment.txt
         git -C /opt/lazyfs rev-parse HEAD >> run/environment.txt
+        git -C /opt/lazyfs rev-parse HEAD > run/lazyfs.revision
+        git -C /opt/lazyfs diff --binary HEAD > run/lazyfs.patch
+        sha256sum /opt/lazyfs/lazyfs/build/lazyfs >> run/environment.txt
         fusermount3 --version >> run/environment.txt
         configuration "$2"
         if [[ ${3:-false} == true ]]; then

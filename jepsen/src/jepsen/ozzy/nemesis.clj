@@ -51,7 +51,7 @@
                                  0 [node] 1 [node other] 2 nodes) "power-loss")))
     {:family family :turn turn :target node :effect true}))
 
-(defrecord OzzyNemesis [progress]
+(defrecord OzzyNemesis [progress witnesses]
   nemesis/Nemesis
   (setup! [this _] this)
   (invoke! [_ test op]
@@ -61,11 +61,13 @@
                    (remote/on! test (:nodes test) "snapshot")
                    (assoc op :type :info :value result)))
       :heal (do (heal! test) (assoc op :type :info :value :healed))
-      :witnesses (merge op (witness/run! test))
+      :witnesses (merge op (witness/step! test witnesses))
       :final-begin (merge op (finalize/begin! test progress (:round op)))
       :final-scan (merge op (finalize/step! test progress (:round op)))
       :finalize (merge op (finalize/complete! progress))))
   (teardown! [_ test]
-    (try (finalize/close! progress) (finally (heal! test)))))
+    (try (witness/close! witnesses)
+         (finalize/close! progress)
+         (finally (heal! test)))))
 
-(defn nemesis [] (->OzzyNemesis (atom {})))
+(defn nemesis [] (->OzzyNemesis (atom {}) (atom nil)))

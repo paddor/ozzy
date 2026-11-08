@@ -4,8 +4,13 @@
             [jepsen.ozzy.remote :as remote])
   (:import (java.util UUID)))
 
+(defn append-evidence! [events operations]
+  (if-let [emit! (::emit! (meta events))]
+    (do (reset! events (vec operations)) (emit! @events))
+    (swap! events into operations)))
+
 (defn evidence! [events op completion]
-  (swap! events into [(assoc op :type :invoke) completion]))
+  (append-evidence! events [(assoc op :type :invoke) completion]))
 
 (defn close! [progress]
   (when-let [reader (:reader @progress)]
@@ -42,7 +47,7 @@
         (do
           (when-not (contains? (:completed @progress) :warm)
             (throw (ex-info "Warm scan did not complete" {})))
-          (remote/on! test (:nodes test) "kill")
+          (remote/on! test (:nodes test) (if (:lazyfs test) "power-loss" "kill"))
           (remote/on! test (:nodes test) "start")))
       (swap! progress assoc :round round
              :remaining (set (map :id (:markers @progress)))

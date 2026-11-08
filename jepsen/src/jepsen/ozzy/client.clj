@@ -151,6 +151,10 @@
       :drain (try (close-state! state) (assoc op :type :ok)
                   (catch Throwable error (assoc op :type :fail :error (str error))))))
   (teardown! [_ _])
-  (close! [_ _] (close-state! state)))
+  (close! [_ _] (close-state! state))
+  client/Reusable
+  ;; SDK owners keep admitted records and reconnect across an indeterminate
+  ;; operation. Replacing them here can block the generator's quorum heal.
+  (reusable? [_ _] true))
 
 (defn client [] (->OzzyClient nil))

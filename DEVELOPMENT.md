@@ -227,6 +227,8 @@ Jepsen history scratch files use the controller's results disk through
 `OZZY_JEPSEN_TMPDIR`; Debian's RAM-backed `/tmp` can exhaust a small guest
 while saving a pressure history. Local runs default Java scratch files to
 `OZZY_ARTIFACT_ROOT`.
+The controller uses `lein trampoline run` so the launcher JVM exits before
+the workload JVM starts.
 The controller's sparse results disk is 256 GiB; each broker's data disk is
 64 GiB. Keep room for binary histories and both text exports across the matrix.
 Each QEMU process has a hard limit of guest RAM plus 1 GiB.
@@ -282,7 +284,13 @@ the entire old process to exit; a zombie leader alone does not release its
 worker threads' journal locks. Combined storage stalls are healed before that
 restart wait.
 Final scans must reach per-partition markers before and after a full restart.
+With LazyFS, the cold scan loses all three file caches after the warm scan,
+so the confirmed marker records also cross a cache-loss boundary.
 Each final scan emits bounded poll results into the history as it progresses.
+Scripted witnesses emit their complete observations through a one-slot queue
+into successive Jepsen operations. The worker retains only its latest batch;
+one large witness completion would exceed the controller's memory while
+decoding or exporting a pressure history.
 The harness writes history chunks of 256 operations; the upstream 16K default
 can retain gigabytes of multipart reads in one decoded chunk. The record
 checker traverses evidence without caching the expanded history or final scans.
@@ -294,16 +302,22 @@ Each SSH node command has a separate 360-second controller deadline; a stalled
 guest fails the run instead of holding its control channel indefinitely.
 SDK cleanup attempts every handle even when one close fails. A failed drain
 remains an availability failure, and teardown still permits history analysis.
+The reconnecting SDK session is reusable after an indeterminate operation.
+Closing it during Jepsen's logical process replacement could wait for quorum
+and prevent the generator from issuing the heal. Final drains still run after
+healing and require cleanup to finish.
 Unknown write outcomes remain possible records. Separate reader sessions
 may intentionally replay them.
 
 Power tests require `--backend pool --lazyfs`. Qualification uses actual pool
 operations and checks loss of unsynced overwrites and preservation of
 `O_DSYNC`, data/file syncs, preallocation, and a synchronized rename. A failed
-qualification blocks power tests without weakening broker I/O. The pinned
-LazyFS 0.3.0 rejects the pool's required `fallocate` operation; its qualification
-currently fails before broker startup. LazyFS 0.3.1 also lacks an allocation
-handler. Power tests require an injector that passes the complete qualifier.
+qualification blocks power tests without weakening broker I/O. Upstream
+LazyFS 0.3.1 has no allocation handler, and libfuse's `subdir` module does
+not forward `fallocate`. The lab pins `lazyfs_commit` from the `paddor/lazyfs`
+fork of 0.3.1. It adds `FALLOC_FL_KEEP_SIZE` preallocation, directory sync,
+native backing-path translation, and fault-worker shutdown on unmount.
+Power tests require an injector that passes the complete qualifier.
 LazyFS models file cache loss; it does not establish namespace rollback,
 AIO power-loss, or hardware behavior. Process kills retain the OS page cache. A passing run
 is bounded evidence, not an independent Jepsen audit or an exactly-once claim.
@@ -312,6 +326,8 @@ VMs, build products, histories, source archives, and logs use
 `OZZY_ARTIFACT_ROOT/ozzy-jepsen/`; command results append to
 `~/.cache/ozzy/jepsen.jsonl`. `OZZY_JEPSEN_LAB` selects the lab directory.
 Collection preserves logs and VM definitions; `down` retains disk images.
+Each broker records the LazyFS revision, local source patch, and executable
+checksum beside its qualification result.
 Use a fresh lab directory after `down`. On the controller, `check` invokes
 Jepsen's offline `analyze` command and returns nonzero unless the history passes.
 `check --test DIR` takes the controller-side

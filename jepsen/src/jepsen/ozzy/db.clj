@@ -41,6 +41,8 @@
      (str remote/root "/run/snapshots.jsonl") "snapshots.jsonl"
      (str remote/root "/run/environment.txt") "environment.txt"
      (str remote/root "/run/qualification.json") "qualification.json"
+     (str remote/root "/run/lazyfs.revision") "lazyfs.revision"
+     (str remote/root "/run/lazyfs.patch") "lazyfs.patch"
      (str remote/root "/run/lazyfs.log") "lazyfs.log"}))
 
 (defn db [] (->OzzyDB))

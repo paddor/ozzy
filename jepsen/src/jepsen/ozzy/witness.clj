@@ -8,7 +8,8 @@
             [jepsen.ozzy.remote :as remote])
   (:import (java.io BufferedReader InputStreamReader)
            (java.util UUID)
-           (java.util.concurrent TimeUnit)))
+           (java.util.concurrent ArrayBlockingQueue TimeUnit)
+           (java.util.concurrent.atomic AtomicBoolean)))
 
 (defn send! [test state events writer ordinal k]
   (let [r (data/event (:run-id test) writer ordinal k)
@@ -145,7 +146,7 @@
         warmup (data/event (:id r) "probe-warmup" 0 0)
         warmup-op {:type :invoke :f :witness :record warmup}]
     (local! "bash" "/opt/ozzy-jepsen/probe-net" "up")
-    (swap! events conj warmup-op)
+    (final/append-evidence! events [warmup-op])
     (let [^java.util.List command
                            ["ip" "netns" "exec" "ozzy-jepsen-probe" "java"
                             "--enable-native-access=ALL-UNNAMED" "-Djava.awt.headless=true"
@@ -157,7 +158,7 @@
           reader (BufferedReader. (InputStreamReader. (.getInputStream process)))]
       (try
         (let [receipt (json/parse-string (line! reader "OZZY_READY ") true)]
-          (swap! events conj (assoc warmup-op :type :ok :receipt receipt)))
+          (final/append-evidence! events [(assoc warmup-op :type :ok :receipt receipt)]))
         ;; Warmup can overlap recovery from the previous probe. Select the
         ;; current agreed leader only after the child has opened its handles.
         (let [leader (common-leader! test)
@@ -185,8 +186,8 @@
                 op {:f :witness :record r}
                 completion (assoc op :type (keyword (:type result)) :receipt (:receipt result))]
             (final/evidence! events op completion)
-            (swap! events conj {:f :quorum-probe :type :ok :confirmed
-                                (if (= :ok (:type completion)) [(:receipt completion)] [])})))
+            (final/append-evidence! events [{:f :quorum-probe :type :ok :confirmed
+                                             (if (= :ok (:type completion)) [(:receipt completion)] [])}])))
         (finally
           (.destroyForcibly process)
           (.waitFor process 10 TimeUnit/SECONDS)
@@ -194,15 +195,44 @@
           (remote/on! test nodes "heal")
           (remote/on! test nodes "start"))))))
 
-(defn run! [test]
-  (let [events (atom [])]
-    (try
-      (pair-witnesses! test events)
-      (recovering-outsider! test events)
-      (lifecycle! test events)
-      (doseq [mode [:minority :lone :recovering]]
-        (remote/on! test (:nodes test) "wait-normal")
-        (minority! test events mode))
-      {:type :info :f :witnesses :ok? true :evidence @events}
-      (catch Throwable error
-        {:type :info :f :witnesses :ok? false :error (str error) :evidence @events}))))
+(defn execute! [test events]
+  (pair-witnesses! test events)
+  (recovering-outsider! test events)
+  (lifecycle! test events)
+  (doseq [mode [:minority :lone :recovering]]
+    (remote/on! test (:nodes test) "wait-normal")
+    (minority! test events mode))
+  {:type :info :f :witnesses :ok? true})
+
+(defn start! [test]
+  (let [queue (ArrayBlockingQueue. 1)
+        closed (AtomicBoolean. false)
+        events (atom [] :meta {::final/emit! #(.put queue %)})]
+    {:queue queue :closed closed
+     :worker (future
+               (let [result (try (execute! test events)
+                                 (catch Throwable error
+                                   {:type :info :f :witnesses :ok? false :error (str error)}))]
+                 (when-not (.get closed)
+                   (.put queue {::complete result}))))}))
+
+(defn close! [progress]
+  (when-let [{:keys [queue closed worker]} @progress]
+    (.set ^AtomicBoolean closed true)
+    (future-cancel worker)
+    (.clear ^ArrayBlockingQueue queue)
+    (reset! progress nil)))
+
+(defn step! [test progress]
+  (when-not @progress (reset! progress (start! test)))
+  (let [{:keys [queue result]} @progress]
+    (if result
+      (assoc result :scan-complete? true)
+      (if-let [item (.poll ^ArrayBlockingQueue queue 360 TimeUnit/SECONDS)]
+        (if-let [result (::complete item)]
+          (do (swap! progress assoc :result result)
+              (assoc result :scan-complete? true))
+          {:type :info :f :witnesses :scan-complete? false :evidence item})
+        (do (close! progress)
+            {:type :info :f :witnesses :ok? false :scan-complete? true
+             :error "Witness made no progress before its deadline"})))))

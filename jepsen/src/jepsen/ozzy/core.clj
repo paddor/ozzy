@@ -90,7 +90,9 @@
                          (gen/nemesis (gen/once {:type :info :f :heal}))
                          (gen/clients (gen/each-thread (gen/once {:f :drain})))
                          (when (:witnesses opts)
-                           (gen/nemesis (gen/once {:type :info :f :witnesses})))
+                           (gen/nemesis
+                             (gen/until :scan-complete?
+                                        (repeat {:type :info :f :witnesses}))))
                          (gen/nemesis (gen/once {:type :info :f :final-begin :round :warm}))
                          (gen/nemesis
                            (gen/until :scan-complete?
