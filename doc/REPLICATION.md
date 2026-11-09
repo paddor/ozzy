@@ -142,7 +142,10 @@ not suspicion.
   step pushes its election deadline out by one election delay, so a
   catch-up longer than any timeout still finishes. A running promise does
   the same, so a slow disk does not end the view as its promise lands.
-  Peer suspicion still counts.
+  Starting an installation, and each step of it, withdraws the broker's
+  own EXIT_VIEW for that view, so a timeout raised before START_VIEW
+  cannot join the leader's progress timeout mid-install. Peer suspicion
+  still counts.
 - A lookup scans the source from the checked prefix to its exact tail, and
   records every report position it passes, so a lagging copy's commit and
   accept cost one scan.

@@ -145,6 +145,10 @@ impl ReplicaDriver {
                 let ticket = installing.ticket();
                 self.role = Role::Installing(installing);
                 self.election_deadline = self.now.saturating_add(self.election_delay);
+                // A verified selection or admitted START_VIEW is newer
+                // evidence than a timeout this voter raised before it.
+                // The installation deadline raises suspicion again.
+                self.withdraw_exit();
                 Ok(ticket)
             }
             Err(rejected) => {
@@ -170,15 +174,22 @@ impl ReplicaDriver {
     /// running. A lagging copy moves and replays its whole missed suffix in
     /// the view change, and a slow disk's promise can take as long, which can
     /// outlast any election timeout, so each advance pushes the local
-    /// election deadline out by one election delay. Peer
-    /// suspicion still counts; two other voters can leave the view without
-    /// this one.
+    /// election deadline out by one election delay. Progress of the view
+    /// being installed also withdraws this voter's own suspicion of it, so a
+    /// timeout raised before or during the installation cannot join a peer's
+    /// timeout while the installation advances. Peer suspicion still counts;
+    /// two other voters can leave the view without this one.
     pub fn history_progress(&mut self, now: Duration) -> Result<(), DriverError> {
         self.observe_time(now)?;
         if matches!(self.role, Role::ViewChanging(_) | Role::Installing(_)) {
             self.election_deadline = self
                 .election_deadline
                 .max(now.saturating_add(self.election_delay));
+        }
+        if let Role::Installing(installing) = &self.role
+            && installing.requested_scope() == installing.ticket().scope()
+        {
+            self.withdraw_exit();
         }
         Ok(())
     }
