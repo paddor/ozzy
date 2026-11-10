@@ -489,7 +489,8 @@ Runs spread over one thread per core; `OZZY_ACTOR_SIM_THREADS` sets the
 count. The fast suite also loses the leader after a long history and
 repeatedly; `seeded::stress` adds a very long history.
 `OZZY_ACTOR_SIM_TRACE=1` prints each broker's view and positions as they
-change.
+change. `OZZY_ACTOR_SIM_WIRE=1` prints each replica message of the first
+group as a broker receives it, with its view, prefixes, and fetch range.
 
 ```sh
 OZZY_ACTOR_SIM_SEEDS=1000 cargo nextest run -p ozzy-sim \

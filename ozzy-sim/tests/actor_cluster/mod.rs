@@ -26,6 +26,7 @@ mod network;
 mod records;
 mod seeds;
 mod sim;
+mod wire_trace;
 mod workload;
 
 use broker::{Control, GROUPS, MAX_SEGMENTS, SEGMENT_BYTES};
@@ -339,6 +340,16 @@ fn scenario(name: &str) -> Option<Scenario> {
         "recovery-crash" => Scenario {
             ticks: 3000,
             script: &[CrashAll { at: 1500 }, Recrash { within: 250 }],
+            ..RANDOM
+        },
+        // As `recovery-crash`, then one broker fails for good at tick 2200,
+        // or right after the second power loss if a slow first election
+        // delays it, perhaps before every partition has a leader. The other
+        // two must elect, confirm, and converge.
+        "power-loss-outsider" => Scenario {
+            ticks: 2200 + OUTSIDER_TICKS,
+            script: &[CrashAll { at: 1500 }, Recrash { within: 250 }],
+            outsider: Some(OUTSIDER_TICKS),
             ..RANDOM
         },
         // Every disk stops completing jobs, then power fails within 300 ms with
