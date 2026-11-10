@@ -26,3 +26,13 @@
         (is (identical? (first @states) (second @states)))
         (finally (interpreter/close! worker {})))
       (is (= 1 @closed)))))
+
+(deftest a-failed-close-keeps-the-failure-that-left-a-record-pending
+  (with-redefs [sdk/close-state! (fn [_] (throw (ex-info "close timed out" {})))]
+    (let [error (try (sdk/with-state (atom {}) #(throw (ex-info "not confirmed" {})))
+                     (catch clojure.lang.ExceptionInfo e e))]
+      (is (= "not confirmed" (ex-message error)))
+      (is (= ["close timed out"] (map ex-message (.getSuppressed ^Throwable error)))))
+    ;; Without an earlier failure, the close failure is the result.
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"close timed out"
+                          (sdk/with-state (atom {}) (constantly :done))))))

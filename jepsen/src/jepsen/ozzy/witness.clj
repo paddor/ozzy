@@ -14,7 +14,7 @@
 (defn send! [test state events writer ordinal k]
   (let [r (data/event (:run-id test) writer ordinal k)
         op (assoc (data/operation r) :f :witness)
-        result (sdk/send-record (assoc test :confirmation-timeout-ms 300000) state op)]
+        result (final/send-timed! (assoc test :confirmation-timeout-ms 300000) state op)]
     (final/evidence! events op result)
     (when-not (= :ok (:type result)) (throw (ex-info "Quorum witness did not confirm" result)))
     r))
@@ -22,20 +22,20 @@
 (defn read-until! [test events ids label]
   (let [state (atom {:client (sdk/connect test) :session label})
         remaining (atom (set ids))]
-    (try
-      (remote/wait!
-        (fn []
-          (doseq [topic data/topics]
-            (let [op {:f :poll :topic topic}
-                  result (sdk/poll-records state op)]
-              (when (or (seq (:records result)) (not= :ok (:type result)))
-                (final/evidence! events op result))
-              (when-not (= :ok (:type result)) (throw (ex-info "Witness reader failed" result)))
-              (swap! remaining #(reduce disj % (map :id (:records result))))
-              (when (empty? (:records result)) (Thread/sleep 10))))
-          (empty? @remaining))
-        (str "Read acknowledged records through " label))
-      (finally (sdk/close-state! state)))))
+    (sdk/with-state state
+      (fn []
+        (remote/wait!
+          (fn []
+            (doseq [topic data/topics]
+              (let [op {:f :poll :topic topic}
+                    result (sdk/poll-records state op)]
+                (when (or (seq (:records result)) (not= :ok (:type result)))
+                  (final/evidence! events op result))
+                (when-not (= :ok (:type result)) (throw (ex-info "Witness reader failed" result)))
+                (swap! remaining #(reduce disj % (map :id (:records result))))
+                (when (empty? (:records result)) (Thread/sleep 10))))
+            (empty? @remaining))
+          (str "Read acknowledged records through " label))))))
 
 (defn pair-witnesses! [test events]
   (doseq [outsider (:nodes test)
@@ -45,9 +45,7 @@
     (remote/on! test [outsider] "pause")
     (let [label (str "pair-" outsider "-" victim)
           state (atom {:client (sdk/connect test) :session label})
-          records (try
-                    (mapv #(send! test state events label % %) (range 12))
-                    (finally (sdk/close-state! state)))]
+          records (sdk/with-state state #(mapv (fn [k] (send! test state events label k k)) (range 12)))]
       (if (:lazyfs test)
         (let [survivor (first (remove #{outsider victim} (:nodes test)))]
           (remote/on! test [victim survivor] "power-loss")

@@ -11,6 +11,7 @@
     (remote/script! "clock-set" (str (* (System/currentTimeMillis) 1000000))))
   (teardown! [_ _ _]
     ;; Collection precedes teardown. Preserve stores for explicit collection/down.
+    (remote/script! "sample-stop")
     (remote/script! "heal")
     (remote/script! "kill"))
   db/Primary
@@ -24,7 +25,8 @@
     (remote/on! test (remove #{node} (:nodes test)) "fetch-identity" node)
     (remote/on! test (:nodes test) "format")
     (remote/on! test (:nodes test) "start")
-    (remote/on! test (:nodes test) "wait-normal"))
+    (remote/on! test (:nodes test) "wait-normal")
+    (remote/on! test (:nodes test) "sample-start"))
   db/Kill
   (kill! [_ _ _] (remote/script! "kill"))
   (start! [_ _ _] (remote/script! "start"))
@@ -39,6 +41,7 @@
      (str remote/root "/run/shared.identity") "shared.identity"
      (str remote/root "/run/status.json") "status.json"
      (str remote/root "/run/snapshots.jsonl") "snapshots.jsonl"
+     (str remote/root "/run/samples.jsonl") "samples.jsonl"
      (str remote/root "/run/environment.txt") "environment.txt"
      (str remote/root "/run/qualification.json") "qualification.json"
      (str remote/root "/run/lazyfs.revision") "lazyfs.revision"

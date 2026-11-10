@@ -287,6 +287,10 @@ Final scans must reach per-partition markers before and after a full restart.
 With LazyFS, the cold scan loses all three file caches after the warm scan,
 so the confirmed marker records also cross a cache-loss boundary.
 Each final scan emits bounded poll results into the history as it progresses.
+Each broker records its admin status around every fault in `snapshots.jsonl`
+and once a second, through witnesses and final scans, in `samples.jsonl`.
+Witness and marker writes carry wall-clock `:start-ms` and `:end-ms`. A close
+that times out on a pending record keeps the write's failure as the error.
 Scripted witnesses emit their complete observations through a one-slot queue
 into successive Jepsen operations. The worker retains only its latest batch;
 one large witness completion would exceed the controller's memory while
@@ -321,6 +325,9 @@ Power tests require an injector that passes the complete qualifier.
 LazyFS memory grows to about twice its cache size, so 2 GiB brokers use a
 128 MiB cache without eviction. Synced pages stay cached; a full cache writes
 through until the next cache loss. LazyFS does not log each file operation.
+It also keeps about 240 KB for each file it has stat'ed until the next cache
+loss. Walking a whole store through the mount, as `du` does, exhausts a broker
+guest; inspect the `backing` directory instead.
 LazyFS models file cache loss; it does not establish namespace rollback,
 AIO power-loss, or hardware behavior. Process kills retain the OS page cache. A passing run
 is bounded evidence, not an independent Jepsen audit or an exactly-once claim.

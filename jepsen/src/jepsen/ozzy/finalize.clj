@@ -12,6 +12,12 @@
 (defn evidence! [events op completion]
   (append-evidence! events [(assoc op :type :invoke) completion]))
 
+(defn send-timed! [test state op]
+  ;; Wall-clock bounds place final and witness writes beside node samples.
+  (let [start (System/currentTimeMillis)
+        result (sdk/send-record test state op)]
+    (assoc result :start-ms start :end-ms (System/currentTimeMillis))))
+
 (defn close! [progress]
   (when-let [reader (:reader @progress)]
     (swap! progress dissoc :reader)
@@ -36,7 +42,7 @@
           (let [markers (mapv #(data/event (:run-id test) "marker" % %) (range data/keys-count))]
             (doseq [r markers]
               (let [op (assoc (data/operation r) :f :marker)
-                    result (sdk/send-record
+                    result (send-timed!
                              (assoc test :confirmation-timeout-ms (* 1000 (:recovery-timeout test 300)))
                              state op)]
                 (evidence! events op result)

@@ -34,6 +34,12 @@ broker() {
 }
 
 alive() { test -f run/pid && kill -0 "$(cat run/pid)" 2>/dev/null; }
+stop_sampler() {
+    if test -f run/sampler.pid; then
+        kill -- "-$(cat run/sampler.pid)" 2>/dev/null || true
+        rm -f run/sampler.pid
+    fi
+}
 wait_broker_exit() {
     if test -f run/pid; then
         local pid deadline
@@ -188,6 +194,7 @@ EOF
 case "${1:-}" in
     setup)
         test -f "$data/.ozzy-jepsen" || { echo 'Unowned data volume' >&2; exit 1; }
+        stop_sampler
         heal
         kill_broker
         if mountpoint -q "$store"; then fusermount3 -u "$store"; fi
@@ -198,6 +205,7 @@ case "${1:-}" in
         : > run/lazyfs.log
         echo '{}' > run/status.json
         : > run/snapshots.jsonl
+        : > run/samples.jsonl
         : > run/qualification.json
         mkdir -p "$store"
         uname -a > run/environment.txt
@@ -261,6 +269,24 @@ case "${1:-}" in
         else
             jq -cn --arg time "$(date --iso-8601=ns)" '{observed_at:$time,unavailable:true}' >>run/snapshots.jsonl
         fi ;;
+    # Status once a second through every phase, including witnesses and
+    # final scans, which take no fault snapshots.
+    sample)
+        while true; do
+            if timeout 2 "$probe" admin "$admin" >run/sample.tmp 2>/dev/null; then
+                jq -c --arg time "$(date --iso-8601=ns)" '. + {observed_at:$time}' \
+                    run/sample.tmp >>run/samples.jsonl || true
+            else
+                jq -cn --arg time "$(date --iso-8601=ns)" '{observed_at:$time,unavailable:true}' \
+                    >>run/samples.jsonl || true
+            fi
+            sleep 1
+        done ;;
+    sample-start)
+        stop_sampler
+        setsid nohup ./node sample >/dev/null 2>&1 </dev/null &
+        echo "$!" > run/sampler.pid ;;
+    sample-stop) stop_sampler ;;
     cut)
         iptables -A OZZY_JEPSEN -s "$2" -j DROP
         iptables -C OZZY_JEPSEN -s "$2" -j DROP
@@ -338,5 +364,5 @@ case "${1:-}" in
             sleep 0.1
         done
         exit 1 ;;
-    *) echo 'node: setup|init|fetch-identity|format|identity|start|kill|pause|resume|status|cut|netem|clock|clock-set|stall|heal|power-loss|recover|resume-recovery|normal' >&2; exit 2 ;;
+    *) echo 'node: setup|init|fetch-identity|format|identity|start|kill|pause|resume|status|sample-start|sample-stop|cut|netem|clock|clock-set|stall|heal|power-loss|recover|resume-recovery|normal' >&2; exit 2 ;;
 esac

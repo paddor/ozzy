@@ -139,6 +139,17 @@
       ;; must not abort the interpreter before the saved history is checked.
       (finally (reset! state {})))))
 
+(defn with-state [state f]
+  ;; Closing waits for pending records. A close that times out must not
+  ;; replace the failure that left a record pending.
+  (let [result (try (f)
+                    (catch Throwable error
+                      (try (close-state! state)
+                           (catch Throwable close-error (.addSuppressed error close-error)))
+                      (throw error)))]
+    (close-state! state)
+    result))
+
 (defrecord OzzyClient [state]
   client/Client
   (open! [this test _]
