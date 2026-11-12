@@ -320,11 +320,15 @@ qualification blocks power tests without weakening broker I/O. Upstream
 LazyFS 0.3.1 has no allocation handler, and libfuse's `subdir` module does
 not forward `fallocate`. The lab pins `lazyfs_commit` from the `paddor/lazyfs`
 fork of 0.3.1. It adds `FALLOC_FL_KEEP_SIZE` preallocation, directory sync,
-native backing-path translation, and fault-worker shutdown on unmount.
+native backing-path translation, fault-worker shutdown on unmount, and one
+backing write for each run of blocks written past a full cache.
 Power tests require an injector that passes the complete qualifier.
 LazyFS memory grows to about twice its cache size, so 2 GiB brokers use a
 128 MiB cache without eviction. Synced pages stay cached; a full cache writes
-through until the next cache loss. LazyFS does not log each file operation.
+through until the next cache loss. Upstream writes each 4 KiB block through
+with its own `pwrite`; with `O_DSYNC` that was about 50 times slower and
+stalled view-change installation for minutes. Eviction keeps writes fast but
+LazyFS exited after a cache loss. LazyFS does not log each file operation.
 It also keeps about 240 KB for each file it has stat'ed until the next cache
 loss. Walking a whole store through the mount, as `du` does, exhausts a broker
 guest; inspect the `backing` directory instead.

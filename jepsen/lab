@@ -7,9 +7,10 @@ prefix=ozzy-jepsen
 uri=${OZZY_JEPSEN_LIBVIRT_URI:-qemu:///system}
 management=192.168.152
 traffic=192.168.153
-# Fork of LazyFS 0.3.1 with preallocation, directory sync, and clean unmount.
+# Fork of LazyFS 0.3.1 with preallocation, directory sync, clean unmount, and
+# one backing write per run of blocks past a full cache.
 lazyfs_repo=https://github.com/paddor/lazyfs
-lazyfs_commit=40a550bc1dd524a1e446f6adc6745e26ddc42ea6
+lazyfs_commit=0b8cc1244a40d34c43d219a2566a454215c49105
 controller_mib=4096
 broker_mib=2048
 qemu_overhead_mib=1024
@@ -220,7 +221,13 @@ deploy() {
         # Guest variables expand in the guest shell.
         # shellcheck disable=SC2016
         ssh_lab "$n" 'set -eu; sectors=$(blockdev --getsz /dev/vdb); printf "0 %s linear /dev/vdb 0\n" "$sectors" | dmsetup create ozzy-jepsen-data; mkfs.ext4 -q /dev/mapper/ozzy-jepsen-data; mkdir -p /var/lib/ozzy-data; mount /dev/mapper/ozzy-jepsen-data /var/lib/ozzy-data; touch /var/lib/ozzy-data/.ozzy-jepsen'
-        ssh_lab "$n" "set -eu; git init -q /opt/lazyfs; cd /opt/lazyfs; git fetch -q --depth 1 $lazyfs_repo $lazyfs_commit; git checkout -q --detach FETCH_HEAD; test \"\$(git rev-parse HEAD)\" = $lazyfs_commit; cd libs/libpcache; ./build.sh; cd ../../lazyfs; ./build.sh; echo user_allow_other >> /etc/fuse.conf"
+        # A local git bundle can carry an unpublished LazyFS commit.
+        local fetch="git fetch -q --depth 1 $lazyfs_repo $lazyfs_commit; git checkout -q --detach FETCH_HEAD"
+        if [[ -n ${OZZY_JEPSEN_LAZYFS_BUNDLE:-} ]]; then
+            copy_lab "$OZZY_JEPSEN_LAZYFS_BUNDLE" "root@$management.$n:/root/lazyfs.bundle"
+            fetch="git fetch -q /root/lazyfs.bundle '+refs/heads/*:refs/remotes/bundle/*'; git checkout -q --detach $lazyfs_commit"
+        fi
+        ssh_lab "$n" "set -eu; git init -q /opt/lazyfs; cd /opt/lazyfs; $fetch; test \"\$(git rev-parse HEAD)\" = $lazyfs_commit; cd libs/libpcache; ./build.sh; cd ../../lazyfs; ./build.sh; echo user_allow_other >> /etc/fuse.conf"
     done
     # Explicit stable IDs let the controller connect before provisioning completes.
     for n in 0 1 2; do
