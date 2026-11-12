@@ -40,6 +40,31 @@ stop_sampler() {
         rm -f run/sampler.pid
     fi
 }
+# Broker and LazyFS threads that run, wait uninterruptibly, or block in a
+# call other than an idle wait, so a storage stall names the stuck call.
+thread_sample() {
+    local threads="" p t s comm state call wchan
+    for p in $(pgrep -x ozzy) $(pgrep -x lazyfs); do
+        for t in /proc/"$p"/task/*; do
+            { read -r s < "$t/stat"; } 2>/dev/null || continue
+            comm=${s#*(}; comm=${comm%)*}; comm=${comm//\"/}
+            state=${s##*) }; state=${state%% *}
+            call='?'
+            { read -r call _ < "$t/syscall"; } 2>/dev/null || true
+            if [[ $state == S ]]; then
+                # futex, epoll_wait, epoll_pwait, nanosleep, clock_nanosleep,
+                # poll, ppoll, select, pselect6, epoll_pwait2
+                case $call in 202|232|281|35|230|7|271|23|270|441) continue ;; esac
+            fi
+            wchan='?'
+            { IFS= read -r wchan < "$t/wchan" || [[ -n $wchan ]]; } 2>/dev/null || true
+            # An idle LazyFS worker waits for the next FUSE request.
+            [[ $state == S && $wchan == fuse_dev_do_read ]] && continue
+            threads+="${threads:+,}[\"$comm\",${t##*/},\"$state\",\"$call\",\"$wchan\"]"
+        done
+    done
+    printf '{"observed_at":"%s","threads":[%s]}\n' "$(date --iso-8601=ns)" "$threads"
+}
 wait_broker_exit() {
     if test -f run/pid; then
         local pid deadline
@@ -206,6 +231,7 @@ case "${1:-}" in
         echo '{}' > run/status.json
         : > run/snapshots.jsonl
         : > run/samples.jsonl
+        : > run/threads.jsonl
         : > run/qualification.json
         mkdir -p "$store"
         uname -a > run/environment.txt
@@ -280,6 +306,7 @@ case "${1:-}" in
                 jq -cn --arg time "$(date --iso-8601=ns)" '{observed_at:$time,unavailable:true}' \
                     >>run/samples.jsonl || true
             fi
+            thread_sample >>run/threads.jsonl 2>/dev/null || true
             sleep 1
         done ;;
     sample-start)

@@ -42,6 +42,7 @@
      (str remote/root "/run/status.json") "status.json"
      (str remote/root "/run/snapshots.jsonl") "snapshots.jsonl"
      (str remote/root "/run/samples.jsonl") "samples.jsonl"
+     (str remote/root "/run/threads.jsonl") "threads.jsonl"
      (str remote/root "/run/environment.txt") "environment.txt"
      (str remote/root "/run/qualification.json") "qualification.json"
      (str remote/root "/run/lazyfs.revision") "lazyfs.revision"
