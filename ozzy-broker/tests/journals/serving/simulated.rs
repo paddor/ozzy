@@ -14,6 +14,7 @@ mod idle_producers;
 mod network_limits;
 mod partitions;
 mod progress;
+mod reader_close;
 mod resume;
 mod retention;
 

@@ -1,7 +1,8 @@
 //! A permanent outsider, as in
 //! [TigerBeetle's liveness mode](https://tigerbeetle.com/blog/2023-07-06-simulation-testing-for-liveness/).
-//! Some ticks before the drain every fault ends and the network heals, but
-//! one broker fails for good. Clients give up on it once it stops
+//! Some ticks before the drain, once every scripted fault has run, every
+//! fault ends and the network heals, but one broker fails for good. A later
+//! power loss would restart it healthy. Clients give up on it once it stops
 //! answering, as an SDK does once its requests time out: a down or paused
 //! one at once, any other once it leads no partition's newest view. Until
 //! then new work reaches it, so a stalled or deaf leader notices; after,
@@ -54,11 +55,17 @@ pub(crate) struct Outsider {
 }
 
 impl Sim {
-    /// The last tick before the outsider fails, if one does.
-    pub(super) fn liveness_start(&self) -> Option<u64> {
-        self.options
-            .outsider
-            .map(|ticks| self.options.ticks - ticks)
+    /// An outsider is due to fail: its start tick has passed and no
+    /// scripted fault is still pending or running.
+    pub(super) fn outsider_due(&self, tick: u64) -> bool {
+        self.outsider.is_none()
+            && self
+                .options
+                .outsider
+                .is_some_and(|ticks| tick > self.options.ticks - ticks)
+            && self.next_fault == self.options.script.len()
+            && self.crash_due.is_none()
+            && self.isolation.is_none()
     }
 
     pub(super) fn outsider_index(&self) -> Option<usize> {
@@ -75,8 +82,12 @@ impl Sim {
 
     /// The seed picks the kind in turn, so five seeds in a row cover every
     /// kind. The broker is the first partition's leader at even odds, else
-    /// any broker.
+    /// any broker. A late start moves the drain out, so the outsider keeps
+    /// its whole window.
     pub(super) fn start_outsider(&mut self, tick: u64) -> Result<(), String> {
+        if let Some(ticks) = self.options.outsider {
+            self.drain_at = self.drain_at.max(tick - 1 + ticks);
+        }
         let kind = STUCK[(self.seed % STUCK.len() as u64) as usize];
         let rng = &mut self.outsiders;
         let broker = match leader(&self.brokers, 0) {

@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# shellcheck source=scripts/ozzy_tools.sh
+source "$(dirname "$0")/ozzy_tools.sh"
+export OZZY_JEPSEN_ROOT="$ozzy_repo_root"
+export OZZY_JEPSEN_LAB="${OZZY_JEPSEN_LAB:-$OZZY_ARTIFACT_ROOT/ozzy-jepsen/lab}"
+ozzy_jepsen_version=$(awk '/^\[workspace.package\]/{section=1;next} section && /^version =/{gsub(/"/,"",$3);print $3;exit}' "$ozzy_repo_root/Cargo.toml")
+export OZZY_JAVA_JAR="${OZZY_JAVA_JAR:-$CARGO_TARGET_DIR/java/ozzy-java-$ozzy_jepsen_version-linux-$(uname -m).jar}"
+case "${1:-help}" in
+    build)
+        cd "$ozzy_repo_root"
+        cargo build --release --locked -p ozzy-broker -p ozzy-java
+        cargo build --release --locked --manifest-path jepsen/support/Cargo.toml
+        java_build="$CARGO_TARGET_DIR/java"
+        platform="linux-$(uname -m)"
+        mkdir -p "$java_build/native-resources/io/ozzy/native/$platform"
+        cp "$CARGO_TARGET_DIR/release/libozzy_java.so" \
+            "$java_build/native-resources/io/ozzy/native/$platform/"
+        mvn -B -f bindings/java/pom.xml "-Dozzy.buildDir=$java_build" \
+            "-Dozzy.platform=$platform" package
+        bundle="$OZZY_ARTIFACT_ROOT/ozzy-jepsen/bundle"
+        mkdir -p "$bundle"
+        cp "$CARGO_TARGET_DIR/release/ozzy" "$CARGO_TARGET_DIR/release/ozzy_jepsen_probe" "$bundle/"
+        cp "$OZZY_JAVA_JAR" "$bundle/ozzy-java.jar"
+        git rev-parse HEAD > "$bundle/revision"
+        git diff --binary HEAD > "$bundle/tree.patch"
+        git ls-files --others --exclude-standard > "$bundle/untracked-files"
+        cp Cargo.lock "$bundle/workspace-Cargo.lock"
+        cp jepsen/support/Cargo.lock "$bundle/support-Cargo.lock"
+        git ls-files -co --exclude-standard -z | tar -czf "$bundle/source.tar.gz" --null -T -
+        (cd "$bundle"; sha256sum ozzy ozzy_jepsen_probe ozzy-java.jar) > "$bundle/SHA256SUMS"
+        ;;
+    local-test|adapter-test)
+        selection=()
+        if [[ $1 == local-test ]]; then
+            bash "$ozzy_repo_root/jepsen/test/clock.sh"
+        fi
+        if [[ $1 == adapter-test ]]; then
+            export OZZY_JEPSEN_BROKER="${OZZY_JEPSEN_BROKER:-$CARGO_TARGET_DIR/release/ozzy}"
+            export OZZY_JEPSEN_PROBE="${OZZY_JEPSEN_PROBE:-$CARGO_TARGET_DIR/release/ozzy_jepsen_probe}"
+            selection=(:integration)
+        fi
+        cd "$ozzy_repo_root/jepsen"
+        exec "${OZZY_JEPSEN_LEIN:-lein}" test "${selection[@]}" ;;
+    preflight|up|down|collect|test|campaign|check|qualify|witness)
+        exec bash "$ozzy_repo_root/jepsen/lab" "$@" ;;
+    *)
+        cat <<'EOF'
+scripts/ozzy-jepsen build                 Build matching release binaries/JAR
+scripts/ozzy-jepsen preflight             Check local VM prerequisites
+scripts/ozzy-jepsen up                    Create the disposable four-VM lab
+scripts/ozzy-jepsen local-test            Run checker/adapter fixtures locally
+scripts/ozzy-jepsen adapter-test          Test Java against three local TCP brokers
+scripts/ozzy-jepsen test [Jepsen options] Run a fresh DQ test (default 120 s)
+scripts/ozzy-jepsen witness               Run scripted quorum/recovery witnesses
+scripts/ozzy-jepsen qualify               Qualify pool/LazyFS separately
+scripts/ozzy-jepsen campaign              Run the overnight matrix
+scripts/ozzy-jepsen check [options]       Offline Jepsen analyze command
+scripts/ozzy-jepsen collect               Copy histories, logs and VM definitions
+scripts/ozzy-jepsen down                  Collect, then destroy this lab's VMs
+EOF
+        ;;
+esac

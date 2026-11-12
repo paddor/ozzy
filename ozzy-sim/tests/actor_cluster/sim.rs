@@ -2,7 +2,8 @@
 //! deliver due frames, then in each 1 ms disk step complete due jobs and run
 //! every broker's shard turn in seeded order. Clients then observe replies
 //! and submit. Checks run after every tick. `OZZY_ACTOR_SIM_TRACE` prints
-//! each broker's view and positions when they change.
+//! each broker's view and positions when they change; `OZZY_ACTOR_SIM_WIRE`
+//! adds group 0's replica messages (`wire_trace.rs`).
 
 mod floors;
 mod nemesis;
@@ -76,8 +77,10 @@ pub(crate) struct Options {
     pub min_refused: u64,
     /// Scripted faults in tick order, on top of the profile's random ones.
     pub script: &'static [Fault],
-    /// This many ticks before the drain, every fault ends but one broker
-    /// fails for good; the other two must keep committing and converge.
+    /// This many ticks before the drain, once every scripted fault has run,
+    /// every fault ends but one broker fails for good; the other two must
+    /// keep committing and converge. A script that runs late moves the drain
+    /// out by as much.
     pub outsider: Option<u64>,
 }
 
@@ -190,6 +193,9 @@ struct Sim {
     checkers: Vec<Checker>,
     trace: Trace,
     options: Options,
+    /// The last tick before the drain: `options.ticks`, or later if an
+    /// outsider failed late.
+    drain_at: u64,
     /// The next scripted fault and a running isolation.
     next_fault: usize,
     isolation: Option<Isolation>,
@@ -269,6 +275,7 @@ pub(crate) fn run(seed: u64, profile: Profile, options: Options) -> Result<Repor
             .map(|_| Checker::default())
             .collect(),
         trace: Trace::default(),
+        drain_at: options.ticks,
         options,
         next_fault: 0,
         isolation: None,
@@ -344,22 +351,21 @@ impl Sim {
     /// Run to convergence; returns the common applied operation and whether
     /// the run was vacuous.
     fn run(&mut self) -> Result<(u64, bool), String> {
-        let end = self.options.ticks + self.options.drain;
         let mut last = [None; BROKERS];
-        while self.clock.tick() < end {
+        while self.clock.tick() < self.drain_at + self.options.drain {
             self.clock.advance();
             let tick = self.clock.tick();
-            let draining = tick > self.options.ticks;
-            if tick == self.options.ticks + 1 {
+            let draining = tick > self.drain_at;
+            if tick == self.drain_at + 1 {
                 self.network.heal();
             }
             self.script(tick)?;
             // The liveness phase ends every fault but the outsider's.
-            let calm = self.liveness_start().is_some_and(|start| tick > start);
-            let liveness = calm && self.outsider.is_none();
+            let liveness = !draining && self.outsider_due(tick);
             if liveness {
                 self.network.heal();
             }
+            let calm = liveness || self.outsider.is_some();
             self.nemesis(tick, draining || calm)?;
             if liveness {
                 self.start_outsider(tick)?;
@@ -606,9 +612,7 @@ impl Sim {
                     ));
                 }
                 // Clients propose nothing new in the drain.
-                if tick <= self.options.ticks
-                    && self.workload.confirmed.len() == isolation.confirmed
-                {
+                if tick <= self.drain_at && self.workload.confirmed.len() == isolation.confirmed {
                     return Err(format!(
                         "no proposal confirmed while broker {}'s link was slow",
                         isolation.broker
@@ -848,6 +852,7 @@ impl Sim {
             }
         }
         let vacuous = self.next_fault < self.options.script.len()
+            || (self.options.outsider.is_some() && self.outsider.is_none())
             || self.chaos.as_ref().is_some_and(|chaos| chaos.total() < 5)
             || self.workload.counts.full < self.options.min_refused
             || applied.op.0 < self.options.min_applied

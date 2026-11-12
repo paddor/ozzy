@@ -1,0 +1,24 @@
+[package]
+name = "ozzy-jepsen-support"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "ozzy_jepsen_probe"
+path = "src/main.rs"
+
+[dependencies]
+omq-tokio = { version = "0.34.3", default-features = false }
+ozzy-config = { path = "../../ozzy-config" }
+ozzy-io = { path = "../../ozzy-io" }
+ozzy-io-pool = { path = "../../ozzy-io-pool" }
+ozzy-proto = { path = "../../ozzy-proto" }
+serde_json = "1"
+tokio = { version = "1.52.0", features = ["macros", "rt", "time"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

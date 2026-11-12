@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Consumer close now releases its subscription after an earlier replay
+  cancellation timed out. The old timeout could abort close before the full
+  unsubscribe was attempted, even after the broker was reachable again.
+- A disk-quorum group with one broker down no longer keeps replacing the
+  new leader while its follower catches up. A follower that timed out
+  before the new view started kept asking to leave it through its own
+  catch-up, and the leader's own progress timeout then supplied the second
+  vote. After a power loss, when catch-up refetches long history, two
+  brokers could lose half a minute this way. A follower now drops that
+  request when its catch-up starts and at each step of it.
+
 ## [0.11.0] - 2026-11-06
 
 ### Breaking

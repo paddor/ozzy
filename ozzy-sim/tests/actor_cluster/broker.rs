@@ -403,10 +403,12 @@ impl Broker {
         while let Some((from, message)) = self.inbox.control.pop_front() {
             input = true;
             if let Some((message, group)) = self.admit(from, message) {
+                crate::wire_trace::receive(clock.tick(), from, index, group, &message, LIMITS);
                 self.shard.receive(group, &message, now).map_err(failure)?;
             }
         }
-        while let Some((_, message)) = self.inbox.data.front() {
+        while let Some((from, message)) = self.inbox.data.front() {
+            let from = *from;
             let Some(group) = group_of(message) else {
                 self.inbox.data.pop_front();
                 continue;
@@ -424,6 +426,7 @@ impl Broker {
             } else {
                 self.shard.receive(group, message, now).map_err(failure)?;
             }
+            crate::wire_trace::receive(clock.tick(), from, index, group, message, LIMITS);
             self.inbox.data.pop_front();
             input = true;
         }

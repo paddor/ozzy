@@ -452,3 +452,46 @@ fn installation_progress_keeps_its_view_until_one_delay_after_the_last() {
         .unwrap();
     assert!(primary.normal().is_none());
 }
+
+#[test]
+fn an_installing_backup_withdraws_suspicion_until_its_installation_stalls() {
+    let (mut primary, mut backup, now) = selected_pair();
+    // The backup times out while the primary selects.
+    let late = now + timing().max_election_timeout;
+    let suspicion = Some(Action::Broadcast(Control::ExitView(backup.scope())));
+    assert_eq!(backup.poll(late).unwrap(), suspicion);
+    let ticket = primary
+        .begin_primary_install(JournalGeneration(10))
+        .unwrap();
+    primary.validate_install_suffix(&[operation()]).unwrap();
+    primary
+        .complete_installation(ticket, Prefix::GENESIS, late)
+        .unwrap();
+    let Some(Action::Broadcast(Control::StartView(start))) = primary.poll(late).unwrap() else {
+        panic!("published primary must announce installed view")
+    };
+    assert_eq!(
+        backup
+            .receive(node(1), Control::StartView(start), late)
+            .unwrap(),
+        Some(start)
+    );
+    let installed = backup
+        .begin_backup_install(node(1), start, JournalGeneration(20), |_, _| None)
+        .unwrap();
+    // The old timeout neither repeats nor joins the primary's own.
+    let at = late + timing().retransmit;
+    assert_eq!(backup.poll(at).unwrap(), None);
+    peer_exit(&mut backup, 1, at);
+    assert_eq!(backup.scope().view, 1);
+    // A stall raises suspicion again; the next staged chunk withdraws it.
+    let stalled = late + timing().max_election_timeout;
+    assert_eq!(backup.poll(stalled).unwrap(), suspicion);
+    backup.history_progress(stalled).unwrap();
+    assert_eq!(backup.poll(stalled + timing().retransmit).unwrap(), None);
+    backup.validate_install_suffix(&[operation()]).unwrap();
+    backup
+        .complete_installation(installed, Prefix::GENESIS, stalled + timing().retransmit)
+        .unwrap();
+    assert_eq!(backup.normal().unwrap().scope().view, 1);
+}

@@ -615,7 +615,7 @@ async fn publication_stream(
     .unwrap();
 }
 
-async fn settle_publications(
+pub(super) async fn settle_publications(
     brokers: &[Broker],
     writer: &mut SharedTopicWriter,
     subscriber: &Socket,
@@ -654,7 +654,7 @@ async fn settle_publications(
 }
 
 /// A raw SUB of `source`'s live topic, claiming `node`'s subscriptions.
-async fn subscriber(
+pub(super) async fn subscriber(
     runtime: &WriterRuntime,
     endpoint: &str,
     source: reader::Source,
@@ -680,7 +680,7 @@ async fn subscriber(
     socket
 }
 
-async fn publish_record(
+pub(super) async fn publish_record(
     brokers: &[Broker],
     writer: &mut SharedTopicWriter,
     offset: u64,
