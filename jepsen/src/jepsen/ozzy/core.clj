@@ -24,7 +24,9 @@
     :parse-fn parse-long :validate [#(<= 1 % 16) "Expected 1 through 16"]]
    [nil "--slow-readers" "Poll each live reader once per second"]
    [nil "--recovery-timeout SECONDS" "Deadline for each final confirmation/scan phase"
-    :default 300 :parse-fn parse-long :validate [pos? "Must be positive"]]])
+    :default 300 :parse-fn parse-long :validate [pos? "Must be positive"]]
+   [nil "--quiet-after-heal SECONDS" "Fault-free seconds after each heal, beyond the 5 s before the next fault"
+    :default 0 :parse-fn parse-long :validate [#(<= 0 %) "Must not be negative"]]])
 
 (defrecord Writes [run writer inflight ordinal]
   gen/Generator
@@ -52,7 +54,7 @@
   ;; there would keep every emitted payload reachable throughout analysis.
   (->Writes run writer inflight 0))
 
-(defn fault-generator [fault]
+(defn fault-generator [fault quiet]
   (when-not (= :none fault)
     (mapcat (fn [turn]
               (let [combined [:process :network :clock :storage]
@@ -63,7 +65,8 @@
                     [(gen/sleep 2) {:type :info :f :fault
                                     :value {:family (nth combined (mod (inc turn) 4))
                                             :turn (inc turn)}}])
-                  [(gen/sleep 10) {:type :info :f :heal}])))
+                  [(gen/sleep 10) {:type :info :f :heal}]
+                  (when (pos? quiet) [(gen/sleep quiet)]))))
             (range))))
 
 (defn test-map [opts]
@@ -85,7 +88,7 @@
             :nemesis (nemesis/nemesis) :checker (checker/check)
             :generator (gen/phases
                          (->> clients
-                              (gen/nemesis (fault-generator (:fault opts)))
+                              (gen/nemesis (fault-generator (:fault opts) (:quiet-after-heal opts 0)))
                               (gen/time-limit (:time-limit opts)))
                          (gen/nemesis (gen/once {:type :info :f :heal}))
                          (gen/clients (gen/each-thread (gen/once {:f :drain})))
