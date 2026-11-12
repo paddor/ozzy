@@ -51,11 +51,14 @@ preflight() {
         echo 'Lab requires cgroup v2 memory accounting for VM hard limits.' >&2; failed=1
     fi
     local available_kib free_kib required_kib
+    # Short runs need less than the full virtual size of the lab disks.
+    local free_gib=${OZZY_JEPSEN_MIN_FREE_GIB:-256}
+    [[ $free_gib =~ ^[0-9]+$ ]] || { echo "OZZY_JEPSEN_MIN_FREE_GIB must be a whole number." >&2; return 1; }
     available_kib=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
     free_kib=$(df -Pk "$lab" | awk 'NR == 2 {print $4}')
     required_kib=$(((lab_budget_mib+host_reserve_mib)*1024))
-    if (( available_kib < required_kib || free_kib < 256*1024*1024 )); then
-        echo 'Lab requires 20 GiB available RAM and 256 GiB free artifact space.' >&2; failed=1
+    if (( available_kib < required_kib || free_kib < free_gib*1024*1024 )); then
+        echo "Lab requires 20 GiB available RAM and $free_gib GiB free artifact space." >&2; failed=1
     fi
     echo "VM artifacts: $lab"
     return "$failed"
@@ -159,7 +162,7 @@ up() {
     network test "$traffic" ''
     : > "$lab/known_hosts"
     for index in 0 1 2 3; do
-        local role=n$((index-1)) number=$((10+index)) memory=$broker_mib data_gib=64
+        local role=n$((index-1)) number=$((10+index)) memory=$broker_mib data_gib=192
         if [[ $index == 0 ]]; then role=controller; memory=$controller_mib; data_gib=256; fi
         local hard_kib=$(((memory+qemu_overhead_mib)*1024))
         cloud_config "$role" "$number"
@@ -197,7 +200,15 @@ up() {
             sleep 1
         done
         "$found"
-        ssh_lab "$n" timeout 900 cloud-init status --wait
+        # cloud-init restarts sshd once during boot; retry refused connections.
+        local status
+        while true; do
+            status=0
+            ssh_lab "$n" timeout 900 cloud-init status --wait || status=$?
+            (( status == 255 && SECONDS < deadline )) || break
+            sleep 1
+        done
+        (( status == 0 ))
         copy_lab "$lab/key" "root@$management.$n:/root/.ssh/id_ed25519"
         copy_lab "$lab/known_hosts" "root@$management.$n:/root/.ssh/known_hosts"
         ssh_lab "$n" chmod 600 /root/.ssh/id_ed25519

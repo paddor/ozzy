@@ -8,6 +8,13 @@ test -f "$lab/owned"
 exec 9>"$lab/host-watch.lock"
 flock -n 9 || exit 0
 mkdir -p "$HOME/.cache/ozzy"
+# Swap charged to machine.slice before the first watch, such as pages left by
+# destroyed guests, is no lab VM swapping. Restarts keep the first baseline.
+if [[ ! -f $lab/host-watch.baseline ]]; then
+    cat /sys/fs/cgroup/machine.slice/memory.swap.current > "$lab/host-watch.baseline"
+fi
+baseline_swap_bytes=$(cat "$lab/host-watch.baseline")
+[[ $baseline_swap_bytes =~ ^[0-9]+$ ]]
 
 while [[ ! -f $lab/stopped ]]; do
     running=$(virsh -c "$uri" list --name)
@@ -21,8 +28,8 @@ while [[ ! -f $lab/stopped ]]; do
         --arg lab "$lab" \
         '{time:$time,kind:"jepsen-host-memory",available_kib:$available_kib,machine_bytes:$machine_bytes,machine_swap_bytes:$machine_swap_bytes,lab:$lab}' \
         >> "$HOME/.cache/ozzy/jepsen.jsonl"
-    if (( available_kib < reserve_kib || machine_swap_bytes > 0 )); then
-        echo "Host memory guard: $available_kib KiB available, $machine_swap_bytes VM swap bytes; stopping owned lab VMs." >&2
+    if (( available_kib < reserve_kib || machine_swap_bytes > baseline_swap_bytes )); then
+        echo "Host memory guard: $available_kib KiB available, $machine_swap_bytes VM swap bytes (baseline $baseline_swap_bytes); stopping owned lab VMs." >&2
         for role in controller n0 n1 n2; do
             name="ozzy-jepsen-$role"
             file="$lab/$role.uuid"
