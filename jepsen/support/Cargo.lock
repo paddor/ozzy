@@ -485,7 +485,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "ozzy-config"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "ozzy-proto",
  "serde",
@@ -497,7 +497,7 @@ dependencies = [
 
 [[package]]
 name = "ozzy-io"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "bytes",
  "fanring",
@@ -508,7 +508,7 @@ dependencies = [
 
 [[package]]
 name = "ozzy-io-pool"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "fanring",
  "futures",
@@ -535,7 +535,7 @@ dependencies = [
 
 [[package]]
 name = "ozzy-proto"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "bytes",
  "lz4rip",
@@ -546,7 +546,7 @@ dependencies = [
 
 [[package]]
 name = "ozzy-telemetry"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "omq-tokio",
  "serde_json",
