@@ -30,3 +30,27 @@
         (is (false? (:ok? result)))
         (is (re-find #"Cache loss did not acknowledge" (str (:error result))))
         (is (false? @connected))))))
+
+(defn cold-reader [consumers]
+  (atom {:round :cold :completed #{:warm} :remaining #{"confirmed-marker"}
+         :deadline (+ (System/nanoTime) 60000000000)
+         :reader (atom {:consumers consumers})}))
+
+(deftest a-reader-that-cannot-open-yet-retries-within-the-deadline
+  (let [progress (cold-reader {})]
+    (with-redefs [sdk/poll-records (fn [_ op]
+                                     (assoc op :type :info
+                                            :error "OzzyException: SDK broker request timed out"))]
+      (let [result (finalize/step! {} progress :cold)]
+        (is (:ok? result))
+        (is (false? (:scan-complete? result)))
+        (is (nil? (:error @progress)))
+        (is (= 4 (count (:evidence result))))))))
+
+(deftest an-open-reader-that-fails-ends-the-scan
+  (let [progress (cold-reader {"log" :open "dedup" :open})]
+    (with-redefs [sdk/poll-records (fn [_ op]
+                                     (assoc op :type :info :error "OzzyException: SDK broker request timed out"))]
+      (let [result (finalize/step! {} progress :cold)]
+        (is (false? (:ok? result)))
+        (is (re-find #"Final reader failed" (str (:error result))))))))

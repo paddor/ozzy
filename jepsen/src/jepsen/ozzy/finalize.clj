@@ -76,10 +76,17 @@
       ;; both complete partition scans inside one nemesis completion.
       (doseq [topic data/topics]
         (let [op {:f :poll :topic topic :round round}
-              result (sdk/poll-records (:reader @progress) op)]
+              result (sdk/poll-records (:reader @progress) op)
+              ;; Opening the reader can time out while the brokers recover
+              ;; from the cold restart. No consumer was kept, so the next step
+              ;; opens it again from the start; the scan deadline bounds this.
+              ;; Any other failure, or one of an open reader, ends the scan.
+              opening? (and (= :info (:type result))
+                            (re-find #"timed out" (str (:error result)))
+                            (nil? (get-in @(:reader @progress) [:consumers topic])))]
           (when (or (seq (:records result)) (not= :ok (:type result)))
             (evidence! events op result))
-          (when-not (= :ok (:type result))
+          (when-not (or (= :ok (:type result)) opening?)
             (throw (ex-info "Final reader failed" result)))
           (swap! progress update :remaining #(reduce disj % (map :id (:records result))))
           (when (empty? (:records result)) (Thread/sleep 10))))
