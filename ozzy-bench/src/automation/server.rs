@@ -29,9 +29,9 @@ const FREEZE: Duration = Duration::from_secs(2);
 const FREEZE_POLL: Duration = Duration::from_millis(10);
 
 /// Pinned Iggy release label used in comparison provenance.
-pub const RELEASE: &str = "0.10.0-rc.1";
+pub const RELEASE: &str = "0.10.0";
 /// Source tag corresponding to the pinned Iggy release.
-pub const RELEASE_TAG: &str = "server-0.10.0-rc.1";
+pub const RELEASE_TAG: &str = "server-0.10.0";
 /// Exact pinned Iggy source revision.
 pub const REVISION: &str = "91e0206367aad2d30259f7d45203832b08ae84e7";
 
