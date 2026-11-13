@@ -1,6 +1,9 @@
 //! Journal admission backpressure and fail-closed storage errors.
 
-use super::{AppendAdmissionError, GroupAssignError, GroupProgressError, PartitionReadError};
+use super::{
+    AppendAdmissionError, GroupAssignError, GroupProgressError, OwnerAppendError,
+    PartitionReadError,
+};
 
 /// Local admission backpressure, not an operation's persistence outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -49,6 +52,9 @@ pub enum JournalError {
     /// Producer identity, session, sequence, or retained retry validation failed.
     #[error(transparent)]
     ProducerAppend(#[from] AppendAdmissionError),
+    /// An owner append does not fit the partition's next offset or kind.
+    #[error(transparent)]
+    OwnerAppend(#[from] OwnerAppendError),
     /// Group assignment, confirmed cursor, or retained history rejected a request.
     #[error(transparent)]
     GroupProgress(#[from] GroupProgressError),

@@ -171,6 +171,10 @@ part. General descriptors use:
 - Stored outcomes consume offsets; every attempt consumes a producer sequence.
   An all-duplicate batch has record count zero and no descriptors or payload.
   Ordinary APPEND batches must be nonempty.
+- An owner batch is an APPEND (kind 3) batch with zero producer fields,
+  written by a partition's one embedded writer. It starts at the next offset
+  and keeps no producer state. A partition with delay or deduplication
+  refuses it.
 - `DedupWatermark` (kind 11): partition incarnation, owner epoch `u64`, logical
   milliseconds `u64`.
 - `GroupPlan` (kind 12): format `u8` (1), coordinator and group incarnations,

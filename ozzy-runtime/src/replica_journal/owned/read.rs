@@ -236,6 +236,7 @@ impl RecordCopy {
             return 0;
         }
         let limits = self.limits;
+        let time = span.append_timestamp_millis();
         let mut taken = 0;
         for record in span.records() {
             let bytes = record.payload_bytes();
@@ -255,7 +256,7 @@ impl RecordCopy {
                 break;
             }
             self.parts += record_parts;
-            let pushed = self.buffer.push_view(&record).and_then(|()| {
+            let pushed = self.buffer.push_view(&record, time).and_then(|()| {
                 self.cursor
                     .next
                     .checked_next()

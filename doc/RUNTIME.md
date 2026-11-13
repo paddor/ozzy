@@ -374,12 +374,16 @@ Only the leader releases, one step at a time.
 ## Local ring exceptions
 
 Cross-thread work uses OMQ inproc sockets, including dispatcher-shard lanes
-and SDK reader inboxes. Two places use typed local queues instead:
+and SDK reader inboxes. Three places use typed local queues instead:
 
 - SDK caller lanes. Application handles pass owned Rust values (records,
   commands, receipts) to the SDK owner over bounded typed queues.
 - Storage jobs. Shards submit jobs to a backend and receive completions over
   bounded rings. The backend's fixed workers share its file table.
+- Embedder logs. A `Log` handle from `Broker::log` sends owned requests
+  (record batches, reads) over one bounded queue per partition. The shard
+  polls it under the partition's waker and answers on one-shot channels;
+  the partition's role goes out on a watch channel.
 
 ## Shutdown and failure
 

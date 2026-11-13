@@ -93,6 +93,41 @@ impl PartitionActors {
         Ok(())
     }
 
+    /// Attach an embedder's log to this partition. Without `lane`, as while
+    /// the partition recovers, it answers until `attach_log_lane` lends one.
+    pub fn install_log(
+        &mut self,
+        group: GroupId,
+        port: crate::log::LogPort,
+        lane: Option<crate::replica_actor::LogLane>,
+    ) -> Result<(), PartitionError> {
+        let slot = *self.index.get(&group).ok_or(PartitionError::Unknown)?;
+        if self.stopped || self.logs[slot].is_some() {
+            return Err(PartitionError::NativeConfiguration);
+        }
+        self.logs[slot] = Some(crate::replica_actor::log_service::LogService::new(
+            port, lane,
+        ));
+        self.touch(slot);
+        Ok(())
+    }
+
+    /// Lend a recovered partition's log the new actor's lane.
+    pub fn attach_log_lane(
+        &mut self,
+        group: GroupId,
+        lane: crate::replica_actor::LogLane,
+    ) -> Result<(), PartitionError> {
+        let slot = *self.index.get(&group).ok_or(PartitionError::Unknown)?;
+        let log = self.logs[slot]
+            .as_mut()
+            .filter(|_| !self.stopped)
+            .ok_or(PartitionError::NativeConfiguration)?;
+        log.attach(lane);
+        self.touch(slot);
+        Ok(())
+    }
+
     /// Whether this partition still owns native proposals or pending replies.
     /// This is a scheduling observation, independent of leadership and physical
     /// buffer release. Unknown groups or missing native adapters fail closed.

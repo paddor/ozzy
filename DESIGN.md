@@ -36,7 +36,7 @@ brokers own journals, replication, and confirmation.
 | --- | --- |
 | Threads | Each thread owns its mutable state. No cross-thread locks on hot state; immutable `Arc` and `Bytes` may cross. |
 | Messaging | OMQ inproc connects the dispatcher and shards. Calls within one thread are direct. |
-| Local rings | SDK caller lanes and storage job rings are the only raw rings; see [runtime](doc/RUNTIME.md#local-ring-exceptions). |
+| Local rings | SDK caller lanes, storage job rings, and embedder log queues are the only raw rings; see [runtime](doc/RUNTIME.md#local-ring-exceptions). |
 | Shards | Shards are symmetric; shard 0 has no special duties. |
 | Sans-I/O | Codecs and replication state do no I/O. |
 | Modes | All modes share one intake, journal, reader, and storage pipeline. Only authority and confirmation policy differ. |

@@ -127,7 +127,7 @@ impl ActorSettings {
                 return Ok(Self::Local(LocalActorConfig {
                     retention_interval,
                     journal,
-                    proposal_lanes: 3,
+                    proposal_lanes: 4,
                     proposal_capacity: config.append_limits.max_operations,
                     turn_steps: 16,
                     evidence_quiet: EVIDENCE_QUIET,
@@ -160,7 +160,7 @@ impl ActorSettings {
                 transfer,
                 sync_batch_target: SyncBatchTarget::half_window(pipeline),
                 evidence_quiet: EVIDENCE_QUIET,
-                proposal_lanes: 3,
+                proposal_lanes: 4,
                 proposal_capacity: pipeline.max_operations,
                 control: QueueLimits {
                     messages: 8,

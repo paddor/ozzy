@@ -137,24 +137,17 @@ impl PartitionReadLease {
     pub(in crate::replica_journal) fn push_view(
         &mut self,
         record: &ozzy_journal_segment::RecordView<'_>,
-    ) -> Result<(), JournalError> {
-        self.push_record(record.message_id(), record.encoding(), record.parts())
-    }
-
-    pub(in crate::replica_journal) fn push_record<'a>(
-        &mut self,
-        id: ozzy_proto::MessageId,
-        encoding: ozzy_proto::data::Encoding,
-        parts: impl Iterator<Item = &'a [u8]>,
+        time_millis: u64,
     ) -> Result<(), JournalError> {
         let arena = &mut *self.0;
         let first = arena.parts.len();
-        for part in parts {
+        for part in record.parts() {
             arena.parts.push(arena.buffer.push_read_part(part)?);
         }
         arena.records.push(ReadRecord {
-            encoding,
-            id,
+            encoding: record.encoding(),
+            id: record.message_id(),
+            time_millis,
             parts: first..arena.parts.len(),
         });
         Ok(())

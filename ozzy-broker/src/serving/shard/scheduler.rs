@@ -204,7 +204,12 @@ impl State {
                 .bind_receive_owner(&self.replica_memory)
                 .map_err(failure)?;
             actor.enable_publication();
-            let (bootstrap, native, coordinator) = super::build::recovered_services(
+            let super::build::RecoveredServices {
+                bootstrap,
+                native,
+                coordinator,
+                lane,
+            } = super::build::recovered_services(
                 actor,
                 plan,
                 &self.config,
@@ -217,6 +222,7 @@ impl State {
             self.actors
                 .install_coordinator(coordinator, binding.links.clone())
                 .map_err(failure)?;
+            self.actors.attach_log_lane(group, lane).map_err(failure)?;
             self.actors
                 .install_readers(
                     group,

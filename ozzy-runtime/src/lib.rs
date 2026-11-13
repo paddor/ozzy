@@ -17,6 +17,7 @@
 mod completion;
 pub mod dispatch;
 pub mod frontend;
+pub mod log;
 pub mod memory;
 mod native_frames;
 mod peer_sessions;

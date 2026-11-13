@@ -20,11 +20,25 @@ pub(super) const WRITERS: usize = 32;
 pub(super) const WRITER_WINDOW: usize = 3;
 /// Coordinator plan proposals one partition may have in flight.
 pub(super) const COORDINATOR_PLANS: usize = 2;
-/// Proposal arenas of one partition's native services: per writer, one open
-/// slot and its APPEND slots, client rejection and consumer control slots,
-/// plus the coordinator's plan arenas.
+/// Owner appends one partition's log may have in flight.
+pub(super) const LOG_APPENDS: usize = 4;
+/// Proposal arenas of one partition's services: per writer, one open slot
+/// and its APPEND slots, client rejection and consumer control slots, the
+/// coordinator's plan arenas, and the log's append and read arenas.
 pub(crate) const fn native_arenas(clients: usize) -> usize {
-    WRITERS * (WRITER_WINDOW + 1) + 2 * clients + COORDINATOR_PLANS
+    WRITERS * (WRITER_WINDOW + 1) + 2 * clients + COORDINATOR_PLANS + LOG_APPENDS + 1
+}
+
+/// Bounds of a partition's log, from its journal's append bound.
+pub(super) fn log_limits(append_bytes: usize) -> ozzy_runtime::log::LogLimits {
+    ozzy_runtime::log::LogLimits {
+        queued: 64,
+        queued_bytes: append_bytes.saturating_mul(2),
+        appends: LOG_APPENDS,
+        append_bytes,
+        read_records: 1024,
+        read_bytes: append_bytes.min(1 << 20),
+    }
 }
 type Handoffs = Vec<(u32, tokio::sync::oneshot::Sender<super::Binding>)>;
 

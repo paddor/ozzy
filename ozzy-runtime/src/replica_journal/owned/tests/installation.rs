@@ -216,6 +216,14 @@ fn finish(controller: &mut Controller, voter: &mut Voter, ticket: &InstallTicket
     let installed = drive(controller, voter.journal.finish_installation(*ticket)).unwrap();
     assert_eq!(installed.applied(), ticket.committed());
     assert!(voter.journal.images().is_err());
+    // The commit point is recorded under the installed view only.
+    let view = ticket.scope().view;
+    let ends = voter.journal.installed_ends.as_ref().unwrap();
+    assert_eq!(ends.0, view);
+    for &(partition, end) in &ends.1 {
+        assert_eq!(voter.journal.installed_end(view, partition), Some(end));
+        assert_eq!(voter.journal.installed_end(view + 1, partition), None);
+    }
     voter
         .driver
         .complete_installation(installed.ticket(), installed.applied(), Duration::ZERO)

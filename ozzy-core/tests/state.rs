@@ -34,6 +34,8 @@ mod group;
 mod images;
 #[path = "state/operation_floor.rs"]
 mod operation_floor;
+#[path = "state/owner_append.rs"]
+mod owner_append;
 #[path = "state/progress.rs"]
 mod progress;
 #[path = "state/resolved.rs"]

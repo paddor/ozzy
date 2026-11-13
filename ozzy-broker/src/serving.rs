@@ -32,8 +32,17 @@ pub struct Broker {
     application: ApplicationShards,
     frontend: Frontend,
     devices: DeviceDrain,
-    serving: Vec<tokio::sync::watch::Receiver<bool>>,
+    registered: Registered,
     clock: ozzy_runtime::frontend::ClockTrust,
+}
+
+/// What the shards handed over at registration.
+#[derive(Debug)]
+struct Registered {
+    /// Each shard's serving observation.
+    serving: Vec<tokio::sync::watch::Receiver<bool>>,
+    /// Log handles by topic and partition number.
+    logs: BTreeMap<(String, u32), ozzy_runtime::log::Log>,
 }
 
 struct Registration {
@@ -44,6 +53,8 @@ struct Registration {
     data: DataSender,
     replica: DataSender,
     routes: Vec<ozzy_proto::directory::RouteState>,
+    /// Log handles of the shard's partitions, by topic and number.
+    logs: Vec<(String, u32, ozzy_runtime::log::Log)>,
     handoff: oneshot::Sender<Binding>,
 }
 
@@ -193,12 +204,12 @@ impl Broker {
         // Keep both startup observations alive: neither owner publishes ready
         // until the bounded two-way shard/frontend handoff has completed.
         let error = match futures::future::join(application, frontend).await {
-            (Ok(application), Ok((frontend, serving))) => {
+            (Ok(application), Ok((frontend, registered))) => {
                 return Ok(Self {
                     application,
                     frontend,
                     devices,
-                    serving,
+                    registered,
                     clock: config.clock.clone(),
                 });
             }
@@ -230,6 +241,15 @@ impl Broker {
         self.frontend.io_threads()
     }
 
+    /// The log of partition `partition` of `topic`, on every broker that
+    /// holds a copy. Its status tells whether this broker leads it.
+    pub fn log(&self, topic: &str, partition: u32) -> Option<ozzy_runtime::log::Log> {
+        self.registered
+            .logs
+            .get(&(topic.to_owned(), partition))
+            .cloned()
+    }
+
     /// What the clock guard last concluded about this broker's clock.
     pub fn clock(&self) -> ozzy_runtime::frontend::ClockStatus {
         self.clock.status()
@@ -242,7 +262,7 @@ impl Broker {
     pub fn ready(
         &self,
     ) -> impl std::future::Future<Output = Result<(), StartupError>> + Send + 'static + use<> {
-        let mut shards = self.serving.clone();
+        let mut shards = self.registered.serving.clone();
         async move {
             for shard in &mut shards {
                 shard
@@ -286,13 +306,17 @@ async fn start_frontend(
     config: &Arc<config::Config>,
     mut registrations: mpsc::Receiver<Registration>,
     startup: crate::shards::lifecycle::Registration,
-) -> Result<(Frontend, Vec<tokio::sync::watch::Receiver<bool>>), StartupError> {
+) -> Result<(Frontend, Registered), StartupError> {
     let mut registered = BTreeMap::new();
+    let mut logs = BTreeMap::new();
     for _ in &checked.plan.shards {
-        let registration: Registration = registrations
+        let mut registration: Registration = registrations
             .recv()
             .await
             .ok_or_else(|| failure("shard registration ended"))?;
+        for (topic, partition, log) in registration.logs.drain(..) {
+            logs.insert((topic, partition), log);
+        }
         if registered.insert(registration.id, registration).is_some() {
             return Err(failure("duplicate shard registration"));
         }
@@ -330,7 +354,7 @@ async fn start_frontend(
     };
     Frontend::start_registered(plan, Some(config.omq.clone()), factory, startup)
         .await
-        .map(|frontend| (frontend, serving))
+        .map(|frontend| (frontend, Registered { serving, logs }))
 }
 
 fn failure(error: impl std::fmt::Display) -> StartupError {

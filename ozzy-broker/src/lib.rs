@@ -45,6 +45,7 @@ pub use journals::{
     JournalConfig, JournalPlan, OpenedPartition, PartitionAuthority, PartitionJournal,
     RecoveryIntent, RecoverySelection, check_partition_limits,
 };
+pub use ozzy_runtime::log;
 pub use provisioning::{
     CheckedConfig, check_config, initialize_broker_identity, initialize_identity,
     load_broker_identity, load_deployment,

@@ -33,6 +33,7 @@ pub struct PartitionActors {
     native: Vec<Option<NativeService>>,
     coordinators: Vec<Option<NativeCoordinator>>,
     readers: Vec<Option<SharedReaders>>,
+    logs: Vec<Option<super::log_service::LogService>>,
     recovered: VecDeque<GroupId>,
     index: BTreeMap<GroupId, usize>,
     turn_actors: usize,
@@ -79,6 +80,7 @@ impl PartitionActors {
             native: actors.iter().map(|_| None).collect(),
             coordinators: actors.iter().map(|_| None).collect(),
             readers: actors.iter().map(|_| None).collect(),
+            logs: actors.iter().map(|_| None).collect(),
             actors,
             index,
             turn_actors,
@@ -232,6 +234,9 @@ impl PartitionActors {
             self.native[slot] = None;
             self.coordinators[slot] = None;
             self.readers[slot] = None;
+            if let Some(log) = &mut self.logs[slot] {
+                log.detach();
+            }
             self.actors.push(actor);
             let last = self.actors.len() - 1;
             self.actors.swap(slot, last);
@@ -251,7 +256,8 @@ impl PartitionActors {
         result
     }
 
-    /// Poll the partition's readers, group coordinator, and native intake.
+    /// Poll the partition's readers, group coordinator, log, and native
+    /// intake.
     fn poll_services(
         &mut self,
         slot: usize,
@@ -274,6 +280,9 @@ impl PartitionActors {
                     Ok(coordinator.poll_progress(cx, now, &mut self.actors[slot])? | sent)
                 })
                 .map_err(|source| PartitionError::Native { group, source })?;
+        }
+        if let Some(log) = &mut self.logs[slot] {
+            changed |= log.poll(&mut self.actors[slot], cx);
         }
         let Some(native) = &mut self.native[slot] else {
             return Ok(changed);
@@ -298,6 +307,7 @@ impl PartitionActors {
         drop(self.native);
         drop(self.coordinators);
         drop(self.readers);
+        drop(self.logs);
         let mut drains = FuturesUnordered::new();
         for actor in self.actors {
             drains.push(async move {

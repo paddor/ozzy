@@ -16,6 +16,7 @@ use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 mod clock;
 mod crash;
 mod delay;
+mod log;
 mod partition;
 mod runner;
 

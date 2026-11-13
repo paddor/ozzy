@@ -44,9 +44,17 @@ struct Bootstrap {
     done: bool,
 }
 
+/// One partition's log until the frontend binding installs it.
+struct LogInstall {
+    group: GroupId,
+    port: ozzy_runtime::log::LogPort,
+    lane: Option<ozzy_runtime::replica_actor::LogLane>,
+}
+
 struct State {
     actors: PartitionActors,
     natives: Vec<NativeIntake>,
+    logs: Vec<LogInstall>,
     coordinators: Vec<GroupCoordinator>,
     identities: Vec<(GroupId, ozzy_proto::PartitionIncarnation)>,
     bootstrap: Vec<Option<Bootstrap>>,
@@ -74,6 +82,8 @@ struct State {
     admin: Option<crate::admin::ShardLane>,
     /// This shard's reader grants, which the reader PUB admits by.
     grants: Option<ozzy_runtime::frontend::ShardGrants>,
+    /// Log handles by topic and partition number, until registration.
+    handles: Vec<(String, u32, ozzy_runtime::log::Log)>,
 }
 
 pub(super) async fn run(
@@ -93,6 +103,7 @@ pub(super) async fn run(
     let (senders, incoming) = open_lanes(shard.plan.id, &config)?;
     let mut state = Box::pin(build(&shard, &journals, config, incoming)).await?;
     let routes = state.route_states()?;
+    let logs = std::mem::take(&mut state.handles);
     let (serving, observed) = tokio::sync::watch::channel(false);
     let result = async {
         let (handoff, binding) = oneshot::channel();
@@ -104,6 +115,7 @@ pub(super) async fn run(
             data: senders.data,
             replica: senders.replica,
             routes,
+            logs,
             handoff,
         };
         tokio::select! {
@@ -120,6 +132,7 @@ pub(super) async fn run(
     }
     .await;
     drop(state.natives);
+    drop(state.logs);
     drop(state.coordinators);
     drop(state.bootstrap);
     drop(state.outbound);
@@ -186,12 +199,17 @@ impl State {
             .collect()
     }
 
-    /// Install the native intakes, coordinators, readers, and route publisher
-    /// on the frontend links of `binding`.
+    /// Install the native intakes, logs, coordinators, readers, and route
+    /// publisher on the frontend links of `binding`.
     fn install_services(&mut self, binding: &Binding) -> Result<(), StartupError> {
         for native in self.natives.drain(..) {
             self.actors
                 .install_native(native, binding.links.clone())
+                .map_err(failure)?;
+        }
+        for log in self.logs.drain(..) {
+            self.actors
+                .install_log(log.group, log.port, log.lane)
                 .map_err(failure)?;
         }
         for coordinator in self.coordinators.drain(..) {

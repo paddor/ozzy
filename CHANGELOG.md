@@ -1,5 +1,30 @@
 # Changelog
 
+## [Unreleased]
+
+### Breaking
+
+- `ozzy_core::state::StateError` has a new `OwnerAppendDisabled` variant,
+  and `ozzy_runtime::replica_journal::JournalError` a new `OwnerAppend`
+  variant.
+
+### Added
+
+- `Broker::log(topic, partition)` returns a `Log` handle for an embedder
+  that is a partition's only writer. `Log::append` adds a batch at the
+  offset the writer expects, in the view it leads. A batch at any other
+  offset fails with the partition's next offset, so the writer's later
+  batches in flight fail too. `Log::read` reads committed records by offset,
+  each with its append time. `Log::status` reports this broker's role and
+  view, the committed end, the end a new lead starts from, and the end at
+  the commit point its view was installed with. These batches name no producer and need a
+  partition without delay or deduplication.
+
+### Changed
+
+- Each partition takes a fourth proposal lane and five more arenas from its
+  journal pool for its log. Arenas allocate only when used.
+
 ## [0.11.1] - 2026-11-12
 
 ### Fixed

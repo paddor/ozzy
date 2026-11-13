@@ -216,6 +216,11 @@ impl CanonicalState {
                 .partitions
                 .get_mut(&cursor.partition)
                 .ok_or(StateError::UnknownPartition)?;
+            if cursor.producer.as_bytes() == &[0; 16] {
+                // An owner batch keeps no producer state.
+                state.next_offset = cursor.next_offset;
+                continue;
+            }
             let producer = state.producer_mut(cursor.producer)?;
             producer.evict_results(usize::from(cursor.evict));
             producer.record_assignment(

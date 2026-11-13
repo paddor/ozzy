@@ -218,6 +218,12 @@ impl OwnedJournal {
             return Err(JournalError::InstallationMismatch);
         }
         self.applied = ticket.committed();
+        let committed = candidate.committed_images().committed();
+        let ends = committed
+            .partitions()
+            .map(|(partition, state)| (partition, state.next_offset))
+            .collect();
+        self.installed_ends = Some((ticket.scope().view, ends));
         self.selected = Some(candidate);
         self.journal = JournalOwner::Ready(Box::new(journal));
         self.faulted = false;
@@ -225,6 +231,21 @@ impl OwnedJournal {
             ticket,
             applied: self.applied,
         })
+    }
+
+    /// The next offset of `partition` at the commit point `view` was
+    /// installed with. `None` when this journal did not install `view`, as
+    /// in a bootstrap view.
+    pub fn installed_end(
+        &self,
+        view: u64,
+        partition: ozzy_proto::PartitionIncarnation,
+    ) -> Option<ozzy_proto::Offset> {
+        let (installed, ends) = self.installed_ends.as_ref()?;
+        (*installed == view)
+            .then(|| ends.iter().find(|(known, _)| *known == partition))
+            .flatten()
+            .map(|&(_, end)| end)
     }
 
     /// Publish the whole-tail commit before exposing its canonical state. Recheck

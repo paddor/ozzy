@@ -21,6 +21,7 @@ mod faults;
 mod identities;
 mod idle_producers;
 mod native;
+mod owner;
 mod partition;
 mod producer_dedup;
 mod producer_session;

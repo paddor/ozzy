@@ -47,6 +47,8 @@ mod scheduled;
 mod startup;
 mod status;
 pub use scheduled::{ScheduleError, ScheduledReplica};
+mod log_service;
+pub use log_service::LogLane;
 mod partitions;
 pub use partitions::{
     PartitionActor, PartitionActors, PartitionError, PartitionStatus, SessionReplacement,

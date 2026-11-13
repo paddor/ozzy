@@ -4,6 +4,7 @@ mod assignment;
 mod body;
 pub(in crate::replica_journal) mod dedup;
 mod metadata;
+mod owner;
 mod producer;
 mod progress;
 mod release;
@@ -95,6 +96,8 @@ enum RequestKind {
     Canonical,
     Producer,
     Partition,
+    /// One producer-less APPEND batch from the partition's one writer.
+    Owner,
 }
 
 #[derive(Debug)]

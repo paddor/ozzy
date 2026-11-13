@@ -216,6 +216,13 @@ impl ShardJournal {
     ) -> Result<Option<super::PartitionFacts>, JournalError> {
         self.idle_owner()?.facts(partition)
     }
+    pub(super) fn installed_end(
+        &self,
+        view: u64,
+        partition: ozzy_proto::PartitionIncarnation,
+    ) -> Option<ozzy_proto::Offset> {
+        self.idle_owner().ok()?.installed_end(view, partition)
+    }
     /// The owner, unless a command holds it. A held owner is busy; the caller
     /// retries on its next turn.
     fn idle_owner(&self) -> Result<&OwnedJournal, JournalError> {

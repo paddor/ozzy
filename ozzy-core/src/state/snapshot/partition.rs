@@ -359,9 +359,12 @@ async fn validate_partition_cooperative(
     if value.owner_epoch.get() == 0
         || value.policy_revision == 0
         || value.retained_from > value.next_offset
+        // Records without a producer are owner batches, which a partition
+        // with delay or deduplication refuses.
         || (value.producers.is_empty()
             && value.next_offset != Offset::ZERO
-            && value.retired_epoch == 0)
+            && value.retired_epoch == 0
+            && (value.delay.is_some() || value.dedup_window_millis.is_some()))
     {
         return Err(StateSnapshotError::InvalidPartition);
     }

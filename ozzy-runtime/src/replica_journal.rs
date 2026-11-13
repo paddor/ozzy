@@ -56,7 +56,8 @@ pub use commands::Rejected;
 pub use history::{FetchedHistory, HistoryPosition, ReplicationPositions};
 pub use install::{InstallationConfig, InstalledChunk, InstalledJournal};
 pub use proposal::{
-    AppendAdmissionError, ProducerAppend, ProposalBuffer, ProposalDeferral, ProposalValidation,
+    AppendAdmissionError, OwnerAppendError, ProducerAppend, ProposalBuffer, ProposalDeferral,
+    ProposalValidation,
 };
 pub(crate) use read::PartitionReadBuffer;
 pub(crate) use read::delivery::ReadDelivery;
@@ -225,6 +226,11 @@ impl ReplicaJournal {
 
     pub(crate) const fn operation_limits(&self) -> OperationLimits {
         self.operations
+    }
+
+    /// Bounds of one proposal arena leased from this journal.
+    pub(crate) const fn append_limits(&self) -> PipelineLimits {
+        self.append_limits
     }
 
     pub(crate) fn available_command_slots(&self) -> usize {
