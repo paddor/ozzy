@@ -117,7 +117,7 @@ impl<'a> LaneRun<'a> {
     }
 
     /// The arrival plan of a paced lane.
-    fn plan(&self) -> Option<Plan> {
+    fn plan(&self) -> Option<&Plan> {
         self.arrivals.as_ref().map(Arrivals::plan)
     }
 
@@ -131,8 +131,8 @@ impl<'a> LaneRun<'a> {
 
     /// Confirm one delivery's offset and count its completion.
     fn observe(&mut self, delivery: Delivery) -> Result<()> {
-        let plan = self.plan();
-        observe(delivery, plan.as_ref(), &mut self.counts, &mut self.offsets)
+        let plan = self.arrivals.as_ref().map(Arrivals::plan);
+        observe(delivery, plan, &mut self.counts, &mut self.offsets)
     }
 
     /// Generate the next record and count its bytes.

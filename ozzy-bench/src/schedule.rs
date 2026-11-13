@@ -50,11 +50,7 @@ impl Load {
             }
         };
         Ok(Some(Schedule {
-            stages: [Stage {
-                rate,
-                start: 0,
-                first: 0,
-            }; MAX_STAGES],
+            stages: [Stage::new(rate, 0, 0); MAX_STAGES],
             count: 1,
             batch,
             period: period * 1_000_000,
@@ -161,18 +157,10 @@ impl Ramp {
 
     /// One arrival per ordinal. `warmup_ns` extends the first stage.
     pub fn plan(&self, warmup_ns: u64) -> BenchResult<Schedule> {
-        let mut stages = [Stage {
-            rate: self.0[0].0,
-            start: 0,
-            first: 0,
-        }; MAX_STAGES];
+        let mut stages = [Stage::new(self.0[0].0, 0, 0); MAX_STAGES];
         let (mut start, mut first) = (0_u64, 0_u64);
         for (index, (rate, ns)) in self.0.iter().enumerate() {
-            stages[index] = Stage {
-                rate: *rate,
-                start,
-                first,
-            };
+            stages[index] = Stage::new(*rate, start, first);
             let ns = if index == 0 { ns + warmup_ns } else { *ns };
             // Ordinals j with j * 1e9 / rate < ns, exactly.
             first = first
@@ -197,10 +185,27 @@ impl Ramp {
 #[derive(Debug, Clone, Copy)]
 struct Stage {
     rate: u64,
+    /// Exact whole-nanosecond step, or zero for a fractional arrival interval.
+    step_ns: u64,
     /// Stage start relative to the origin.
     start: u64,
     /// First arrival ordinal of the stage.
     first: u64,
+}
+
+impl Stage {
+    fn new(rate: u64, start: u64, first: u64) -> Self {
+        Self {
+            rate,
+            step_ns: if 1_000_000_000 % rate == 0 {
+                1_000_000_000 / rate
+            } else {
+                0
+            },
+            start,
+            first,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -214,16 +219,20 @@ pub struct Schedule {
 }
 
 impl Schedule {
-    fn relative(self, ordinal: u64) -> u128 {
+    fn relative(&self, ordinal: u64) -> u128 {
         // The first stage starts at ordinal zero, so it covers any ordinal
         // that no later stage reaches.
         let stage = self.stages[..self.count]
             .iter()
             .rfind(|stage| stage.first <= ordinal)
             .unwrap_or(&self.stages[0]);
-        let steady = u128::from(stage.start)
-            + u128::from(ordinal - stage.first) * self.batch as u128 * 1_000_000_000
-                / u128::from(stage.rate);
+        let records = u128::from(ordinal - stage.first) * self.batch as u128;
+        let elapsed = if stage.step_ns == 0 {
+            records * 1_000_000_000 / u128::from(stage.rate)
+        } else {
+            records * u128::from(stage.step_ns)
+        };
+        let steady = u128::from(stage.start) + elapsed;
         if self.active == self.period {
             return steady;
         }
@@ -232,14 +241,14 @@ impl Schedule {
     }
 
     /// Compute one batch arrival time from its global ordinal, rejecting clock overflow.
-    pub fn due(self, origin: u64, ordinal: u64) -> BenchResult<u64> {
+    pub fn due(&self, origin: u64, ordinal: u64) -> BenchResult<u64> {
         origin
             .checked_add(u64::try_from(self.relative(ordinal))?)
             .ok_or_else(|| bench_error("scheduled arrival clock overflow"))
     }
 
     /// Exact count in [origin, origin + duration), including integer rounding.
-    pub fn count(self, duration_ns: u64) -> BenchResult<usize> {
+    pub fn count(&self, duration_ns: u64) -> BenchResult<usize> {
         let (mut low, mut high) = (0_u64, u64::MAX);
         while low < high {
             let middle = low + (high - low) / 2;
@@ -380,6 +389,23 @@ mod tests {
         ] {
             assert!(text.parse::<Ramp>().is_err(), "accepted {text:?}");
         }
+    }
+
+    #[test]
+    fn fractional_and_integral_ramp_stages_keep_exact_arrivals() {
+        let ramp: Ramp = "7:1,1000000:1".parse().unwrap();
+        let plan = ramp.plan(1_000_000_000).unwrap();
+        for ordinal in 0..14 {
+            assert_eq!(plan.due(0, ordinal).unwrap(), ordinal * 1_000_000_000 / 7);
+        }
+        assert_eq!(plan.count(2_000_000_000).unwrap(), 14);
+        for ordinal in [14, 15, 1_000_013, 1_000_014] {
+            assert_eq!(
+                plan.due(0, ordinal).unwrap(),
+                2_000_000_000 + (ordinal - 14) * 1000
+            );
+        }
+        assert_eq!(plan.count(3_000_000_000).unwrap(), 1_000_014);
     }
 
     #[test]

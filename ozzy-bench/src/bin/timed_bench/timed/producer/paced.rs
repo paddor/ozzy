@@ -78,6 +78,7 @@ pub(super) async fn produce(
         // bytes, independently generated from the earliest copy's schedule.
         let event_clock = schedule
             .canonical
+            .as_ref()
             .map_or(Ok(start), |plan| plan.due(run.sequence))?;
         let input = run
             .lane
