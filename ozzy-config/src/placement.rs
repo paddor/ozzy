@@ -182,6 +182,48 @@ impl ValidatedDeployment {
         Ok(placements)
     }
 
+    /// Placement of the runtime log `id` on broker `name`. It depends only
+    /// on the ID and the broker's shards, so every broker computes the same
+    /// shard for each copy without exchanging it.
+    pub fn log_placement(
+        &self,
+        name: &str,
+        id: uuid::Uuid,
+    ) -> Result<PartitionPlacement, ConfigError> {
+        require(
+            self.deployment.logs.is_some(),
+            "logs",
+            "no runtime log class is configured",
+        )?;
+        let broker = self.deployment.broker(name)?;
+        let shards = self.broker_shards(name)?;
+        let index = xxhash_rust::xxh3::xxh3_64(id.as_bytes()) % shards.len().max(1) as u64;
+        let shard = shards
+            .get(index as usize)
+            .ok_or_else(|| invalid(name, "broker has no shards"))?;
+        let label = id.simple().to_string();
+        Ok(PartitionPlacement {
+            topic: format!("l-{label}"),
+            partition: 0,
+            retention: crate::TopicRetention::default(),
+            deduplication: None,
+            delay: None,
+            producer_idle_secs: crate::schema::default_producer_idle(),
+            shard: shard.id,
+            device: shard.device.clone(),
+            directory: broker.device(&shard.device)?.root.join("logs").join(label),
+        })
+    }
+
+    /// Application shard IDs of one configured broker, in configured order.
+    pub fn shard_ids(&self, name: &str) -> Result<Vec<u32>, ConfigError> {
+        Ok(self
+            .broker_shards(name)?
+            .iter()
+            .map(|shard| shard.id)
+            .collect())
+    }
+
     /// Application shards of one configured broker.
     fn broker_shards(&self, name: &str) -> Result<&[crate::Shard], ConfigError> {
         self.shards
@@ -214,13 +256,7 @@ impl ValidatedDeployment {
                 name,
                 "controller must reserve jobs and handles for every assigned shard",
             )?;
-            let max_append = self
-                .deployment
-                .topics
-                .values()
-                .map(|t| t.max_append_bytes)
-                .max()
-                .unwrap_or(0);
+            let max_append = self.deployment.max_append_bytes();
             require(
                 w.queued_bytes / count as u64 >= max_append && w.progress_bytes / count as u64 > 0,
                 name,

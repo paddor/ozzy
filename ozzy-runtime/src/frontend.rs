@@ -7,6 +7,9 @@
 mod routing;
 pub use routing::{Binding, Kind, Placement, Routed, RoutingError, RoutingTable};
 
+mod runtime_routes;
+pub use runtime_routes::{RuntimeRoute, RuntimeRoutes};
+
 mod dispatch;
 pub use dispatch::{DataPressure, Dispatcher, DispatcherLimits, Rejected, Rejection, SetupError};
 

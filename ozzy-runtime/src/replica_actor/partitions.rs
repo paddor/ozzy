@@ -18,12 +18,14 @@ use crate::frontend::Links;
 use wakeups::Wakeups;
 
 mod actor;
+mod membership;
 mod replication;
 mod services;
 mod wakeups;
 mod woken;
 
 pub use actor::{PartitionActor, PartitionStatus, SessionReplacement};
+pub use membership::Uninserted;
 
 /// One application shard's fixed actor set. No actor or journal threads/tasks
 /// are spawned here. All file futures use the actors' shared backend clients.
@@ -36,6 +38,8 @@ pub struct PartitionActors {
     logs: Vec<Option<super::log_service::LogService>>,
     recovered: VecDeque<GroupId>,
     index: BTreeMap<GroupId, usize>,
+    /// Most actors this shard may hold at once.
+    maximum: usize,
     turn_actors: usize,
     next: usize,
     remaining: usize,
@@ -83,6 +87,7 @@ impl PartitionActors {
             logs: actors.iter().map(|_| None).collect(),
             actors,
             index,
+            maximum,
             turn_actors,
             next: 0,
             remaining: 0,

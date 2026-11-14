@@ -29,7 +29,7 @@ fn logs(cluster: &broker::Cluster) -> Vec<Log> {
 }
 
 /// The broker that leads partition 0 in a view above `after`, and its status.
-async fn leader(logs: &[Log], after: Option<u64>) -> (usize, LogStatus) {
+pub(super) async fn leader(logs: &[Log], after: Option<u64>) -> (usize, LogStatus) {
     let mut statuses: Vec<_> = logs.iter().map(Log::status).collect();
     loop {
         for (index, status) in statuses.iter_mut().enumerate() {
@@ -46,13 +46,18 @@ async fn leader(logs: &[Log], after: Option<u64>) -> (usize, LogStatus) {
     }
 }
 
-async fn append(log: &Log, view: u64, at: u64, ids: &[u8]) -> Result<Appended, AppendError> {
+pub(super) async fn append(
+    log: &Log,
+    view: u64,
+    at: u64,
+    ids: &[u8],
+) -> Result<Appended, AppendError> {
     let records = ids.iter().map(|&id| record(id, b"body")).collect();
     log.append(view, Offset::new(at), records).unwrap().await
 }
 
 /// Every record from `from` to the committed end, read in small pieces.
-async fn read_all(log: &Log, from: u64, end: u64) -> Vec<StoredRecord> {
+pub(super) async fn read_all(log: &Log, from: u64, end: u64) -> Vec<StoredRecord> {
     let mut records = Vec::new();
     let mut next = from;
     while next < end {
@@ -71,7 +76,7 @@ async fn read_all(log: &Log, from: u64, end: u64) -> Vec<StoredRecord> {
 
 /// The leader takes pipelined appends at expected offsets, refuses others
 /// with the next offset or the current view, and reads them back.
-async fn appends_and_reads(logs: &[Log]) -> (usize, u64, u64) {
+pub(super) async fn appends_and_reads(logs: &[Log]) -> (usize, u64, u64) {
     let (index, status) = leader(logs, None).await;
     let lead = status.lead.unwrap();
     assert_eq!(lead.start_end, status.committed_end);

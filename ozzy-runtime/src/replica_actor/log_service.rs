@@ -113,6 +113,18 @@ pub(super) struct LogService {
     stepped_at: Option<Duration>,
 }
 
+/// A service that goes away, with its partition or its shard, leaves its
+/// handles a stopped log.
+impl Drop for LogService {
+    fn drop(&mut self) {
+        self.port.publish(LogStatus {
+            role: LogRole::Stopped,
+            lead: None,
+            ..self.port.published()
+        });
+    }
+}
+
 impl LogService {
     pub(super) fn new(port: LogPort, lane: Option<LogLane>) -> Self {
         Self {

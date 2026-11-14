@@ -388,6 +388,37 @@ and SDK reader inboxes. Three places use typed local queues instead:
   writer trims. Each copy then schedules a retention turn when it sees the
   floor move and retires the sealed segments wholly below it.
 
+## Runtime logs
+
+An embedder creates and deletes logs while the broker runs, with
+`Broker::create_log` and `Broker::delete_log`. A runtime log is one
+partition with one writer, reached only through its `Log` handle from
+`Broker::runtime_log`: it has no client intake, readers, or consumer groups.
+
+- The embedder orders creation and deletion across brokers and gives every
+  member the same spec: log ID, incarnation, and one or three members. Ozzy
+  keeps no cluster-wide catalog.
+- One member makes a single durable log on that broker alone. Three members
+  make a replicated group, which elects once two copies exist. A log never
+  changes between the two.
+- The log's shard on each broker follows from its ID and that broker's shard
+  list, so every broker knows where each copy lives without asking.
+- A command goes to the owning shard over a bounded queue. The shard records
+  the log, formats its store, starts its actor, and publishes its broker
+  route and handle. Storage steps run as shard jobs beside the partitions.
+- Deletion withdraws the route, takes the actor out of the shard, drains
+  it, and removes the store. Open requests end; the handle reports
+  `Stopped`. The record stays as a tombstone: an ID is formatted at most
+  once per broker.
+- At start a shard opens its recorded logs again, eight at a time, finishes
+  interrupted deletions, and discards creations that never finished.
+  `Broker::ready` waits for them. A recorded log that cannot open stops
+  the shard.
+- The `[logs]` class sets segment size, append bound, and the number of
+  logs per broker. A log keeps the sizes it was created with.
+- The dispatcher routes only broker traffic to a runtime log and holds no
+  leader observation of it. Followers check the view of every PREPARE.
+
 ## Shutdown and failure
 
 - `SIGINT`, `SIGTERM`, or `Broker::shutdown` stops the dispatcher and shards.

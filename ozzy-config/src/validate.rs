@@ -37,12 +37,8 @@ impl Deployment {
             ));
         }
         validate_topics(&self, &mut ids)?;
-        let max_append = self
-            .topics
-            .values()
-            .map(|t| t.max_append_bytes)
-            .max()
-            .unwrap_or(0);
+        validate_logs(&self)?;
+        let max_append = self.max_append_bytes();
         let mut endpoints = BTreeSet::new();
         let mut shards = BTreeMap::new();
         for (name, broker) in &self.brokers {
@@ -209,6 +205,39 @@ impl ValidatedDeployment {
                 % u64::from(config.partitions)) as u32,
         )
     }
+}
+
+/// The runtime log class obeys the size rules of a topic, and its logs
+/// share the partition bound with the configured topics.
+fn validate_logs(config: &Deployment) -> Result<(), ConfigError> {
+    let Some(logs) = config.logs else {
+        return Ok(());
+    };
+    let partitions = config
+        .topics
+        .values()
+        .map(|topic| topic.partitions as usize)
+        .sum::<usize>();
+    require(
+        logs.max_logs > 0
+            && partitions
+                .checked_add(logs.max_logs)
+                .is_some_and(|total| total <= config.limits.max_partitions),
+        "logs.max_logs",
+        "log count must be nonzero and fit max_partitions beside the topics",
+    )?;
+    require(
+        logs.max_append_bytes > 0 && logs.max_append_bytes <= MAX_APPEND_BYTES,
+        "logs.max_append_bytes",
+        "max_append_bytes must be at most 8 MiB",
+    )?;
+    require(
+        logs.segment_bytes >= 1024 * 1024
+            && logs.segment_bytes % 4096 == 0
+            && logs.max_append_bytes <= logs.segment_bytes / 2,
+        "logs.segment_bytes",
+        "segment must be aligned and leave framing space beyond max_append_bytes",
+    )
 }
 
 fn validate_topics(config: &Deployment, ids: &mut BTreeSet<Uuid>) -> Result<(), ConfigError> {

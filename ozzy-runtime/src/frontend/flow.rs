@@ -90,8 +90,7 @@ impl super::Service {
         if !self
             .dispatcher
             .routes
-            .partitions
-            .contains_key(&state.report.channel.scope.group_id)
+            .serves_brokers(state.report.channel.scope.group_id)
             || !self
                 .dispatcher
                 .peers

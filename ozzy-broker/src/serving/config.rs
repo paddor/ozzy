@@ -1,4 +1,6 @@
+mod logs;
 mod routes;
+pub(super) use logs::LogLane;
 
 use super::{Binding, Registration, failure};
 use crate::{CheckedConfig, StartupError, TransportLimits};
@@ -68,6 +70,13 @@ pub(super) struct Config {
     pub clock: frontend::ClockTrust,
     /// The monotonic origin of the clock guard's readings.
     pub clock_timer: super::context::Timer,
+    /// Broker routes of replicated runtime logs, shared with every shard.
+    pub runtime_routes: frontend::RuntimeRoutes,
+    /// Every runtime log of this broker and its state.
+    pub log_table: crate::logs::LogTable,
+    /// Each shard's log command lane: the broker handle's sender, and the
+    /// receiver until its shard takes it.
+    pub log_lanes: BTreeMap<u32, LogLane>,
     /// Broker peers whose traffic this simulated broker drops.
     #[cfg(feature = "simulation")]
     pub cut: super::context::CutPeers,
@@ -134,19 +143,15 @@ impl Config {
         let local = NodeId::from_bytes(*checked.identity.broker_id(&checked.plan.name)?.as_bytes());
         let clients = deployment.limits.max_clients;
         let limits = native_limits(checked)?;
-        let body = deployment
-            .topics
-            .values()
-            .map(|topic| topic.max_append_bytes as usize)
-            .max()
-            .ok_or_else(|| failure("no topics"))?;
+        let body = deployment.max_append_bytes() as usize;
         let envelope = ozzy_proto::EnvelopeLimits {
             max_metadata_bytes: 64 * 1024,
             max_payload_bytes: body,
         };
         require_follower_pub_endpoints(checked)?;
         let brokers = peer_endpoints(checked, local)?;
-        let followers = follower_routes(checked, local, &brokers)?;
+        let runtime_routes = frontend::RuntimeRoutes::default();
+        let followers = follower_routes(checked, local, &brokers, &runtime_routes)?;
         // SDK links, broker links, and repair links from each remote shard,
         // each with room for a replaced connection that still drains.
         let senders = clients + brokers.len() + followers.incoming.len();
@@ -181,6 +186,14 @@ impl Config {
             receipt_handles: ozzy_runtime::replica_actor::ReceiptHandles::default(),
             clock,
             clock_timer,
+            runtime_routes,
+            log_table: crate::logs::LogTable::default(),
+            log_lanes: checked
+                .plan
+                .shards
+                .iter()
+                .map(|shard| (shard.id, LogLane::new()))
+                .collect(),
             #[cfg(feature = "simulation")]
             cut,
         })
@@ -310,6 +323,7 @@ impl Config {
             .collect::<Vec<_>>();
         let ids = shards.iter().map(|shard| shard.id).collect::<Vec<_>>();
         frontend::RoutingTable::new(&ids, &placements, self.maximum_partitions, self.envelope)
+            .map(|table| table.with_runtime(self.runtime_routes.clone()))
             .map_err(failure)
     }
 

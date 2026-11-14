@@ -111,16 +111,20 @@ impl Service {
         if message.part_slice(0) != Some(scope.group_id.as_bytes().as_slice()) {
             return Err(PublicationError::Source);
         }
-        if self
-            .dispatcher
-            .routes
-            .partitions
-            .get(&scope.group_id)
-            .is_none_or(|placement| placement.shard != shard)
-        {
-            return Err(PublicationError::Destination);
+        let routes = &self.dispatcher.routes;
+        if let Some(placement) = routes.partitions.get(&scope.group_id) {
+            if placement.shard != shard {
+                return Err(PublicationError::Destination);
+            }
+            return self.check_leader(scope.group_id, scope.configuration_epoch, scope.view);
         }
-        self.check_leader(scope.group_id, scope.configuration_epoch, scope.view)
+        // No client watches a runtime log, so the dispatcher holds no leader
+        // observation of it. Its followers check the view of every PREPARE.
+        let runtime = routes.runtime.as_ref();
+        match runtime.and_then(|runtime| runtime.get(scope.group_id)) {
+            Some(route) if route.placement.shard == shard => Ok(()),
+            _ => Err(PublicationError::Destination),
+        }
     }
 
     fn check_records(

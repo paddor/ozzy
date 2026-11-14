@@ -109,6 +109,7 @@ impl ActorSettings {
         checked: &CheckedConfig,
         placement: &PartitionPlacement,
         config: &JournalConfig,
+        sharers: usize,
     ) -> Result<Self, StartupError> {
         let journal = ShardJournalConfig::default();
         // Unlimited retention still sweeps idle producer sessions, once per
@@ -135,7 +136,7 @@ impl ActorSettings {
             }
         };
         let pipeline = config.append_limits;
-        let replay_cache = replay_cache_limits(checked, placement, pipeline)?;
+        let replay_cache = replay_cache_limits(checked, placement, pipeline, sharers)?;
         let transfer = common_transfer(checked, pipeline)?;
         let data = data_queue(transfer)?;
         let installation = installation_config(config)?;
@@ -237,6 +238,7 @@ fn replay_cache_limits(
     checked: &CheckedConfig,
     placement: &PartitionPlacement,
     pipeline: PipelineLimits,
+    partitions_on_shard: usize,
 ) -> Result<PipelineLimits, StartupError> {
     let shard = checked
         .plan
@@ -244,12 +246,6 @@ fn replay_cache_limits(
         .iter()
         .find(|shard| shard.id == placement.shard)
         .ok_or_else(|| StartupError::Runtime("partition has no application shard".into()))?;
-    let partitions_on_shard = checked
-        .plan
-        .partitions
-        .iter()
-        .filter(|partition| partition.shard == placement.shard)
-        .count();
     if partitions_on_shard == 0 {
         return Err(StartupError::Runtime(
             "partition has no shard placement".into(),

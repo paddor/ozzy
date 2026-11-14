@@ -19,6 +19,7 @@ mod delay;
 mod log;
 mod partition;
 mod runner;
+mod runtime_logs;
 
 #[tokio::test(flavor = "current_thread")]
 async fn inproc_memory_all_modes_share_the_real_broker_and_sdk_harness() {

@@ -1,5 +1,5 @@
 use super::*;
-use crate::replica_actor::{PartitionActor, PartitionActors, PartitionStatus};
+use crate::replica_actor::{PartitionActor, PartitionActors, PartitionError, PartitionStatus};
 
 fn step(
     shards: &mut [PartitionActors],
@@ -609,4 +609,97 @@ fn close_set(controller: &mut Controller, actors: PartitionActors) {
         settle(controller, &[]);
     }
     panic!("partition drains did not finish");
+}
+
+/// A running shard takes a new group and commits on it beside the first.
+/// It refuses a second actor of a group and one past its bound. A removed
+/// group is unknown afterwards, and the group that moved into its slot
+/// keeps working.
+#[test]
+fn a_running_shard_takes_and_gives_up_partitions() {
+    for sweep in [None, Some(Duration::from_millis(100))] {
+        let (mut controller, io) = setup();
+        let (first, pending) = cluster(&mut controller, &io, 0);
+        let (second, added) = cluster(&mut controller, &io, 1);
+        let (third, _) = cluster(&mut controller, &io, 2);
+        let groups = [&first, &second].map(|actors| actors[0].status().scope.group_id);
+        let mut shards: Vec<_> = first
+            .into_iter()
+            .map(|actor| {
+                let shard =
+                    PartitionActors::new(vec![PartitionActor::Replicated(actor)], 2, 1).unwrap();
+                match sweep {
+                    Some(sweep) => shard.with_safety_sweep(sweep).unwrap(),
+                    None => shard,
+                }
+            })
+            .collect();
+        let mut routes = StepRoutes::default();
+        let mut now = Duration::ZERO;
+        let mut commit = |shards: &mut [PartitionActors], pending: PendingProposal| {
+            let mut pending = Box::pin(pending);
+            for _ in 0..10000 {
+                now += Duration::from_millis(1);
+                budgeted_step(shards, &mut routes, now, usize::MAX);
+                settle(&mut controller, &[]);
+                if let Poll::Ready(result) = poll(pending.as_mut()) {
+                    assert!(matches!(
+                        result.unwrap().outcome,
+                        ProposalOutcome::Committed { .. }
+                    ));
+                    return;
+                }
+            }
+            panic!("proposal did not commit");
+        };
+        commit(&mut shards, pending);
+        for (shard, actor) in shards.iter_mut().zip(second) {
+            shard.insert(PartitionActor::Replicated(actor)).unwrap();
+            assert_eq!(shard.len(), 2);
+        }
+        commit(&mut shards, added);
+        let mut refused = Vec::new();
+        for (shard, actor) in shards.iter_mut().zip(third) {
+            let full = shard.insert(PartitionActor::Replicated(actor)).unwrap_err();
+            assert!(matches!(full.error, PartitionError::Limits));
+            refused.push(full.actor);
+        }
+        let mut removed = Vec::new();
+        for shard in &mut shards {
+            removed.push(shard.remove(groups[0]).unwrap());
+            assert!(matches!(
+                shard.remove(groups[0]),
+                Err(PartitionError::Unknown)
+            ));
+            assert!(shard.status(groups[0]).is_none());
+            assert!(matches!(
+                shard.receive(groups[0], &Message::single("late"), now),
+                Err(PartitionError::Unknown)
+            ));
+            assert!(shard.status(groups[1]).is_some());
+        }
+        // The remaining group still elects and commits in its new slot.
+        for _ in 0..200 {
+            now += Duration::from_millis(1);
+            budgeted_step(&mut shards, &mut routes, now, usize::MAX);
+            settle(&mut controller, &[]);
+        }
+        for (shard, actor) in shards.iter_mut().zip(removed) {
+            shard.insert(actor).unwrap();
+            let twice = shard.remove(groups[0]).unwrap();
+            let PartitionActor::Replicated(actor) = twice else {
+                panic!("wrong authority");
+            };
+            close(&mut controller, actor);
+        }
+        for actor in refused {
+            let PartitionActor::Replicated(actor) = actor else {
+                panic!("wrong authority");
+            };
+            close(&mut controller, actor);
+        }
+        for shard in shards {
+            close_set(&mut controller, shard);
+        }
+    }
 }

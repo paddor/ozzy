@@ -35,18 +35,14 @@ pub(super) fn follower_routes(
     checked: &CheckedConfig,
     local: NodeId,
     brokers: &BTreeMap<NodeId, Endpoint>,
+    runtime: &ozzy_runtime::frontend::RuntimeRoutes,
 ) -> Result<crate::FollowerRoutes, StartupError> {
     let deployment = checked.deployment.deployment();
-    let mut followers = crate::FollowerRoutes::default();
-    for placement in &checked.plan.partitions {
-        let partition = checked
-            .identity
-            .partition(&placement.topic, placement.partition)?;
-        followers.local.insert(
-            ozzy_proto::GroupId::from_bytes(*partition.group.as_bytes()),
-            placement.shard,
-        );
-    }
+    let mut followers = crate::FollowerRoutes {
+        runtime: runtime.clone(),
+        ..crate::FollowerRoutes::default()
+    };
+    followers.local = local_placements(checked)?;
     for (name, id) in &checked.identity.brokers {
         let broker = NodeId::from_bytes(*id.as_bytes());
         if broker != local {
@@ -67,6 +63,11 @@ pub(super) fn follower_routes(
             followers
                 .publications
                 .insert(broker, endpoint.parse().map_err(failure)?);
+        }
+        if deployment.logs.is_some() {
+            followers
+                .shards
+                .insert(broker, checked.deployment.shard_ids(name)?);
         }
         for placement in checked.deployment.partition_placements(name)? {
             let partition = checked
@@ -94,6 +95,23 @@ pub(super) fn follower_routes(
         }
     }
     Ok(followers)
+}
+
+/// The shard of every configured partition on this broker.
+fn local_placements(
+    checked: &CheckedConfig,
+) -> Result<BTreeMap<ozzy_proto::GroupId, u32>, StartupError> {
+    let mut local = BTreeMap::new();
+    for placement in &checked.plan.partitions {
+        let partition = checked
+            .identity
+            .partition(&placement.topic, placement.partition)?;
+        local.insert(
+            ozzy_proto::GroupId::from_bytes(*partition.group.as_bytes()),
+            placement.shard,
+        );
+    }
+    Ok(local)
 }
 
 /// Replicated brokers each need an explicit follower PUB endpoint.

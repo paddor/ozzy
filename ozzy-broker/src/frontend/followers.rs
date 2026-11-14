@@ -50,9 +50,42 @@ pub struct FollowerRoutes {
     pub incoming: BTreeMap<NodeId, (NodeId, u32)>,
     /// Local partition placement checked before alias dispatch.
     pub local: BTreeMap<GroupId, u32>,
+    /// Every shard of each remote broker that may hold a runtime log.
+    pub shards: BTreeMap<NodeId, Vec<u32>>,
+    /// Placements of replicated runtime logs, here and on their members.
+    pub runtime: ozzy_runtime::frontend::RuntimeRoutes,
 }
 
 impl FollowerRoutes {
+    /// The local shard of `group`: a configured partition or a runtime log.
+    pub(crate) fn local_shard(&self, group: GroupId) -> Option<u32> {
+        self.local
+            .get(&group)
+            .copied()
+            .or_else(|| self.runtime.get(group).map(|route| route.placement.shard))
+    }
+
+    /// The shard of `group` on remote broker `peer`.
+    fn remote_shard(&self, peer: NodeId, group: GroupId) -> Option<u32> {
+        self.destinations
+            .get(&(peer, group))
+            .copied()
+            .or_else(|| self.runtime.remote_shard(peer, group))
+    }
+
+    /// Every remote shard a repair may address.
+    fn repair_targets(&self) -> std::collections::BTreeSet<(NodeId, u32)> {
+        let configured = self
+            .destinations
+            .iter()
+            .map(|(&(broker, _), &shard)| (broker, shard));
+        let runtime = self
+            .shards
+            .iter()
+            .flat_map(|(&broker, shards)| shards.iter().map(move |&shard| (broker, shard)));
+        configured.chain(runtime).collect()
+    }
+
     /// Stable transport label only. This does not authenticate a broker or vote.
     pub(crate) fn identity(from: NodeId, to: NodeId, shard: u32) -> NodeId {
         let mut bytes = Vec::with_capacity(64);
@@ -83,10 +116,7 @@ impl Followers {
         let options = frontend.limits.peer();
         let result =
             async {
-                for (&(broker, _), &shard) in &transport.routes.destinations {
-                    if transport.repair.contains_key(&(broker, shard)) {
-                        continue;
-                    }
+                for (broker, shard) in transport.routes.repair_targets() {
                     let identity = ozzy_runtime::transport::peer_identity(
                         FollowerRoutes::identity(frontend.local, broker, shard),
                     );
@@ -150,10 +180,7 @@ impl Followers {
             },
         )
         .ok()?;
-        Some((
-            peer,
-            *self.routes.destinations.get(&(peer, scope.group_id))?,
-        ))
+        Some((peer, self.routes.remote_shard(peer, scope.group_id)?))
     }
 
     pub(super) fn send(

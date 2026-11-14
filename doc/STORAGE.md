@@ -46,6 +46,20 @@ Metadata temporaries are `.MANIFEST.<generation>.tmp`,
 - Partitions keep independent histories and recovery. A shared device is still
   a shared failure and bandwidth domain.
 
+A runtime log's store has the same layout in `<device-root>/logs/<id>/`,
+named by its log ID in hex. Beside it, `<id>.record` is the broker's
+record of the log: IDs, members, store, class sizes, and state.
+
+| State | Meaning at start |
+| --- | --- |
+| `creating` | The store may be partial. It never served: store and record are removed |
+| `ready` | The store is opened |
+| `deleting` | The store, or `<id>.trash/` after its rename, is removed |
+| `deleted` | Tombstone. The ID is never formatted here again |
+
+A record is replaced through `<id>.staged`: written, synced, renamed, and
+the directory synced.
+
 ## Volumes and exclusive ownership
 
 - Each device root holds a checksummed `OZZY_VOLUME` marker binding cluster,

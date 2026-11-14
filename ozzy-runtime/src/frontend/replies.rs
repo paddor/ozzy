@@ -72,8 +72,7 @@ impl Dispatcher {
                 };
                 if !self
                     .routes
-                    .partitions
-                    .contains_key(&state.report.channel.scope.group_id)
+                    .serves_brokers(state.report.channel.scope.group_id)
                     || !peer.outgoing_channels.bind(state)
                 {
                     return Err((ReplyError::Session, message));

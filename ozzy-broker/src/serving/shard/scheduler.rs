@@ -39,6 +39,7 @@ impl State {
         // Send what the visits queued in this turn, not at the next wakeup.
         self.outbound.poll(cx, &mut binding.port, now)?;
         self.install_recovered(binding)?;
+        self.poll_logs(cx, binding, now)?;
         self.poll_bootstrap(cx)?;
         // Installed once the frontend binding exists; startup turns have none.
         if let Some(publisher) = &mut self.publisher {
@@ -91,7 +92,7 @@ impl State {
         (0..count.min(16)).map(move |offset| (first + offset) % count)
     }
 
-    fn sync_group(
+    pub(super) fn sync_group(
         &mut self,
         group: GroupId,
         binding: &Binding,
@@ -204,6 +205,13 @@ impl State {
                 .bind_receive_owner(&self.replica_memory)
                 .map_err(failure)?;
             actor.enable_publication();
+            if index >= self.fixed {
+                // A runtime log has a log service only.
+                let (bootstrap, lane) = super::build::recovered_log(actor, plan)?;
+                self.actors.attach_log_lane(group, lane).map_err(failure)?;
+                self.bootstrap[index] = Some(bootstrap);
+                continue;
+            }
             let super::build::RecoveredServices {
                 bootstrap,
                 native,
@@ -252,9 +260,11 @@ impl State {
 
     /// Every local partition accepts client work here or knows its remote leader.
     pub(super) fn serving(&self) -> bool {
-        self.identities
-            .iter()
-            .all(|&(group, partition)| self.client_ready(group, partition))
+        self.logs_settled()
+            && self
+                .identities
+                .iter()
+                .all(|&(group, partition)| self.client_ready(group, partition))
     }
 
     /// The partition finished its bootstrap here, or a remote leader serves it.

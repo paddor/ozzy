@@ -67,14 +67,15 @@ impl std::fmt::Debug for RoutePublisher {
 }
 
 impl RoutePublisher {
-    /// Exactly one checked incarnation per shard actor. Initial member order
+    /// One checked incarnation per watched shard actor; the shard may hold
+    /// further actors that no client watches. Initial member order
     /// and configuration epochs come from the actors, not caller leader guesses.
     pub fn new(
         actors: &PartitionActors,
         identities: &[(GroupId, PartitionIncarnation)],
         turn: usize,
     ) -> Result<Self, RoutePublicationError> {
-        if identities.len() != actors.len() || turn == 0 || turn > 1024 {
+        if identities.len() > actors.len() || turn == 0 || turn > 1024 {
             return Err(RoutePublicationError::Configuration);
         }
         let mut groups = BTreeSet::new();

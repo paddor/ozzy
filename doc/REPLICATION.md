@@ -17,6 +17,9 @@ terms.
 - The leader of view `v` is `brokers[v % 3]` in the persisted member order.
   Only an election activates it. `init` rotates the order per partition to
   spread leaders.
+- A runtime log names its own members: one broker makes it single durable
+  on that broker, three make it a group of its own. Brokers that are not
+  members hold no copy and drop its traffic.
 - One remaining broker never confirms. There is no forced promotion, lower
   quorum, or discard of confirmed history.
 - `CONFIGURATION` (256 bytes replicated, 128 bytes single durable) binds group

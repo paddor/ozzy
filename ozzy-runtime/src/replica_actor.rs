@@ -52,6 +52,7 @@ pub use log_service::LogLane;
 mod partitions;
 pub use partitions::{
     PartitionActor, PartitionActors, PartitionError, PartitionStatus, SessionReplacement,
+    Uninserted,
 };
 mod routes;
 pub use routes::{RoutePublicationError, RoutePublisher};

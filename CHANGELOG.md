@@ -11,6 +11,9 @@
   `ozzy_runtime::replica_journal::PartitionFacts` a new `operation_floor`
   field.
 
+- `ozzy_config::Deployment` has a new `logs` field, and
+  `ozzy_broker::FollowerRoutes` new `shards` and `runtime` fields.
+
 ### Added
 
 - `Broker::log(topic, partition)` returns a `Log` handle for an embedder
@@ -36,6 +39,20 @@
   retention policy, each copy then retires its sealed segments that hold
   no record at or above the floor. Before, such a partition never freed
   a segment.
+
+- `Broker::create_log(spec)` and `Broker::delete_log(id)` create and
+  delete a log while the broker runs; `Broker::logs` lists them and
+  `Broker::runtime_log(id)` returns the `Log` handle. A spec names the
+  log's ID, incarnation, and one or three member brokers: one member makes
+  a single durable log on that broker, also in a three-broker deployment.
+  The embedder gives every member the same spec. Each broker records its
+  logs beside their stores, opens them again at start, and keeps a deleted
+  log's record so its ID is never formatted twice. The new `[logs]` table
+  sets the class: `max_logs`, `segment_bytes`, `max_append_bytes`.
+- `PartitionActors::insert` and `remove` add and take a partition actor on
+  a running shard. `RoutingTable::with_runtime` routes broker traffic to
+  the logs a shared `RuntimeRoutes` names.
+- A `Log` handle reports `Stopped` once its log service is gone.
 
 ### Changed
 

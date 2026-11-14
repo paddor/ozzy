@@ -69,6 +69,27 @@ impl Wakeups {
         }
     }
 
+    /// Marks for one more partition, set so it gets its first visit.
+    pub(super) fn grow(&mut self) {
+        let woken = Arc::new(Woken::new(self.shard.clone()));
+        self.wakers.push(Waker::from(woken.clone()));
+        self.woken.push(woken);
+        self.refused.push(false);
+        self.deadlines.push(None);
+        self.stalled.push(false);
+        self.shard.wake();
+    }
+
+    /// Drop the marks of `slot`. The last partition takes the slot, as in
+    /// the actor list.
+    pub(super) fn swap_remove(&mut self, slot: usize) {
+        self.woken.swap_remove(slot);
+        self.wakers.swap_remove(slot);
+        self.refused.swap_remove(slot);
+        self.deadlines.swap_remove(slot);
+        self.stalled.swap_remove(slot);
+    }
+
     /// Something other than the sweep calls for a visit.
     fn due(&self, slot: usize, now: Duration) -> bool {
         self.woken[slot].is_set()

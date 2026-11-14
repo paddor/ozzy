@@ -7,6 +7,7 @@ pub(crate) use context::CutPeers;
 pub use context::ServingContext;
 pub(crate) use context::{Alarm, Timer};
 mod drain;
+mod logs;
 mod outbound;
 mod shard;
 
@@ -34,6 +35,7 @@ pub struct Broker {
     devices: DeviceDrain,
     registered: Registered,
     clock: ozzy_runtime::frontend::ClockTrust,
+    logs: logs::LogHandles,
 }
 
 /// What the shards handed over at registration.
@@ -166,12 +168,9 @@ impl Broker {
         context: ServingContext,
         storage: ShardStorage<B, impl StorageOwner>,
     ) -> Result<Self, StartupError> {
-        let mut config = config::Config::new(&checked, context)?;
-        let clock = config.time.sdk_clock();
-        let admin = Admin::bind(&checked, &config.omq, config.local, config.clients, clock)?;
-        config.admin = admin.as_ref().map(Admin::hooks);
-        let config = Arc::new(config);
+        let (config, admin) = bound_config(&checked, context)?;
         let checked = Arc::new(checked);
+        let logs = config.log_handles(journals.logs.clone());
         let shards = checked.plan.shards.len();
         let (application_start, frontend_start) = startup_groups(shards);
         let devices = DeviceDrain::new(
@@ -211,6 +210,7 @@ impl Broker {
                     devices,
                     registered,
                     clock: config.clock.clone(),
+                    logs,
                 });
             }
             (Err(error), Err(_)) => error,
@@ -297,6 +297,19 @@ impl Broker {
         drain.request();
         async move { drain.closed().await }
     }
+}
+
+/// The serving configuration with the admin endpoint bound, when the
+/// deployment has one.
+fn bound_config(
+    checked: &CheckedConfig,
+    context: ServingContext,
+) -> Result<(Arc<config::Config>, Option<Admin>), StartupError> {
+    let mut config = config::Config::new(checked, context)?;
+    let clock = config.time.sdk_clock();
+    let admin = Admin::bind(checked, &config.omq, config.local, config.clients, clock)?;
+    config.admin = admin.as_ref().map(Admin::hooks);
+    Ok((Arc::new(config), admin))
 }
 
 /// Wait for every shard to register, then start the dispatcher. Its service

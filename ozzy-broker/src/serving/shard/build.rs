@@ -7,6 +7,9 @@ use super::{
 use ozzy_runtime::replica_actor::PartitionActor;
 use std::time::Duration;
 
+mod recovered;
+pub(super) use recovered::{RecoveredServices, recovered_log, recovered_services};
+
 pub(super) async fn build(
     shard: &ShardContext,
     journals: &JournalPlan,
@@ -31,8 +34,10 @@ pub(super) async fn build(
         identities,
         ..
     } = opening;
-    let routes = routing(shard.plan.id, &identities, config.envelope)?;
-    let actors = scheduled(actors, identities.len())?;
+    let routes = routing(shard.plan.id, &identities, &config)?;
+    let runtime = runtime_logs(shard, journals, &config)?;
+    let fixed = identities.len();
+    let actors = scheduled(actors, fixed + log_capacity(journals))?;
     let indices = identities
         .iter()
         .enumerate()
@@ -61,14 +66,53 @@ pub(super) async fn build(
         outbound: outbound(&config),
         indices,
         group_cursor: 0,
-        admin: config
-            .admin
-            .as_ref()
-            .map(|admin| crate::admin::ShardLane::connect(&config.omq, admin, shard.plan.id))
-            .transpose()?,
+        admin: admin_lane(&config, shard.plan.id)?,
         grants: config.reader_grants.shard(shard.plan.id),
+        shard: shard.plan.id,
+        io: shard.io.clone(),
+        fixed,
+        runtime,
         config,
     })
+}
+
+/// The shard's lane to the admin owner, when one runs.
+fn admin_lane(
+    config: &Config,
+    shard: u32,
+) -> Result<Option<crate::admin::ShardLane>, StartupError> {
+    config
+        .admin
+        .as_ref()
+        .map(|admin| crate::admin::ShardLane::connect(&config.omq, admin, shard))
+        .transpose()
+}
+
+/// Runtime logs the shard must have room for beside its partitions.
+fn log_capacity(journals: &JournalPlan) -> usize {
+    journals.logs.as_ref().map_or(0, |logs| logs.class.max_logs)
+}
+
+/// The shard's runtime log state, when the deployment has a log class.
+fn runtime_logs(
+    shard: &ShardContext,
+    journals: &JournalPlan,
+    config: &Config,
+) -> Result<Option<super::logs::RuntimeLogs>, StartupError> {
+    let Some(setup) = &journals.logs else {
+        return Ok(None);
+    };
+    let commands = config
+        .take_log_commands(shard.plan.id)
+        .ok_or_else(|| failure("shard without a log command lane"))?;
+    super::logs::RuntimeLogs::new(
+        setup.clone(),
+        &shard.plan.device,
+        commands,
+        config,
+        &shard.io,
+    )
+    .map(Some)
 }
 
 /// Opens the shard's partitions. Holds the services opened so far, in
@@ -275,7 +319,7 @@ fn outbound(config: &Config) -> Outbound {
 fn routing(
     shard: u32,
     identities: &[(GroupId, ozzy_proto::PartitionIncarnation)],
-    envelope: ozzy_proto::EnvelopeLimits,
+    config: &Config,
 ) -> Result<frontend::RoutingTable, StartupError> {
     let placements = identities
         .iter()
@@ -285,8 +329,14 @@ fn routing(
             shard,
         })
         .collect::<Vec<_>>();
-    frontend::RoutingTable::new(&[shard], &placements, identities.len().max(1), envelope)
-        .map_err(failure)
+    frontend::RoutingTable::new(
+        &[shard],
+        &placements,
+        identities.len().max(1),
+        config.envelope,
+    )
+    .map(|table| table.with_runtime(config.runtime_routes.clone()))
+    .map_err(failure)
 }
 
 fn profile(config: &JournalConfig) -> (Policy, usize, GroupId) {
@@ -341,62 +391,6 @@ async fn open_recovery(
         ActorIds::random(config.receipt_handles.clone()),
         config.journal_clock(),
     )
-}
-
-pub(super) fn recovered_services(
-    actor: &mut ozzy_runtime::replica_actor::PartitionActor,
-    plan: &crate::PartitionJournal,
-    config: &Config,
-    data_memory: &ozzy_runtime::memory::Owner,
-    control: &ozzy_runtime::memory::Owner,
-) -> Result<RecoveredServices, StartupError> {
-    let (policy, body_bytes, group) = profile(&plan.config);
-    let crate::ActorSettings::Replicated {
-        actor: settings, ..
-    } = &plan.actors
-    else {
-        return Err(failure("recovered services require replicated settings"));
-    };
-    let limits = settings.transfer;
-    let mut buffer = actor
-        .lease_proposal_buffer_with_limits(limits)
-        .map_err(failure)?;
-    crate::actors::prepare_partition(&mut buffer, plan.cluster, &plan.placement, plan.incarnation)?;
-    let submitter = actor
-        .take_submitter()
-        .ok_or_else(|| failure("missing recovered bootstrap lane"))?;
-    let native = native_intake(
-        actor,
-        native_config(config, plan, group, policy),
-        data_memory,
-        control,
-    )?;
-    let coordinator = coordinator_service(actor, config, plan, &topologies(config)?, control)?;
-    let lane = ozzy_runtime::replica_actor::LogLane::new(
-        actor,
-        super::super::config::log_limits(body_bytes),
-    )
-    .map_err(failure)?;
-    Ok(RecoveredServices {
-        bootstrap: Bootstrap {
-            group,
-            submitter,
-            buffer: Some(buffer),
-            pending: None,
-            done: false,
-        },
-        native,
-        coordinator,
-        lane,
-    })
-}
-
-/// The services a partition gets back when it rejoins after recovery.
-pub(super) struct RecoveredServices {
-    pub(super) bootstrap: Bootstrap,
-    pub(super) native: NativeIntake,
-    pub(super) coordinator: GroupCoordinator,
-    pub(super) lane: ozzy_runtime::replica_actor::LogLane,
 }
 
 /// Immutable topic shapes shared by every coordinator of a topic.

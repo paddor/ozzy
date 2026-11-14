@@ -1,4 +1,5 @@
 mod build;
+mod logs;
 mod scheduler;
 use build::build;
 
@@ -84,6 +85,14 @@ struct State {
     grants: Option<ozzy_runtime::frontend::ShardGrants>,
     /// Log handles by topic and partition number, until registration.
     handles: Vec<(String, u32, ozzy_runtime::log::Log)>,
+    /// This shard's ID and its lane to the device.
+    shard: u32,
+    io: ozzy_io::Local,
+    /// Configured partitions: the first entries of `identities`. Runtime
+    /// logs follow them.
+    fixed: usize,
+    /// Runtime logs, when the deployment has a log class.
+    runtime: Option<logs::RuntimeLogs>,
 }
 
 pub(super) async fn run(
@@ -187,9 +196,10 @@ fn open_lanes(id: u32, config: &Config) -> Result<(LaneSenders, [DataReceiver; 4
 }
 
 impl State {
-    /// Each partition's route state, in partition order, for the frontend.
+    /// Each configured partition's route state, in partition order, for
+    /// the frontend.
     fn route_states(&self) -> Result<Vec<ozzy_proto::directory::RouteState>, StartupError> {
-        self.identities
+        self.identities[..self.fixed]
             .iter()
             .map(|&(group, partition)| {
                 self.actors
@@ -217,7 +227,7 @@ impl State {
                 .install_coordinator(coordinator, binding.links.clone())
                 .map_err(failure)?;
         }
-        for (index, &(group, partition)) in self.identities.iter().enumerate() {
+        for (index, &(group, partition)) in self.identities[..self.fixed].iter().enumerate() {
             if self.bootstrap[index].is_none() {
                 continue;
             }
@@ -234,8 +244,10 @@ impl State {
                 )
                 .map_err(failure)?;
         }
-        self.publisher =
-            Some(RoutePublisher::new(&self.actors, &self.identities, 16).map_err(failure)?);
+        self.publisher = Some(
+            RoutePublisher::new(&self.actors, &self.identities[..self.fixed], 16)
+                .map_err(failure)?,
+        );
         Ok(())
     }
 
@@ -254,8 +266,7 @@ impl State {
         let Some(admin) = &self.admin else {
             return;
         };
-        let rows = self
-            .identities
+        let rows = self.identities[..self.fixed]
             .iter()
             .filter_map(|&(group, partition)| {
                 let status = self.actors.status(group)?;

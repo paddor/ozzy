@@ -365,3 +365,65 @@ fn routing_class_does_not_validate_broker_payload_or_allow_legacy_prepare() {
         Err(RoutingError::Broker(wire::WireError::Payload))
     ));
 }
+
+/// A table with runtime routes sends broker traffic to a log created at
+/// run time, on this table's shards only, until its route is withdrawn.
+/// Clients never reach such a log over a link.
+#[test]
+fn runtime_logs_route_broker_traffic_until_their_route_is_withdrawn() {
+    use crate::frontend::{RuntimeRoute, RuntimeRoutes};
+    let fixed = placement(0, 7);
+    let log = placement(1, 7);
+    let elsewhere = placement(2, 8);
+    let runtime = RuntimeRoutes::default();
+    let table = RoutingTable::new(&[7], &[fixed], 1, EnvelopeLimits::default())
+        .unwrap()
+        .with_runtime(runtime.clone());
+    let broker = binding(Kind::Broker);
+    let unknown = |message: &Message, binding| {
+        matches!(table.route(message, binding), Err(RoutingError::Partition))
+    };
+    assert!(unknown(&control(log, broker), broker));
+    let route = |placement| RuntimeRoute {
+        placement,
+        remote: [
+            (NodeId::from_bytes([8; 16]), 3),
+            (NodeId::from_bytes([9; 16]), 4),
+        ],
+    };
+    assert!(runtime.insert(route(log)));
+    assert!(runtime.insert(route(elsewhere)));
+    // Neither a second route of a group nor a reused incarnation replaces one.
+    assert!(!runtime.insert(route(Placement { shard: 9, ..log })));
+    assert!(!runtime.insert(route(Placement {
+        group: GroupId::from_bytes([99; 16]),
+        ..log
+    })));
+    assert_eq!(runtime.len(), 2);
+    assert_eq!(
+        table
+            .route(&control(log, broker), broker)
+            .unwrap()
+            .placement,
+        log
+    );
+    assert_eq!(
+        table
+            .route(&control(fixed, broker), broker)
+            .unwrap()
+            .placement,
+        fixed
+    );
+    assert!(unknown(&control(elsewhere, broker), broker));
+    let client = binding(Kind::Client);
+    assert!(unknown(&append(log, client), client));
+    assert_eq!(
+        runtime.remote_shard(NodeId::from_bytes([9; 16]), log.group),
+        Some(4)
+    );
+    assert_eq!(runtime.remote_shard(broker.peer, log.group), None);
+    assert!(runtime.remove(log.group));
+    assert!(!runtime.remove(log.group));
+    assert!(unknown(&control(log, broker), broker));
+    assert!(!runtime.is_empty());
+}

@@ -230,7 +230,7 @@ impl<'a> Ingress<'a> {
             let Ok(scope) = ozzy_replication::wire::route(packet, service.envelope_limits()) else {
                 return Ok(None);
             };
-            if followers.local.get(&scope.group_id) != Some(&shard) {
+            if followers.local_shard(scope.group_id) != Some(shard) {
                 return Ok(None);
             }
             message.pop_front_payload();

@@ -17,6 +17,25 @@ pub struct Deployment {
     pub brokers: BTreeMap<String, Broker>,
     /// Named topic policies and partition counts.
     pub topics: BTreeMap<String, Topic>,
+    /// The class of logs an embedder creates while the broker runs. Omitted
+    /// refuses every such log.
+    pub logs: Option<LogClass>,
+}
+
+/// One class for every log created at run time. Such a log has one
+/// partition, one writer, and no retention policy, deduplication or delay
+/// of its own. The class is fixed while any of its logs exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogClass {
+    /// Maximum physical bytes per segment file.
+    #[serde(default = "default_log_segment_bytes")]
+    pub segment_bytes: u64,
+    /// Maximum canonical append body.
+    #[serde(default = "default_log_append_bytes")]
+    pub max_append_bytes: u64,
+    /// Logs one broker may hold at once.
+    pub max_logs: usize,
 }
 
 /// Deployment authority, independent of local topology.
@@ -203,7 +222,7 @@ const fn default_dedup_window() -> u64 {
     300_000
 }
 
-const fn default_producer_idle() -> u64 {
+pub(crate) const fn default_producer_idle() -> u64 {
     7 * 24 * 60 * 60
 }
 
@@ -238,6 +257,14 @@ const fn default_segment_bytes() -> u64 {
 
 const fn default_append_bytes() -> u64 {
     MAX_APPEND_BYTES
+}
+
+const fn default_log_segment_bytes() -> u64 {
+    4 * 1024 * 1024
+}
+
+const fn default_log_append_bytes() -> u64 {
+    1024 * 1024
 }
 
 /// Ozzy-owned CPU affinity. OS identifiers, not hwloc logical indexes.

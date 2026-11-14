@@ -69,6 +69,7 @@ labels. Field names and enum values are fixed.
 | `[topics.NAME.retention]` | `max_age_secs`, `max_bytes` (unset: keep all) |
 | `[topics.NAME.deduplication]` | `window_millis` (300000), `max_entries`, `max_bytes` |
 | `[topics.NAME.delay]` | `max_secs`, `max_entries` (100000) |
+| `[logs]` | `max_logs`, `segment_bytes` (4 MiB), `max_append_bytes` (1 MiB) |
 
 The rustdoc of each field in `src/schema.rs` lists the rest, including
 `workers` and shard `budget` defaults.
@@ -105,6 +106,9 @@ says what each mode confirms.
 - One device gets one shard by default. Several devices need explicit `shards`.
 - `segment_bytes` is at least 1 MiB, a multiple of 4096, and at least twice
   `max_append_bytes`. `max_append_bytes` is at most 8 MiB.
+- `[logs]` is the class of every log an embedder creates at run time. Its
+  sizes follow the topic rules, and `max_logs` plus the configured
+  partitions fit `max_partitions`. Without the table a broker creates none.
 - `producer_idle_secs` is positive. A producer session with no open or append
   that long retires; resuming its identity starts fresh sequences.
 - Shard and device byte budgets must cover the largest `max_append_bytes`.

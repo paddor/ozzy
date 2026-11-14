@@ -101,7 +101,7 @@ fn preflight(journals: &JournalPlan) -> Result<(), StartupError> {
     Ok(())
 }
 
-async fn initialize_directory(
+pub(crate) async fn initialize_directory(
     io: &ozzy_io::Local,
     path: &std::path::Path,
 ) -> Result<(), StartupError> {
