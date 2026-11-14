@@ -423,6 +423,13 @@ impl ReplicaJournal {
         self.execution.held_load_wanted()
     }
 
+    /// The committed record floor of a partition without a retention
+    /// policy, once its owner trimmed it. `None` while the owner runs a
+    /// command.
+    pub(crate) fn owner_floor(&self) -> Option<ozzy_proto::Offset> {
+        self.execution.owner_floor()
+    }
+
     /// Time until the earliest committed held record is due, by the journal
     /// clock, or zero while a carry is pending. `None` while nothing is held
     /// or the owner runs a command.

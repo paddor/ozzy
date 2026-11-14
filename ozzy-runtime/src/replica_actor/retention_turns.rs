@@ -14,6 +14,8 @@ pub(super) struct RetentionDue {
     /// A turn reported retention disabled; a repeated step enables it again.
     enabled: bool,
     identities: bool,
+    /// The highest floor seen that the partition's owner trimmed to.
+    trimmed: ozzy_proto::Offset,
 }
 
 /// The retention work to start now.
@@ -32,6 +34,16 @@ impl RetentionDue {
             schedule: interval.map(|interval| Periodic::new(interval, ())),
             enabled: true,
             identities: false,
+            trimmed: ozzy_proto::Offset::ZERO,
+        }
+    }
+
+    /// The partition's owner trimmed past the last floor seen: its
+    /// segments below `floor` can retire, so a turn is due now.
+    pub(super) fn observe_floor(&mut self, floor: Option<ozzy_proto::Offset>, now: Duration) {
+        if let Some(floor) = floor.filter(|floor| *floor > self.trimmed) {
+            self.trimmed = floor;
+            self.repeat(now);
         }
     }
 

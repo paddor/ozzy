@@ -175,6 +175,21 @@ impl ProposalBuffer {
         Ok(())
     }
 
+    /// Freeze the one `trim` of a partition's only writer into an empty
+    /// arena. Validation admits it only in the view `authority` names.
+    pub(crate) fn prepare_owner_trim(
+        &mut self,
+        authority: ozzy_proto::append::Authority,
+        trim: ozzy_journal::operation::Trim,
+        limits: ozzy_journal::operation::OperationLimits,
+    ) -> Result<(), JournalError> {
+        let body = ozzy_journal::operation::OperationBody::Trim(trim);
+        let bytes = ozzy_journal::operation::encode_operation_body(&body, limits)?;
+        self.push(body.kind(), &bytes)?;
+        self.0.proposal_authority = Some(authority);
+        Ok(())
+    }
+
     /// The leader's timestamp on the one owner batch, once validated.
     pub(crate) fn owner_timestamp(&self) -> Option<u64> {
         self.0.owner_timestamp()

@@ -212,6 +212,7 @@ impl ReplicaDriver {
             InstallOutcome::ViewChanging(changing) => Role::ViewChanging(changing),
         };
         self.contact_deadline = now.saturating_add(self.timing.primary_timeout);
+        self.backup_heard_at = now;
         self.persistence_deadline = now.saturating_add(self.timing.primary_timeout);
         self.progress_deadline = now.saturating_add(self.progress_timeout());
         self.election_deadline = now.saturating_add(self.election_delay);

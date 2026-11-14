@@ -120,7 +120,10 @@ impl ReplicaDriver {
                 }
                 self.contact_deadline = now.saturating_add(self.timing.primary_timeout);
             }
-            Control::PrepareOk { ack, .. } => normal.receive_ack(from, ack)?,
+            Control::PrepareOk { ack, .. } => {
+                normal.receive_ack(from, ack)?;
+                self.backup_heard_at = now;
+            }
             Control::StartView(start) => {
                 normal.observe_installed_start(from, start)?;
                 self.contact_deadline = now.saturating_add(self.timing.primary_timeout);

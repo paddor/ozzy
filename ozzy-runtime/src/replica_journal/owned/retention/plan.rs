@@ -18,6 +18,9 @@ struct Retained {
     /// First operation of the oldest segment holding a record the last
     /// committed release and carry left.
     held: Option<u64>,
+    /// The floor, when the partition has no policy and its owner trimmed
+    /// it: segments wholly below it retire.
+    trimmed: Option<Offset>,
 }
 
 impl OwnedJournal {
@@ -46,13 +49,15 @@ impl OwnedJournal {
             ozzy_core::retention::Kept {
                 committed_operation: ticket.applied().op.0,
                 held_operation: retained.held,
+                trimmed: retained.trimmed,
             },
             maximum_segments,
         )?;
         Ok(Some((retained.partition, plan)))
     }
 
-    /// The journal's only partition, when its policy limits retention.
+    /// The journal's only partition, when its policy limits retention or
+    /// its owner trimmed it.
     fn retained_partition(&self) -> Result<Option<Retained>, JournalError> {
         let mut partitions = self.images()?.committed().partitions();
         let Some((partition, state)) = partitions.next() else {
@@ -62,7 +67,8 @@ impl OwnedJournal {
             return Err(JournalError::Configuration);
         }
         let policy = state.retention;
-        if policy.max_age_millis.is_none() && policy.max_bytes.is_none() {
+        let trimmed = owner_trimmed(state);
+        if trimmed.is_none() && policy.max_age_millis.is_none() && policy.max_bytes.is_none() {
             return Ok(None);
         }
         Ok(Some(Retained {
@@ -70,6 +76,7 @@ impl OwnedJournal {
             policy,
             floor: state.retained_from,
             end: state.next_offset,
+            trimmed,
             held: match &state.delay {
                 Some(delay) => self
                     .held
@@ -79,6 +86,12 @@ impl OwnedJournal {
                 None => None,
             },
         }))
+    }
+
+    /// The committed record floor of a partition its owner trimmed.
+    pub(in crate::replica_journal) fn owner_floor(&self) -> Option<Offset> {
+        let (_, state) = self.images.as_ref()?.committed().partitions().next()?;
+        owner_trimmed(state)
     }
 
     /// Summaries of every selected segment. Reads at most
@@ -206,6 +219,21 @@ impl OwnedJournal {
         }
         Ok((!buffer.is_empty()).then_some(buffer))
     }
+}
+
+/// The floor of a partition its one writer trimmed: it takes owner batches
+/// (no delay, no deduplication), holds no producer session, has no
+/// retention policy, and its floor moved. Only such a partition retires
+/// segments by its floor alone.
+fn owner_trimmed(state: &ozzy_core::state::CanonicalPartition) -> Option<Offset> {
+    let policy = state.retention;
+    (policy.max_age_millis.is_none()
+        && policy.max_bytes.is_none()
+        && state.delay.is_none()
+        && state.dedup_window_millis.is_none()
+        && state.producers().next().is_none()
+        && state.retained_from > Offset::ZERO)
+        .then_some(state.retained_from)
 }
 
 pub(super) fn push(

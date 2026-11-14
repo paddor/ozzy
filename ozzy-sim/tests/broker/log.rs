@@ -5,7 +5,8 @@
 use super::*;
 use bytes::Bytes;
 use ozzy_broker::log::{
-    AppendError, Appended, Log, LogRecord, LogRole, LogStatus, StoredRecord, SubmitError,
+    AppendError, Appended, Log, LogRecord, LogRole, LogStatus, ReadError, StepDownError,
+    StoredRecord, SubmitError, TrimError,
 };
 use ozzy_proto::{MessageId, Offset};
 
@@ -203,4 +204,190 @@ async fn owner_log_moves_to_a_new_leader_at_the_committed_end() {
     })
     .await
     .expect("owner log failover made no bounded progress");
+}
+
+/// A leader that hears neither follower reports doubt and refuses appends,
+/// though both still hear it and keep its view. When they reach it again
+/// it leads the same term on.
+#[tokio::test(flavor = "current_thread")]
+async fn owner_log_leader_doubts_while_no_follower_answers() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let cluster = broker::Cluster::configured(DeploymentMode::Three, None, |config| {
+            config.topics.get_mut("orders").unwrap().retention =
+                ozzy_config::TopicRetention::default();
+        })
+        .await;
+        let logs = logs(&cluster);
+        let (index, view, end) = appends_and_reads(&logs).await;
+        let log = &logs[index];
+        let lead = log.status().borrow().lead;
+        let followers = (0..3).filter(|&other| other != index);
+        for other in followers.clone() {
+            cluster.cut_one_way(other, index, true);
+        }
+        let mut status = log.status();
+        let doubt = *status
+            .wait_for(|status| status.role != LogRole::Leader)
+            .await
+            .unwrap();
+        assert_eq!(
+            (doubt.role, doubt.view, doubt.lead),
+            (LogRole::Doubt, view, lead)
+        );
+        assert_eq!(
+            append(log, view, end, &[7]).await,
+            Err(AppendError::NotLeader)
+        );
+        // Committed records stay readable.
+        assert_eq!(read_all(log, 0, end).await.len() as u64, end);
+        for other in followers {
+            cluster.cut_one_way(other, index, false);
+        }
+        let again = *status
+            .wait_for(|status| status.role != LogRole::Doubt)
+            .await
+            .unwrap();
+        assert_eq!(
+            (again.role, again.view, again.lead),
+            (LogRole::Leader, view, lead)
+        );
+        let appended = append(log, view, end, &[7]).await.unwrap();
+        assert_eq!(appended.end.get(), end + 1);
+        cluster.shutdown().await;
+    })
+    .await
+    .expect("owner log doubt made no bounded progress");
+}
+
+/// The leader hands the log to the follower it names. Requests for another
+/// view, for itself, or right after the last one are refused.
+#[tokio::test(flavor = "current_thread")]
+async fn owner_log_steps_down_to_the_named_follower() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let cluster = broker::Cluster::configured(DeploymentMode::Three, None, |config| {
+            config.topics.get_mut("orders").unwrap().retention =
+                ozzy_config::TopicRetention::default();
+        })
+        .await;
+        let logs = logs(&cluster);
+        let (index, view, end) = appends_and_reads(&logs).await;
+        let log = &logs[index];
+        let step =
+            |log: &Log, view, target: usize| log.step_down(view, cluster.node(target)).unwrap();
+        assert_eq!(
+            step(log, view + 1, (index + 1) % 3).await,
+            Err(StepDownError::View {
+                named: view + 1,
+                current: view
+            })
+        );
+        assert_eq!(step(log, view, index).await, Err(StepDownError::Target));
+        let follower = (index + 2) % 3;
+        assert_eq!(
+            step(&logs[follower], view, index).await,
+            Err(StepDownError::NotLeader)
+        );
+        // An append queued ahead of the step-down commits first.
+        let last = log
+            .append(view, Offset::new(end), vec![record(8, b"last")])
+            .unwrap();
+        let next_view = step(log, view, follower).await.unwrap();
+        assert!(next_view > view && next_view <= view + 2);
+        assert_eq!(last.await.unwrap().end.get(), end + 1);
+        let (next, status) = leader(&logs, Some(view)).await;
+        assert_eq!((next, status.view), (follower, next_view));
+        assert_eq!(status.lead.unwrap().start_end.get(), end + 1);
+        assert_eq!(
+            step(&logs[next], next_view, index).await,
+            Ok(next_view + if (index + 3 - next) % 3 == 1 { 1 } else { 2 })
+        );
+        let (back, status) = leader(&logs, Some(next_view)).await;
+        assert_eq!(back, index);
+        // This log stepped down less than a second ago.
+        assert_eq!(
+            step(&logs[back], status.view, follower).await,
+            Err(StepDownError::Limited)
+        );
+        cluster.shutdown().await;
+    })
+    .await
+    .expect("owner log step-down made no bounded progress");
+}
+
+/// The leader trims at the floor it expects, in every mode. The status
+/// shows the new floor, reads below it name it, and the next leader starts
+/// from it.
+#[tokio::test(flavor = "current_thread")]
+async fn owner_log_trims_forward_from_the_expected_floor() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        for mode in [DeploymentMode::Single, DeploymentMode::Three] {
+            let mut cluster = broker::Cluster::configured(mode, None, |config| {
+                config.topics.get_mut("orders").unwrap().retention =
+                    ozzy_config::TopicRetention::default();
+            })
+            .await;
+            let all = logs(&cluster);
+            let (index, view, end) = appends_and_reads(&all).await;
+            let log = &all[index];
+            let trim = |log: &Log, view, expected, floor| {
+                log.trim(view, Offset::new(expected), Offset::new(floor))
+                    .unwrap()
+            };
+            assert_eq!(
+                trim(log, view, 1, 2).await,
+                Err(TrimError::Floor {
+                    current: Offset::ZERO
+                })
+            );
+            assert_eq!(trim(log, view, 0, 0).await, Err(TrimError::Invalid));
+            assert_eq!(trim(log, view, 0, end + 1).await, Err(TrimError::Invalid));
+            assert_eq!(
+                trim(log, view + 1, 0, 2).await,
+                Err(TrimError::View {
+                    named: view + 1,
+                    current: view
+                })
+            );
+            assert_eq!(trim(log, view, 0, 2).await, Ok(()));
+            let mut status = log.status();
+            status
+                .wait_for(|status| status.retained_from.get() == 2)
+                .await
+                .unwrap();
+            assert_eq!(
+                log.read(Offset::new(1), Offset::new(end), 8, 1024)
+                    .unwrap()
+                    .await,
+                Err(ReadError::Gap {
+                    earliest: Offset::new(2)
+                })
+            );
+            assert_eq!(read_all(log, 2, end).await.len() as u64, end - 2);
+            // The log may be trimmed to its end.
+            assert_eq!(trim(log, view, 2, end).await, Ok(()));
+            let appended = append(log, view, end, &[7]).await.unwrap();
+            assert_eq!(appended.end.get(), end + 1);
+            if mode == DeploymentMode::Three {
+                for (other, log) in all.iter().enumerate().filter(|&(other, _)| other != index) {
+                    assert_eq!(
+                        trim(log, view, end, end + 1).await,
+                        Err(TrimError::NotLeader),
+                        "broker {other} does not lead"
+                    );
+                }
+                let image = cluster.stop(index).await;
+                let survivors = logs(&cluster);
+                let (next, status) = leader(&survivors, Some(view)).await;
+                assert_eq!(status.retained_from.get(), end);
+                assert_eq!(
+                    trim(&survivors[next], status.view, end, end + 1).await,
+                    Ok(())
+                );
+                cluster.restore(index, image).await;
+            }
+            cluster.shutdown().await;
+        }
+    })
+    .await
+    .expect("owner log trim made no bounded progress");
 }

@@ -381,9 +381,12 @@ and SDK reader inboxes. Three places use typed local queues instead:
 - Storage jobs. Shards submit jobs to a backend and receive completions over
   bounded rings. The backend's fixed workers share its file table.
 - Embedder logs. A `Log` handle from `Broker::log` sends owned requests
-  (record batches, reads) over one bounded queue per partition. The shard
-  polls it under the partition's waker and answers on one-shot channels;
-  the partition's role goes out on a watch channel.
+  (record batches, reads, trims, step-downs) over one bounded queue per
+  partition. The shard polls it under the partition's waker and answers
+  on one-shot channels; the partition's role goes out on a watch channel.
+  A partition without a retention policy keeps every segment until its
+  writer trims. Each copy then schedules a retention turn when it sees the
+  floor move and retires the sealed segments wholly below it.
 
 ## Shutdown and failure
 

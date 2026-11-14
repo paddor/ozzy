@@ -198,3 +198,104 @@ fn owner_batches_survive_power_loss_and_replay_without_producers() {
     read(&mut controller, &mut journal, &driver, 5);
     drive(&mut controller, journal.shutdown()).unwrap();
 }
+
+/// Commit the owner's trim from `expected` to `floor`.
+fn trim(
+    controller: &mut Controller,
+    journal: &mut OwnedJournal,
+    driver: &mut Driver,
+    (expected, floor): (u64, u64),
+) {
+    let operation_floor = journal.images().unwrap().committed().operation_floor();
+    let mut buffer = journal.lease_proposal_buffer().unwrap();
+    buffer
+        .prepare_owner_trim(
+            authority(driver),
+            ozzy_journal::operation::Trim {
+                partition: partition(),
+                expected_floor: Offset::new(expected),
+                new_floor: Offset::new(floor),
+                expected_operation_floor: operation_floor,
+                new_operation_floor: operation_floor,
+                operation_id: OperationId::from_bytes([floor as u8 + 1; 16]),
+            },
+            local_config().limits.operations,
+        )
+        .unwrap();
+    let receipt = admit(controller, journal, driver, buffer);
+    write(controller, journal, driver, receipt);
+    sync_apply(controller, journal, driver);
+}
+
+/// Run retention turns, their proposals and their jobs until none is owed.
+/// Turns take their operation IDs from `first_id` on.
+fn retain(
+    controller: &mut Controller,
+    journal: &mut OwnedJournal,
+    driver: &mut Driver,
+    first_id: u8,
+) {
+    for turn in 0..16u8 {
+        let ticket = driver.begin_validation().unwrap();
+        let seed = OperationId::from_bytes([first_id + turn; 16]);
+        let result = drive(
+            controller,
+            journal.retention_turn(ticket, 999.into(), seed, true),
+        )
+        .unwrap();
+        if let Some(proposal) = result.proposal {
+            let receipt = admit(controller, journal, driver, proposal);
+            write(controller, journal, driver, receipt);
+            sync_apply(controller, journal, driver);
+        }
+        super::retention::run_retention_jobs(controller, journal);
+        if !result.more_work {
+            return;
+        }
+    }
+    panic!("retention never settled");
+}
+
+fn segments(journal: &OwnedJournal) -> usize {
+    journal.journal.ready().unwrap().manifest().segments.len()
+}
+
+/// A partition without a retention policy keeps every segment until its
+/// owner trims. Then each sealed segment whose records all lie below the
+/// floor retires; one that reaches past the floor stays, as does the
+/// segment being written.
+#[test]
+fn an_owner_trim_retires_the_sealed_segments_below_its_floor() {
+    let (mut controller, io) = setup();
+    let (mut journal, mut driver) = owner_journal(&mut controller, io);
+    for first in [0, 2, 4, 6] {
+        let batch = owned(&journal, authority(&driver), first, first as u8 + 1, 2);
+        let receipt = admit(&mut controller, &mut journal, &mut driver, batch);
+        write(&mut controller, &mut journal, &mut driver, receipt);
+        sync_apply(&mut controller, &mut journal, &mut driver);
+        if first < 6 {
+            super::retention::roll(&mut controller, &mut journal);
+        }
+    }
+    assert_eq!(segments(&journal), 4);
+    retain(&mut controller, &mut journal, &mut driver, 100);
+    assert_eq!((segments(&journal), journal.owner_floor()), (4, None));
+
+    // Offset 3 lies in the second segment, so only the first one goes.
+    trim(&mut controller, &mut journal, &mut driver, (0, 3));
+    assert_eq!(journal.owner_floor(), Some(Offset::new(3)));
+    retain(&mut controller, &mut journal, &mut driver, 120);
+    assert_eq!(segments(&journal), 3);
+
+    // The whole log is trimmed: the sealed segments go, the active stays.
+    trim(&mut controller, &mut journal, &mut driver, (3, 8));
+    retain(&mut controller, &mut journal, &mut driver, 140);
+    assert_eq!(segments(&journal), 1);
+    let committed = journal.images().unwrap().committed();
+    let state = committed.partition(partition()).unwrap();
+    assert_eq!(
+        (state.retained_from, state.next_offset),
+        (Offset::new(8), Offset::new(8))
+    );
+    drive(&mut controller, journal.shutdown()).unwrap();
+}

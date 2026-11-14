@@ -203,6 +203,9 @@ impl ReplicaActor {
             return Ok(());
         }
         self.observe_storage(now)?;
+        self.maintenance
+            .retention
+            .observe_floor(self.journal.owner_floor(), now);
         // At most four fixed controls (eight destinations), one history chunk,
         // and one disk submission per iteration. Each chunk has byte/count bounds.
         for _ in 0..4 {

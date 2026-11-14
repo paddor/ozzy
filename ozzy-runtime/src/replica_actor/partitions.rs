@@ -282,7 +282,7 @@ impl PartitionActors {
                 .map_err(|source| PartitionError::Native { group, source })?;
         }
         if let Some(log) = &mut self.logs[slot] {
-            changed |= log.poll(&mut self.actors[slot], cx);
+            changed |= log.poll(&mut self.actors[slot], cx, now);
         }
         let Some(native) = &mut self.native[slot] else {
             return Ok(changed);

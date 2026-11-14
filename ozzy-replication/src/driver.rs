@@ -14,6 +14,7 @@ mod exit_view;
 mod installation;
 mod poll;
 mod receive;
+mod step_down;
 mod storage;
 mod validation;
 
@@ -112,6 +113,8 @@ pub struct ReplicaDriver {
     timing: Timing,
     now: Duration,
     contact_deadline: Duration,
+    /// When a backup of this view last acknowledged, or when the role began.
+    backup_heard_at: Duration,
     progress_deadline: Duration,
     persistence_deadline: Duration,
     /// When busy local storage last completed work; `None` while idle.
@@ -192,6 +195,7 @@ impl ReplicaDriver {
             timing,
             now,
             contact_deadline: now.saturating_add(timing.primary_timeout),
+            backup_heard_at: now,
             persistence_deadline: now.saturating_add(timing.primary_timeout),
             storage_busy_since: None,
             progress_deadline: now

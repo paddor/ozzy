@@ -320,6 +320,23 @@ impl ScheduledReplica {
         self.actor.driver.scope().group_id
     }
 
+    /// Hand the group to `target`: leave the view this ready primary leads
+    /// for the next one `target` leads. `None` while work is uncommitted.
+    pub(in crate::replica_actor) fn step_down(
+        &mut self,
+        target: NodeId,
+    ) -> Result<Option<u64>, ozzy_replication::driver::DriverError> {
+        let view = self.actor.driver.step_down(target, self.now)?;
+        // The next visit runs the election this started.
+        self.actor.more_work |= view.is_some();
+        Ok(view)
+    }
+
+    /// Whether this ready primary heard no backup for the primary timeout.
+    pub(in crate::replica_actor) fn leader_doubt(&self) -> bool {
+        self.actor.driver.primary_doubt()
+    }
+
     /// Current per-partition route, including proposed leader changes. This is
     /// a routing hint. Only actor validation and activation permit admission.
     pub fn authority_hint(&self) -> ozzy_proto::nack::AuthorityHint {

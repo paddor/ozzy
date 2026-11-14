@@ -3,8 +3,13 @@
 //! records back by offset. Handles work from any thread. The partition's
 //! shard runs the service behind them.
 
+mod trim;
+
+pub use trim::TrimError;
+pub(crate) use trim::TrimRequest;
+
 use bytes::Bytes;
-use ozzy_proto::{MessageId, Offset, PartitionIncarnation};
+use ozzy_proto::{MessageId, NodeId, Offset, PartitionIncarnation};
 use smallvec::SmallVec;
 use std::future::Future;
 use std::pin::Pin;
@@ -45,7 +50,8 @@ pub struct Appended {
     pub time_millis: u64,
 }
 
-/// Why an append did not commit. Every one but `Busy` at submission ends
+/// Why an append did not commit. Every one but `NotLeader` in doubt or
+/// during a step-down that then fails ends
 /// the writer's term: its later appends fail too, so it rebuilds from the
 /// log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -65,7 +71,7 @@ pub enum AppendError {
         /// View this broker last observed.
         current: u64,
     },
-    /// This broker does not lead the log now.
+    /// This broker does not lead the log now, or it leads in doubt.
     #[error("this broker does not lead the log")]
     NotLeader,
     /// The view changed after admission. The batch may or may not be in
@@ -133,6 +139,36 @@ pub enum ReadError {
     Stopped,
 }
 
+/// Why a step-down did not start a view change. The term goes on unless
+/// the status says otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum StepDownError {
+    /// The request names another view than the one this broker leads.
+    #[error("step-down names view {named}, the log is in view {current}")]
+    View {
+        /// View the request named.
+        named: u64,
+        /// View this broker leads.
+        current: u64,
+    },
+    /// This broker does not lead the log now.
+    #[error("this broker does not lead the log")]
+    NotLeader,
+    /// The target is this broker or holds no copy of the log.
+    #[error("target cannot lead the log")]
+    Target,
+    /// Accepted records did not commit within the wait.
+    #[error("uncommitted records remained")]
+    Busy,
+    /// Another step-down runs or started less than a second ago.
+    #[error("step-down is rate limited")]
+    Limited,
+    /// The service or its partition stopped.
+    #[error("log stopped")]
+    Stopped,
+}
+
 /// A request the service did not take.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
@@ -158,6 +194,11 @@ pub enum SubmitError {
 pub enum LogRole {
     /// It leads the view and admits appends.
     Leader,
+    /// It leads the view but heard no follower for the primary timeout, so
+    /// nothing it admits could commit. Appends fail with `NotLeader`. The
+    /// term goes on: when a follower of the view answers, the role returns
+    /// to `Leader` and the writer continues at its first refused offset.
+    Doubt,
     /// Another broker leads the view.
     Follower,
     /// A view change is in progress.
@@ -191,7 +232,7 @@ pub struct LogStatus {
     pub committed_end: Offset,
     /// Retained floor, as of the last leader observation.
     pub retained_from: Offset,
-    /// Present while `role` is `Leader`.
+    /// Present while `role` is `Leader` or `Doubt`.
     pub lead: Option<Lead>,
 }
 
@@ -253,9 +294,18 @@ pub(crate) struct ReadRequest {
 }
 
 #[derive(Debug)]
+pub(crate) struct StepDownRequest {
+    pub(crate) view: u64,
+    pub(crate) target: NodeId,
+    pub(crate) reply: oneshot::Sender<Result<u64, StepDownError>>,
+}
+
+#[derive(Debug)]
 pub(crate) enum Command {
     Append(AppendRequest),
     Read(ReadRequest),
+    StepDown(StepDownRequest),
+    Trim(TrimRequest),
 }
 
 /// Handle to one partition's log. Cheap to clone; usable from any thread.
@@ -382,6 +432,33 @@ impl Log {
         Ok(Pending(pending))
     }
 
+    /// Hand the log to `target`, another broker holding a copy. The leader
+    /// of `view` stops taking appends, waits up to a second for accepted
+    /// records to commit, then starts a view change to the next view
+    /// `target` leads, which the reply names. `target` leads once it
+    /// installs that view; the status of its log shows it. At most one
+    /// step-down starts per second.
+    ///
+    /// # Errors
+    ///
+    /// `Busy` when the queue is full, `Stopped` after the service ends.
+    pub fn step_down(
+        &self,
+        view: u64,
+        target: NodeId,
+    ) -> Result<Pending<u64, StepDownError>, SubmitError> {
+        let (reply, pending) = oneshot::channel();
+        self.submit(
+            Command::StepDown(StepDownRequest {
+                view,
+                target,
+                reply,
+            }),
+            0,
+        )?;
+        Ok(Pending(pending))
+    }
+
     fn submit(&self, command: Command, bytes: usize) -> Result<(), SubmitError> {
         // A failed reservation is undone below, so the service never sees
         // more than the limit. Relaxed: the counter guards no other memory.
@@ -462,5 +539,13 @@ impl Future for Pending<ReadBatch, ReadError> {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.poll_reply(cx, ReadError::Stopped)
+    }
+}
+
+impl Future for Pending<u64, StepDownError> {
+    type Output = Result<u64, StepDownError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.poll_reply(cx, StepDownError::Stopped)
     }
 }

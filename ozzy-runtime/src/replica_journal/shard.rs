@@ -275,6 +275,11 @@ impl ShardJournal {
     pub(super) fn release_wait(&self) -> Option<u64> {
         (self.state.as_ref()?.owner).release_wait(&self.timestamp)
     }
+    /// The floor the partition's owner trimmed to. A command holding the
+    /// owner hides it until the owner returns.
+    pub(super) fn owner_floor(&self) -> Option<ozzy_proto::Offset> {
+        self.state.as_ref()?.owner.owner_floor()
+    }
     /// Whether the copy wants a held-row load beside writes. A command
     /// holding the owner hides it until the owner returns.
     pub(super) fn held_load_wanted(&self) -> bool {

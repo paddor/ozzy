@@ -17,6 +17,7 @@ const fn kept(committed_operation: u64, held_operation: Option<u64>) -> Kept {
     Kept {
         committed_operation,
         held_operation,
+        trimmed: None,
     }
 }
 
@@ -142,4 +143,47 @@ fn without_a_trusted_time_only_the_byte_target_retires() {
     let paused = Plan::select(&segments, sized, None, kept(12, None), 8).unwrap();
     assert_eq!(paused.retire, vec![1]);
     assert!(!paused.roll_active);
+}
+
+/// Without a target, a sealed committed segment retires once every record
+/// in it lies below the floor its owner trimmed to. A segment that reaches
+/// past the floor stays, with everything after it.
+#[test]
+fn an_owner_trim_retires_only_segments_wholly_below_its_floor() {
+    let policy = RetentionPolicy {
+        max_age_millis: None,
+        max_bytes: None,
+    };
+    let segment = |id, sealed, last_operation, record_end| Segment {
+        id,
+        capacity: 1024,
+        sealed,
+        last_operation,
+        record_end: Offset::new(record_end),
+        newest_append_millis: Some(id),
+    };
+    let segments = [
+        segment(1, true, 10, 4),
+        segment(2, true, 20, 8),
+        segment(3, true, 30, 12),
+        segment(4, false, 40, 16),
+    ];
+    let plan = |floor: Option<u64>, committed| {
+        let kept = Kept {
+            trimmed: floor.map(Offset::new),
+            ..kept(committed, None)
+        };
+        Plan::select(&segments, policy, Some(1_000_000), kept, 4).unwrap()
+    };
+    assert_eq!(plan(None, 40).retire, [] as [u64; 0]);
+    assert_eq!(plan(Some(3), 40).retire, [] as [u64; 0]);
+    let two = plan(Some(11), 40);
+    assert_eq!(two.retire, [1, 2]);
+    assert_eq!(
+        (two.record_floor, two.operation_floor),
+        (Offset::new(8), 21)
+    );
+    assert_eq!(plan(Some(16), 40).retire, [1, 2, 3]);
+    // An uncommitted segment stays whatever the floor.
+    assert_eq!(plan(Some(16), 15).retire, [1]);
 }

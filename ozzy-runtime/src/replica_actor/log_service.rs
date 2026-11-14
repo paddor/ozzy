@@ -6,6 +6,8 @@
 
 mod appends;
 mod reads;
+mod step_down;
+mod trims;
 
 use super::{ActorError, PartitionActor, PartitionStatus, ProposalSubmitter};
 use crate::log::{Command, LogLimits, LogPort, LogRole, LogStatus};
@@ -14,6 +16,7 @@ use futures::task::AtomicWaker;
 use ozzy_replication::{JournalGeneration, PipelineLimits, Scope};
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 /// Requests one poll takes from the channel at most.
 const TURN_COMMANDS: usize = 16;
@@ -27,6 +30,7 @@ pub struct LogLane {
     reads: PartitionReadBuffer,
     read_limits: PartitionReadLimits,
     max_records: usize,
+    operations: ozzy_journal::operation::OperationLimits,
 }
 
 impl LogLane {
@@ -69,6 +73,7 @@ impl LogLane {
             reads,
             read_limits,
             max_records: operation.max_records,
+            operations: operation,
         })
     }
 }
@@ -81,6 +86,17 @@ struct Term {
     generation: JournalGeneration,
 }
 
+impl Term {
+    /// The authority a proposal of this term names.
+    const fn authority(self) -> ozzy_proto::append::Authority {
+        ozzy_proto::append::Authority {
+            group_id: self.scope.group_id,
+            config_epoch: self.scope.configuration_epoch,
+            view: self.scope.view,
+        }
+    }
+}
+
 /// One log on one partition: its port, the lane of the current actor, and
 /// the work in flight.
 #[derive(Debug)]
@@ -91,6 +107,10 @@ pub(super) struct LogService {
     waiting: Option<Command>,
     appends: Vec<appends::Flight>,
     read: Option<reads::Reading>,
+    trim: Option<trims::TrimFlight>,
+    stepping: Option<step_down::Stepping>,
+    /// When the last step-down started its view change.
+    stepped_at: Option<Duration>,
 }
 
 impl LogService {
@@ -102,6 +122,9 @@ impl LogService {
             waiting: None,
             appends: Vec::new(),
             read: None,
+            trim: None,
+            stepping: None,
+            stepped_at: None,
         }
     }
 
@@ -116,7 +139,11 @@ impl LogService {
         self.lane = None;
         self.term = None;
         self.read = None;
+        self.refuse_step_down(crate::log::StepDownError::NotLeader);
         for flight in self.appends.drain(..) {
+            flight.unknown();
+        }
+        if let Some(flight) = self.trim.take() {
             flight.unknown();
         }
         self.port.publish(LogStatus {
@@ -126,20 +153,33 @@ impl LogService {
         });
     }
 
-    pub(super) fn poll(&mut self, actor: &mut PartitionActor, cx: &mut Context<'_>) -> bool {
+    pub(super) fn poll(
+        &mut self,
+        actor: &mut PartitionActor,
+        cx: &mut Context<'_>,
+        now: Duration,
+    ) -> bool {
         let mut progress = self.observe(actor);
         progress |= self.finish_appends(cx);
+        progress |= self.finish_trim(cx);
+        progress |= self.poll_step_down(actor, now);
         progress |= self.poll_read(actor, cx);
-        progress |= self.take_commands(cx);
+        progress |= self.take_commands(actor, cx, now);
         progress
     }
 
     /// Follow the partition's role. A ready primary opens a term at the
-    /// committed end; anything else ends it.
+    /// committed end and leads it in doubt while no follower answers;
+    /// anything else ends it.
     fn observe(&mut self, actor: &mut PartitionActor) -> bool {
         let status = actor.status();
         let (_, local, _) = actor.native_identity();
         let primary = actor.authority_hint().primary;
+        let role = if actor.leader_doubt() {
+            LogRole::Doubt
+        } else {
+            LogRole::Leader
+        };
         let Some((ticket, journal)) = actor.read_access() else {
             return self.lose(LogRole::Electing, self.port.published().view);
         };
@@ -163,7 +203,10 @@ impl LogService {
             generation: ticket.generation(),
         };
         if self.term == Some(term) {
-            return false;
+            // Doubt comes and goes within the term.
+            let published = self.port.published();
+            self.port.publish(LogStatus { role, ..published });
+            return role != published.role;
         }
         let Ok(Some(cursor)) = journal.open_reader(ticket, self.port.partition, None) else {
             // Busy, or the partition is not created yet: look again later.
@@ -176,7 +219,7 @@ impl LogService {
         self.term = Some(term);
         self.port.publish(LogStatus {
             view: term.scope.view,
-            role: LogRole::Leader,
+            role,
             committed_end: end,
             retained_from: cursor.retained_from(),
             lead: Some(crate::log::Lead {
@@ -203,7 +246,12 @@ impl LogService {
     }
 
     /// Take queued requests while arenas and the read slot allow.
-    fn take_commands(&mut self, cx: &mut Context<'_>) -> bool {
+    fn take_commands(
+        &mut self,
+        actor: &PartitionActor,
+        cx: &mut Context<'_>,
+        now: Duration,
+    ) -> bool {
         let mut progress = false;
         for _ in 0..TURN_COMMANDS {
             let command = match self.waiting.take() {
@@ -216,6 +264,12 @@ impl LogService {
             let held = match command {
                 Command::Append(append) => self.start_append(append).map(Command::Append),
                 Command::Read(read) => self.start_read(read).map(Command::Read),
+                Command::Trim(trim) => self.start_trim(actor, trim).map(Command::Trim),
+                Command::StepDown(request) => {
+                    let (_, local, _) = actor.native_identity();
+                    self.start_step_down(request, local, now);
+                    None
+                }
             };
             if let Some(command) = held {
                 self.waiting = Some(command);

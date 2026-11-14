@@ -7,6 +7,9 @@
 - `ozzy_core::state::StateError` has a new `OwnerAppendDisabled` variant,
   and `ozzy_runtime::replica_journal::JournalError` a new `OwnerAppend`
   variant.
+- `ozzy_core::retention::Kept` has a new `trimmed` field, and
+  `ozzy_runtime::replica_journal::PartitionFacts` a new `operation_floor`
+  field.
 
 ### Added
 
@@ -19,6 +22,20 @@
   view, the committed end, the end a new lead starts from, and the end at
   the commit point its view was installed with. These batches name no producer and need a
   partition without delay or deduplication.
+- A leader that hears no follower for the primary timeout reports the
+  `Doubt` role on its `Log` and refuses appends with `NotLeader`, since
+  nothing it admits could commit. Its term goes on when a follower of the
+  view answers. `ReplicaDriver::primary_doubt` reports the condition.
+- `Log::step_down(view, target)` hands a log to another broker. The
+  leader stops taking appends, waits up to a second for accepted records
+  to commit, then starts a view change to the next view the target
+  leads. At most one starts per second and log.
+  `ReplicaDriver::step_down` is the protocol step.
+- `Log::trim(view, expected_floor, floor)` moves a log's floor forward.
+  Records below it are gone for every reader. On a partition without a
+  retention policy, each copy then retires its sealed segments that hold
+  no record at or above the floor. Before, such a partition never freed
+  a segment.
 
 ### Changed
 

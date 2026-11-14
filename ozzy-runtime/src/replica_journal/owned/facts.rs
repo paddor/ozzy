@@ -14,6 +14,8 @@ pub struct PartitionFacts {
     pub retained_from: Offset,
     /// Offset the next record gets.
     pub next_offset: Offset,
+    /// First operation whose control-operation identity is still claimed.
+    pub operation_floor: u64,
     /// Open producer sessions.
     pub producers: usize,
     /// Committed retention policy.
@@ -70,6 +72,7 @@ impl OwnedJournal {
         Ok(Some(PartitionFacts {
             retained_from: log.retained_from,
             next_offset: log.next_offset,
+            operation_floor: state.operation_floor(),
             producers: log.producers().len(),
             retention: log.retention,
             policy_revision: log.policy_revision,

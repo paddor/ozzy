@@ -79,6 +79,12 @@ impl Execution {
             Self::Recovery(_) => None,
         }
     }
+    pub(super) fn owner_floor(&self) -> Option<ozzy_proto::Offset> {
+        match self {
+            Self::Normal(owner) => owner.owner_floor(),
+            Self::Recovery(_) => None,
+        }
+    }
     pub(super) fn held_load_wanted(&self) -> bool {
         match self {
             Self::Normal(owner) => owner.held_load_wanted(),

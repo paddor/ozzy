@@ -2,7 +2,7 @@
 //! submit on the log's lane, and answer from the proposal outcome.
 
 use super::{LogService, Term};
-use crate::log::{AppendError, AppendRequest, Appended, LogStatus};
+use crate::log::{AppendError, AppendRequest, Appended, LogRole, LogStatus};
 use crate::replica_actor::{PendingProposal, ProposalOutcome, ProposalStopped};
 use crate::replica_journal::{
     AppendAdmissionError, JournalError, OwnerAppendError, ProposalBuffer,
@@ -42,6 +42,10 @@ impl LogService {
                 return None;
             }
         };
+        if self.stepping.is_some() || self.port.published().role == LogRole::Doubt {
+            let _ = append.reply.send(Err(AppendError::NotLeader));
+            return None;
+        }
         let Some(lane) = &mut self.lane else {
             let _ = append.reply.send(Err(AppendError::NotLeader));
             return None;
@@ -145,13 +149,8 @@ fn prepare(
             parts: record.parts.iter().map(AsRef::as_ref).collect(),
         })
         .collect();
-    let authority = ozzy_proto::append::Authority {
-        group_id: term.scope.group_id,
-        config_epoch: term.scope.configuration_epoch,
-        view: term.scope.view,
-    };
     buffer
-        .prepare_owner_append(authority, partition, append.expected, records)
+        .prepare_owner_append(term.authority(), partition, append.expected, records)
         .map_err(|error| match error {
             JournalError::AppendCapacity | JournalError::Operation(_) => AppendError::TooLarge,
             _ => AppendError::Refused,

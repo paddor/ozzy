@@ -132,6 +132,29 @@ impl PartitionActor {
         }
     }
 
+    /// Whether this broker leads a replicated partition but heard no
+    /// follower for the primary timeout, so nothing it admits can commit.
+    pub(in crate::replica_actor) fn leader_doubt(&self) -> bool {
+        match self {
+            Self::Replicated(actor) => actor.leader_doubt(),
+            Self::Local(_) | Self::Recovering(_) => false,
+        }
+    }
+
+    /// Hand a replicated partition this broker leads to `target`. `None`
+    /// while accepted work is uncommitted.
+    pub(in crate::replica_actor) fn step_down(
+        &mut self,
+        target: NodeId,
+    ) -> Result<Option<u64>, ozzy_replication::driver::DriverError> {
+        match self {
+            Self::Replicated(actor) => actor.step_down(target),
+            Self::Local(_) | Self::Recovering(_) => {
+                Err(ozzy_replication::ReplicationError::WrongRole.into())
+            }
+        }
+    }
+
     /// Current leader hint. It neither activates authority nor confirms history.
     pub fn authority_hint(&self) -> ozzy_proto::nack::AuthorityHint {
         match self {

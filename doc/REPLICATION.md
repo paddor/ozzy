@@ -111,6 +111,15 @@ request from the view's primary is suspicion too: that primary cannot
 install its view. A restart's retained-history probe still votes and is
 not suspicion.
 
+A ready leader that gets no acknowledgment from either follower for the
+primary timeout is in doubt. Doubt is not suspicion and moves no view: it
+only tells an embedder's log to refuse appends, which could not commit.
+The next acknowledgment in the view ends it.
+
+A ready leader with nothing uncommitted may step down: it leaves its view
+for the next one a named follower leads, and the ordinary election runs.
+The follower leads only once it installs that view.
+
 | Step | Gate |
 | --- | --- |
 | Suspicion | Two brokers send EXIT_VIEW for the current view |
