@@ -80,7 +80,7 @@ impl Plan {
     }
 
     /// Stage of an arrival; warmup belongs to the first stage.
-    fn stage(self, due: u64) -> usize {
+    fn stage(&self, due: u64) -> usize {
         self.bounds[1..self.stages]
             .iter()
             .take_while(|start| **start <= due)
@@ -90,7 +90,7 @@ impl Plan {
     /// This lane's arrivals due before `stage`. An overloaded lane still
     /// admits these, late but with their original clocks, so every earlier
     /// stage keeps a complete cohort.
-    pub(super) fn total_before(self, stage: usize) -> Result<u64> {
+    pub(super) fn total_before(&self, stage: usize) -> Result<u64> {
         if stage == 0 {
             return Ok(0);
         }
@@ -103,7 +103,7 @@ impl Plan {
     }
 
     /// This lane's arrivals due inside one measured stage.
-    pub(super) fn stage_total(self, stage: usize) -> Result<u64> {
+    pub(super) fn stage_total(&self, stage: usize) -> Result<u64> {
         let count = |at: u64| -> Result<u64> {
             Ok(assigned(
                 self.schedule.count(at - self.window.start)?,
@@ -114,11 +114,11 @@ impl Plan {
         Ok(count(self.bounds[stage + 1])? - count(self.bounds[stage])?)
     }
 
-    pub(super) fn total(self) -> u64 {
+    pub(super) fn total(&self) -> u64 {
         self.total
     }
 
-    pub(super) fn due(self, sequence: u64) -> Result<u64> {
+    pub(super) fn due(&self, sequence: u64) -> Result<u64> {
         if sequence >= self.total() {
             return Err(error("record outside scheduled arrival cohort"));
         }
@@ -133,7 +133,7 @@ impl Plan {
     /// late. Once the oldest unadmitted arrival is `max_lag_ns` late,
     /// a fixed rate fails and a ramp returns that arrival's stage. Every earlier
     /// stage was admitted completely; the lane then admits nothing more.
-    pub(super) fn check_backlog(self, admitted: u64, now: u64) -> Result<Option<usize>> {
+    pub(super) fn check_backlog(&self, admitted: u64, now: u64) -> Result<Option<usize>> {
         if admitted < self.total() {
             let due = self.due(admitted)?;
             if due.saturating_add(self.max_lag_ns) <= now {
@@ -166,8 +166,8 @@ impl Arrivals {
         }
     }
 
-    pub(super) fn plan(&self) -> Plan {
-        self.plan
+    pub(super) fn plan(&self) -> &Plan {
+        &self.plan
     }
 
     /// Whether the lane admitted every arrival it may.

@@ -169,7 +169,7 @@ fn scheduled_row(config: &Config, plans: &[Plan], stages: Vec<Value>) -> Result<
         } else {
             "an arrival unadmitted for the maximum lag fails the run; preserve due times and drain every arrival scheduled before window end"
         },
-        "planned_total_records":plans.iter().map(|plan| plan.total()).sum::<u64>(),
+        "planned_total_records":plans.iter().map(Plan::total).sum::<u64>(),
         "latency_cohort":"scheduled arrivals in measurement window, including admission and completion during drain",
         "submission_clock":"actual record generation starts; excludes implicit unadmitted scheduled backlog",
     });

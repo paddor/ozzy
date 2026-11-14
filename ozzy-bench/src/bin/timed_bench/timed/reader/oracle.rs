@@ -194,7 +194,11 @@ impl Oracle {
         // Compare these original bytes with the writer digest outside broker
         // state. Regenerating bodies on the reader would change the workload.
         state.counts.record_bytes(record.id, bytes);
-        let due = state.plan.map(|plan| plan.due(sequence)).transpose()?;
+        let due = state
+            .plan
+            .as_ref()
+            .map(|plan| plan.due(sequence))
+            .transpose()?;
         state.verified += 1;
         self.offsets[partition] = Some(
             offset
