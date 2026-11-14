@@ -85,7 +85,8 @@ impl NormalReplica {
         if self.is_primary() {
             return Err(ReplicationError::WrongRole);
         }
-        if self.installed_view != Some(start) {
+        // A rejoined backup installed its own log, not this descriptor.
+        if !self.rejoined && self.installed_view != Some(start) {
             return Err(self.conflict());
         }
         Ok(())
@@ -105,8 +106,16 @@ impl NormalReplica {
         if commit.committed.op < self.applied.op {
             return Ok(());
         }
+        if let Some(tail) = self.journal_tail.filter(|_| self.rejoined) {
+            // The whole tail came from this primary or the log it installed,
+            // so a commit at or past its end commits it. One inside it has
+            // no local evidence to check against, and waits for a later one.
+            if commit.committed.op < tail.op && commit.committed.op != self.committed.op {
+                return Ok(());
+            }
+        }
         if commit.committed.op > self.accepted.op
-            && self.journal_tail.is_none()
+            && (self.journal_tail.is_none() || self.rejoined)
             && self.accepted.op > self.known_commit
         {
             // Otherwise a backup whose window is full behind a primary that

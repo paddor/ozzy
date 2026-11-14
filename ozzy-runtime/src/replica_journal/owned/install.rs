@@ -130,10 +130,11 @@ impl OwnedJournal {
         let mut prepared = std::mem::take(&mut buffer.prepared);
         prepared.clear();
         let operations: Vec<_> = buffer.operations().collect();
-        if operations
-            .iter()
-            .any(|operation| operation.original_view >= ticket.scope().view)
-        {
+        // Only a rejoining backup restages operations of the view itself.
+        let view = ticket.scope().view;
+        if operations.iter().any(|operation| {
+            operation.original_view > view || (operation.original_view == view && !ticket.rejoins())
+        }) {
             return Err(JournalError::InstallationMismatch);
         }
         stage_chunks(&mut installing.staging, installing.limits, &operations).await?;

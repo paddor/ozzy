@@ -495,3 +495,115 @@ fn an_installing_backup_withdraws_suspicion_until_its_installation_stalls() {
         .unwrap();
     assert_eq!(backup.normal().unwrap().scope().view, 1);
 }
+
+/// A backup of view 4 whose disk holds one accepted, uncommitted operation.
+fn restarted_backup() -> ReplicaDriver {
+    let changing = ViewChange::recover_intact(
+        configuration(),
+        node(2),
+        JournalGeneration(101),
+        RecoveredState {
+            scope: Scope {
+                view: 4,
+                ..configuration().scope()
+            },
+            log: FrozenLog {
+                last_normal_view: 4,
+                accepted: operation().prefix(),
+                committed: Prefix::GENESIS,
+            },
+        },
+        PipelineLimits {
+            max_operations: 8,
+            max_body_bytes: 1024,
+        },
+    )
+    .unwrap();
+    ReplicaDriver::from_view_change(changing, Duration::ZERO, timing()).unwrap()
+}
+
+/// An intact restarted backup installs its own log in the view it last
+/// installed and votes there again: it acknowledges its stored tail, takes
+/// the primary's own descriptor, and commits on the primary's word.
+#[test]
+fn a_restarted_backup_rejoins_its_installed_view_from_its_own_log() {
+    let now = Duration::from_millis(5);
+    let mut backup = restarted_backup();
+    assert!(backup.rejoin_pending());
+    assert_eq!(backup.poll(now).unwrap(), None, "no promise of view 5");
+    let ticket = backup.begin_rejoin_install(JournalGeneration(102)).unwrap();
+    assert!(ticket.rejoins() && !backup.rejoin_pending());
+    assert_eq!(ticket.scope().view, 4);
+    assert_eq!(backup.scope().view, 4);
+    assert_eq!(ticket.source().voter, node(2));
+    assert_eq!(ticket.accepted(), operation().prefix());
+    assert_eq!(
+        (ticket.committed(), ticket.retained()),
+        (Prefix::GENESIS, Prefix::GENESIS)
+    );
+    backup.validate_install_suffix(&[operation()]).unwrap();
+    backup
+        .complete_installation(ticket, Prefix::GENESIS, now)
+        .unwrap();
+    let normal = backup.normal().unwrap();
+    assert_eq!(normal.scope().view, 4);
+    assert_eq!(
+        normal.acknowledgment().unwrap().durable,
+        operation().prefix()
+    );
+    let scope = normal.scope();
+    let start = ozzy_replication::StartView {
+        scope,
+        generation: JournalGeneration(77),
+        accepted: Prefix::GENESIS,
+        committed: Prefix::GENESIS,
+    };
+    backup
+        .receive(node(1), Control::StartView(start), now)
+        .unwrap();
+    let commit = ozzy_replication::Commit {
+        scope,
+        committed: operation().prefix(),
+    };
+    backup
+        .receive(node(1), Control::Commit(commit), now)
+        .unwrap();
+    assert_eq!(
+        backup.normal().unwrap().snapshot().committed,
+        operation().prefix()
+    );
+}
+
+/// The right to rejoin lapses at the election deadline, or as soon as a
+/// peer shows a later view. Then the ordinary election runs.
+#[test]
+fn a_restarted_backup_that_cannot_rejoin_asks_for_the_next_view() {
+    let mut waiting = restarted_backup();
+    let deadline = timing().election_timeout;
+    assert_eq!(waiting.next_deadline(), Some(timing().retransmit));
+    let before = deadline.checked_sub(Duration::from_nanos(1)).unwrap();
+    assert_eq!(waiting.poll(before).unwrap(), None);
+    let Some(Action::PersistPromise(promise)) = waiting.poll(deadline).unwrap() else {
+        panic!("the lapsed backup promises the next view");
+    };
+    assert_eq!(promise.scope().view, 5);
+    assert!(!waiting.rejoin_pending());
+    assert!(
+        waiting
+            .begin_rejoin_install(JournalGeneration(102))
+            .is_err()
+    );
+
+    let mut fenced = restarted_backup();
+    let later = StartViewChange {
+        scope: Scope {
+            view: 6,
+            ..configuration().scope()
+        },
+    };
+    fenced
+        .receive(node(0), Control::StartViewChange(later), Duration::ZERO)
+        .unwrap();
+    assert!(!fenced.rejoin_pending());
+    assert_eq!(fenced.scope().view, 6);
+}

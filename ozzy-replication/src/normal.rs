@@ -100,6 +100,9 @@ pub struct NormalReplica {
     acknowledged: Voters<OpNumber>,
     activation_tail: OpNumber,
     installed_view: Option<crate::StartView>,
+    /// This backup rejoined its view after a restart, so `installed_view`
+    /// is its own descriptor, not the primary's.
+    rejoined: bool,
     journal_tail: Option<Prefix>,
 }
 
@@ -169,6 +172,7 @@ impl NormalReplica {
             acknowledged: Voters::splat(OpNumber(0)),
             activation_tail: OpNumber(0),
             installed_view: None,
+            rejoined: false,
             journal_tail: None,
         })
     }
@@ -204,6 +208,7 @@ impl NormalReplica {
         self.acknowledged = Voters::splat(OpNumber(0));
         self.activation_tail = log.accepted.op;
         self.installed_view = None;
+        self.rejoined = false;
         self.journal_tail = (log.accepted != Prefix::GENESIS).then_some(log.accepted);
     }
 

@@ -8,8 +8,8 @@ use super::{Action, DriverError, ReplicaDriver, Role};
 use crate::wire::Control;
 use crate::{
     Commit, Digest, InstallOutcome, InstallTicket, InstallingView, JournalGeneration, LogSource,
-    Prefix, PreparedOperation, ReceivedStart, ReplicationError, Scope, StartView, ViewChangeError,
-    VoterSet,
+    Prefix, PreparedOperation, ReceivedStart, RejectedInstallation, ReplicationError, Scope,
+    StartView, ViewChangeError, VoterSet,
 };
 
 /// Whole-tail commit authority captured before worker-side image activation.
@@ -126,6 +126,36 @@ impl ReplicaDriver {
         self.begin_install(Some(ReceivedStart { from, start }), generation, lookup)
     }
 
+    /// Whether this restarted backup may still rejoin the view it last
+    /// installed. Until the adapter tries, or the election deadline passes,
+    /// `poll` promises no later view.
+    pub fn rejoin_pending(&self) -> bool {
+        matches!(&self.role, Role::ViewChanging(changing) if changing.rejoinable())
+    }
+
+    /// Give up rejoining. The ordinary election of the next view runs.
+    pub fn decline_rejoin(&mut self) {
+        if let Role::ViewChanging(changing) = &mut self.role {
+            changing.decline_rejoin();
+        }
+    }
+
+    /// Begin a restarted backup's return to its installed view from its own
+    /// pinned log. The adapter supplies a fresh writer incarnation and runs
+    /// the same staging, publication and application recovery as any
+    /// installation. A rejection ends the attempt: the ordinary election of
+    /// the next view follows.
+    pub fn begin_rejoin_install(
+        &mut self,
+        generation: JournalGeneration,
+    ) -> Result<InstallTicket, DriverError> {
+        self.changing()?;
+        let Role::ViewChanging(changing) = self.take_role() else {
+            return Err(ViewChangeError::Faulted.into());
+        };
+        self.admit_install(changing.begin_rejoin_install(generation))
+    }
+
     fn begin_install(
         &mut self,
         backup: Option<ReceivedStart>,
@@ -140,6 +170,13 @@ impl ReplicaDriver {
             Some(received) => changing.begin_backup_install(received, generation, lookup),
             None => changing.begin_primary_install(generation),
         };
+        self.admit_install(admitted)
+    }
+
+    fn admit_install(
+        &mut self,
+        admitted: Result<InstallingView, RejectedInstallation>,
+    ) -> Result<InstallTicket, DriverError> {
         match admitted {
             Ok(installing) => {
                 let ticket = installing.ticket();

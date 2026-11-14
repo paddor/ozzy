@@ -148,8 +148,10 @@ fn election_bridges_retired_commit(installed_view: u64) {
         );
     }
     let mut activated = false;
+    // Restarted followers rejoin their views first. Their contact timeouts
+    // must pass before they leave them, so time moves a millisecond a step.
     for step in 0..20000 {
-        let now = Duration::from_millis(step / 100);
+        let now = Duration::from_millis(step);
         for (to, message) in collect(&mut actors, now, false) {
             if to < actors.len() {
                 actors[to].receive(&message, now).unwrap();

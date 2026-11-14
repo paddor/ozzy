@@ -39,6 +39,11 @@
 
 ### Changed
 
+- A follower that restarts with its disk intact rejoins the view it last
+  installed instead of requesting the next one, so restarting a follower
+  no longer moves leadership. A restarted leader still requests the next
+  view. `ReplicaDriver::begin_rejoin_install` and `rejoin_pending` are the
+  protocol steps; `InstallTicket::rejoins` marks such an installation.
 - Each partition takes a fourth proposal lane and five more arenas from its
   journal pool for its log. Arenas allocate only when used.
 

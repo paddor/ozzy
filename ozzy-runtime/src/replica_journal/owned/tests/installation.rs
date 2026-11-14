@@ -90,6 +90,8 @@ fn voter(controller: &mut Controller, io: Local, index: u8, count: u8) -> Voter 
     let mut driver = startup
         .into_driver(Duration::ZERO, timing(), config.append_limits)
         .unwrap();
+    // These voters take part in an election, not a rejoin.
+    driver.decline_rejoin();
     let Some(Action::PersistPromise(ticket)) = driver.poll(Duration::ZERO).unwrap() else {
         panic!("restart requires promise")
     };

@@ -25,7 +25,8 @@ impl ViewChange {
     /// Restart an intact durable voter without granting same-view authority.
     ///
     /// Restart from an installed normal view requests its successor, fencing a
-    /// primary that sent prepares before its local write completed. An already
+    /// primary that sent prepares before its local write completed. A backup
+    /// of that view may instead rejoin it through `begin_rejoin_install`. An already
     /// promised but never installed election resumes that same view: it could
     /// not have assigned normal operations there. Repeated restarts cannot
     /// ratchet that unfinished election. Quorum selection and durable selected
@@ -81,6 +82,16 @@ impl ViewChange {
                 log: recovered.log,
             })
         } else {
+            // The view's primary may have sent prepares it never stored, so
+            // it must leave the view. A backup acknowledged only what its
+            // disk holds: its restart is a pause, and it may rejoin.
+            if configuration.primary(recovered.scope.view) != local {
+                changing.rejoin = Some(PromiseTicket {
+                    scope: recovered.scope,
+                    generation,
+                    log: recovered.log,
+                });
+            }
             Promise::Prior(recovered.scope.view)
         };
         Ok(changing)

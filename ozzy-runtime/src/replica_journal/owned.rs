@@ -237,6 +237,7 @@ impl OwnedJournal {
             ..configuration.scope()
         };
         let startup = JournalStartup {
+            rebuilt: false,
             configuration,
             local: config.identity.replica_node_id,
             generation,

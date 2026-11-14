@@ -391,3 +391,42 @@ async fn owner_log_trims_forward_from_the_expected_floor() {
     .await
     .expect("owner log trim made no bounded progress");
 }
+
+/// A follower that restarts with its disk intact rejoins the leader's view
+/// as a follower. The leader's term goes on, and the returned follower
+/// alone is enough to commit.
+#[tokio::test(flavor = "current_thread")]
+async fn owner_log_keeps_its_leader_across_a_follower_restart() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let mut cluster = broker::Cluster::configured(DeploymentMode::Three, None, |config| {
+            config.topics.get_mut("orders").unwrap().retention =
+                ozzy_config::TopicRetention::default();
+        })
+        .await;
+        let (index, view, end) = appends_and_reads(&logs(&cluster)).await;
+        let (restarted, other) = ((index + 1) % 3, (index + 2) % 3);
+        let image = cluster.stop(restarted).await;
+        // The follower misses these records while it is down.
+        let log = cluster.brokers[index].log("orders", 0).unwrap();
+        let appended = append(&log, view, end, &[4, 5]).await.unwrap();
+        cluster.restore_clean(restarted, image).await;
+        let mut status = cluster.brokers[restarted]
+            .log("orders", 0)
+            .unwrap()
+            .status();
+        let rejoined = *status
+            .wait_for(|status| status.role == LogRole::Follower)
+            .await
+            .unwrap();
+        assert_eq!(rejoined.view, view, "the restart moved the view");
+        // Only the leader and the returned follower are left to commit.
+        let _image = cluster.stop(other).await;
+        let last = append(&log, view, appended.end.get(), &[6]).await.unwrap();
+        assert_eq!(last.end.get(), end + 3);
+        let leading = *log.status().borrow();
+        assert_eq!((leading.role, leading.view), (LogRole::Leader, view));
+        cluster.shutdown().await;
+    })
+    .await
+    .expect("owner log follower restart made no bounded progress");
+}

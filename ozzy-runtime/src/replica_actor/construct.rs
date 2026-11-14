@@ -171,7 +171,13 @@ fn start_protocol(
 ) -> Result<(ReplicaDriver, normal::Work), ActorError> {
     let configuration = startup.configuration();
     let local = startup.local();
-    let driver = startup.into_driver(Duration::ZERO, config.timing, config.pipeline)?;
+    let mut driver = startup.into_driver(Duration::ZERO, config.timing, config.pipeline)?;
+    // A restarted backup rejoins the view it last installed. Beginning here
+    // keeps the next view from ever showing. A refusal leaves the ordinary
+    // election of that next view.
+    if driver.rejoin_pending() {
+        let _ = driver.begin_rejoin_install(ids.generation()?);
+    }
     let receive_buffer = journal.lease_append_buffer()?;
     let peers = normal::remote_transmitters(configuration, local, driver.scope(), config, ids)?;
     let flow = normal::Flow::new(peers, activated, config)?;

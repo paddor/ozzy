@@ -49,6 +49,7 @@ pub struct InstallTicket {
     protected_committed: Prefix,
     retained: Prefix,
     committed: Prefix,
+    rejoin: bool,
 }
 
 impl InstallTicket {
@@ -81,6 +82,11 @@ impl InstallTicket {
     /// Complete selected accepted prefix to install durably.
     pub const fn accepted(self) -> Prefix {
         self.source.accepted
+    }
+    /// Whether a restarted backup installs its own log to rejoin the view
+    /// it last installed. Its tail may then hold operations of that view.
+    pub const fn rejoins(self) -> bool {
+        self.rejoin
     }
     /// Effective local committed prefix, never lower than prior local knowledge.
     pub const fn committed(self) -> Prefix {

@@ -180,6 +180,7 @@ The follower leads only once it installs that view.
 stateDiagram-v2
     direction LR
     [*] --> Election: serve
+    [*] --> Voting: serve, follower rejoins its view
     [*] --> Nonvoting: recover
     Election --> Voting: view installed and activated
     Voting --> Election: view change
@@ -190,9 +191,23 @@ stateDiagram-v2
 
 - `format` creates a group. `serve` never creates missing identity or history.
 - An intact reopen validates configuration, history, promises, and installed
-  lineage, then enters election with a fresh writer incarnation.
-- A restart never resumes old leader authority. It requests the next view or
-  resumes an uninstalled promise. A promise alone grants no authority.
+  lineage, and takes a fresh writer incarnation.
+- A restart never resumes old leader authority. A leader may have sent
+  operations it never stored, so it requests the next view. A copy with an
+  uninstalled promise resumes that election. A promise alone grants no
+  authority.
+- A follower of its last installed view rejoins that view. It installs its
+  own log there: the committed prefix stays, the tail after it is staged
+  again, and both publish atomically. Then it votes as before and catches
+  up from the leader. No view changes, so the leader keeps serving.
+- Rejoining is safe because a follower's restart is a pause. It
+  acknowledged only what its disk holds, and it promised no later view, or
+  the reopen would have found that promise. So its log still holds every
+  operation the leader counted its vote for, in the lineage the leader
+  wrote.
+- The right to rejoin ends when a peer shows a later view or the attempt
+  fails. The copy then requests the next view. A rejoined follower whose
+  leader is gone times out like any other.
 - Each segment roll publishes the applied prefix as the commit. After a
   restart, installation keeps local history through it and fetches only the
   rest, and replays only after the state the reopen rebuilt.

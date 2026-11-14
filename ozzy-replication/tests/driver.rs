@@ -542,7 +542,9 @@ fn a_recovering_election_primary_ends_its_view_before_the_deadline() {
     )
     .unwrap();
     let mut replica = ReplicaDriver::from_view_change(changing, Duration::ZERO, timing()).unwrap();
-    let now = Duration::ZERO;
+    // A restarted backup first waits to rejoin its view; nobody lets it.
+    assert_eq!(replica.poll(Duration::ZERO).unwrap(), None);
+    let now = timing().election_timeout;
     persist(&mut replica, now);
     assert_eq!(replica.scope().view, 3, "voter 0 leads this view");
     start(&mut replica, now);

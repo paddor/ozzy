@@ -324,7 +324,7 @@ impl RecoveringJournal {
                 journal.shutdown().await?;
                 return Err(JournalError::CompletionMismatch);
             }
-            Ok((journal, startup))
+            Ok((journal, startup.rebuilt()))
         })
     }
 

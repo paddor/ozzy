@@ -39,6 +39,8 @@ impl ReplicaDriver {
             if self.normal().is_some() {
                 return Ok(self.exit_action());
             }
+        } else if self.rejoin_wait(now) {
+            return Ok(None);
         } else if now >= self.election_deadline && !self.promise_pending() {
             // A voter still waiting on its own promise has no evidence about
             // the view. With stalled storage it would keep helping a peer's
@@ -54,6 +56,24 @@ impl ReplicaDriver {
             self.retry_at = now.saturating_add(self.timing.retransmit);
         }
         self.poll_election()
+    }
+
+    /// A restarted backup holds its election back while it may rejoin its
+    /// installed view. At the election deadline the right lapses and the
+    /// election of the next view gets a full delay of its own.
+    fn rejoin_wait(&mut self, now: Duration) -> bool {
+        let Role::ViewChanging(changing) = &mut self.role else {
+            return false;
+        };
+        if !changing.rejoinable() {
+            return false;
+        }
+        if now < self.election_deadline {
+            return true;
+        }
+        changing.decline_rejoin();
+        self.election_deadline = now.saturating_add(self.election_delay);
+        false
     }
 
     fn poll_installing(&mut self, now: Duration) -> Result<Option<Action>, DriverError> {

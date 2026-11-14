@@ -99,6 +99,9 @@ pub struct JournalStartup {
     local: NodeId,
     generation: JournalGeneration,
     recovered: Option<RecoveredState>,
+    /// The store was rebuilt from other copies: it may lack what this
+    /// voter acknowledged before, so it must not rejoin its view.
+    rebuilt: bool,
 }
 
 impl JournalStartup {
@@ -116,6 +119,14 @@ impl JournalStartup {
     /// controlled shard-local execution may inject deterministic generations.
     pub const fn generation(&self) -> JournalGeneration {
         self.generation
+    }
+
+    /// Mark a store that recovery rebuilt from other copies. Its driver
+    /// enters the ordinary election and never rejoins the installed view.
+    #[must_use]
+    pub(crate) const fn rebuilt(mut self) -> Self {
+        self.rebuilt = true;
+        self
     }
 
     /// Stored intact history; `None` means successful explicit fresh format only.
@@ -139,17 +150,19 @@ impl JournalStartup {
                 now,
                 timing,
             ),
-            Some(recovered) => ReplicaDriver::from_view_change(
-                ViewChange::recover_intact(
+            Some(recovered) => {
+                let mut changing = ViewChange::recover_intact(
                     self.configuration,
                     self.local,
                     self.generation,
                     recovered,
                     limits,
-                )?,
-                now,
-                timing,
-            ),
+                )?;
+                if self.rebuilt {
+                    changing.decline_rejoin();
+                }
+                ReplicaDriver::from_view_change(changing, now, timing)
+            }
         }
     }
 }
