@@ -3,6 +3,7 @@ use crate::{
     DirectoryError,
     directory::{LOCK_FILE, evidence, publication},
 };
+use bytes::Bytes;
 use ozzy_io::{
     Class, Completed, Handle, Local, OpenMode, Operation, Outcome, SyncMode, WriteBuffer,
 };
@@ -264,16 +265,25 @@ impl Files {
         offset: u64,
         bytes: &[u8],
     ) -> Result<usize, DirectoryError> {
-        let result = self
-            .execute(Operation::Write {
-                handle: handle.clone(),
-                offset,
-                data: WriteBuffer::from_vec(bytes.to_vec()),
-            })
-            .await?;
-        match *result {
+        let data = WriteBuffer::from_vec(bytes.to_vec());
+        self.write_buffer(handle, offset, data).await
+    }
+
+    async fn write_buffer(
+        &self,
+        handle: &Handle,
+        offset: u64,
+        data: WriteBuffer,
+    ) -> Result<usize, DirectoryError> {
+        let length = data.len();
+        let write = Operation::Write {
+            handle: handle.clone(),
+            offset,
+            data,
+        };
+        match *self.execute(write).await? {
             Outcome::Written(0) => Err(io::Error::from(io::ErrorKind::WriteZero).into()),
-            Outcome::Written(count) if count <= bytes.len() => Ok(count),
+            Outcome::Written(count) if count <= length => Ok(count),
             _ => Err(unexpected()),
         }
     }
@@ -374,16 +384,15 @@ impl publication::Io for Files {
         self.read(name, Some(length), length).await
     }
 
-    async fn write_new(&mut self, name: &str, bytes: &[u8]) -> Result<(), DirectoryError> {
+    async fn write_new(&mut self, name: &str, bytes: &Bytes) -> Result<(), DirectoryError> {
         self.check(name, bytes.len())?;
         let handle = self.open_file(name, OpenMode::CreateNew).await?;
         let result = async {
             let mut offset = 0;
             while offset < bytes.len() {
                 let end = bytes.len().min(offset + self.limits.chunk_bytes);
-                offset += self
-                    .write_once(&handle, offset as u64, &bytes[offset..end])
-                    .await?;
+                let chunk = WriteBuffer::shared(vec![bytes.slice(offset..end)], end - offset)?;
+                offset += self.write_buffer(&handle, offset as u64, chunk).await?;
             }
             Ok(())
         }

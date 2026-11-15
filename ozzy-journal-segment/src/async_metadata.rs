@@ -192,7 +192,7 @@ impl Directory {
         &mut self,
         target: &str,
         temporary: &str,
-        bytes: &[u8],
+        bytes: &bytes::Bytes,
     ) -> Result<(), DirectoryError> {
         self.files.check(target, bytes.len())?;
         self.files.check(temporary, bytes.len())?;

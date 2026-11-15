@@ -202,7 +202,7 @@ async fn establish(directory: &mut Directory) {
     directory.select_current(current(&manifest)).await.unwrap();
     let evidence = crate::directory::evidence::image(&manifest, LogPosition::GENESIS).unwrap();
     directory
-        .replace("DURABLE", ".DURABLE.tmp", &evidence)
+        .replace("DURABLE", ".DURABLE.tmp", &evidence.into())
         .await
         .unwrap();
 }
@@ -396,8 +396,9 @@ fn canceled_publication_fences_owner_and_keeps_group_locked_until_physical_work_
         Directory::open("/".into(), io.clone(), limits()),
     )
     .unwrap();
+    let state = bytes::Bytes::from_static(b"state");
     let pending = {
-        let mut future = std::pin::pin!(directory.replace("STATE", ".STATE.tmp", b"state"));
+        let mut future = std::pin::pin!(directory.replace("STATE", ".STATE.tmp", &state));
         assert!(poll(future.as_mut()).is_pending());
         controller.jobs()[0].0
     };
@@ -694,7 +695,7 @@ fn evidence_descriptor_is_reused_but_invalidated_when_its_inode_is_replaced() {
     let replacement = crate::directory::evidence::image(&metadata, LogPosition::GENESIS).unwrap();
     drive(
         &mut controller,
-        directory.replace(NAME, ".DURABLE.tmp", &replacement),
+        directory.replace(NAME, ".DURABLE.tmp", &replacement.clone().into()),
     )
     .unwrap();
     let newer = LogPosition {

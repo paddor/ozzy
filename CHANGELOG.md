@@ -98,6 +98,10 @@
   so a shard with more partitions sees each once per several intervals.
   With these, the CPU time of idle replicated logs no longer grows with
   their count.
+- A replica allocates its history payload scratch when it first sends
+  history, and a fresh `DURABLE` file is written from its image without a
+  copy. A replicated log that never sent history holds about 60 KiB less
+  resident memory.
 - A follower that restarts with its disk intact rejoins the view it last
   installed instead of requesting the next one, so restarting a follower
   no longer moves leadership. A restarted leader still requests the next

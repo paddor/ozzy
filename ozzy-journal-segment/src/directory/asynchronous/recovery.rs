@@ -117,7 +117,11 @@ impl RecoveryDirectory {
         self.require_selected(configuration).await?;
         let marker = recovery_marker(configuration)?;
         self.directory
-            .replace(CONFIGURATION_FILE, ".CONFIGURATION.quarantine.tmp", &marker)
+            .replace(
+                CONFIGURATION_FILE,
+                ".CONFIGURATION.quarantine.tmp",
+                &marker.to_vec().into(),
+            )
             .await?;
         self.configuration = marker.to_vec();
         Ok(self)

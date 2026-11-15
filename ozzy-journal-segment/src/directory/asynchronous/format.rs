@@ -146,7 +146,7 @@ async fn select_initial(
         .replace(
             evidence::NAME,
             ".DURABLE.tmp",
-            &evidence::image(manifest, LogPosition::GENESIS)?,
+            &evidence::image(manifest, LogPosition::GENESIS)?.into(),
         )
         .await?;
     directory

@@ -1,5 +1,6 @@
 //! Crash-safe metadata publication ordering over one directory I/O driver.
 
+use bytes::Bytes;
 use std::io;
 
 use super::{CURRENT_FILE, DirectoryError, evidence, manifest_name};
@@ -16,7 +17,8 @@ pub(crate) trait Overwrite {
 pub(crate) trait Io: Overwrite {
     async fn exists(&mut self, name: &str) -> Result<bool, DirectoryError>;
     async fn read_exact(&mut self, name: &str, bytes: usize) -> Result<Vec<u8>, DirectoryError>;
-    async fn write_new(&mut self, name: &str, bytes: &[u8]) -> Result<(), DirectoryError>;
+    /// The file keeps a share of `bytes` until it is written, not a copy.
+    async fn write_new(&mut self, name: &str, bytes: &Bytes) -> Result<(), DirectoryError>;
     async fn sync_file(&mut self, name: &str) -> Result<(), DirectoryError>;
     async fn link(&mut self, source: &str, target: &str) -> Result<(), DirectoryError>;
     async fn remove(&mut self, name: &str) -> Result<(), DirectoryError>;
@@ -79,7 +81,7 @@ pub(crate) async fn prepare_manifest(
 /// leave its name with no, some, or other bytes. Nothing refers to that name,
 /// so it is removed and created again. The old file is never written: an
 /// interrupted link may share it with an installed target.
-async fn prepare(io: &mut impl Io, name: &str, bytes: &[u8]) -> Result<(), DirectoryError> {
+async fn prepare(io: &mut impl Io, name: &str, bytes: &Bytes) -> Result<(), DirectoryError> {
     match io.write_new(name, bytes).await {
         Ok(()) => {}
         Err(DirectoryError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -108,7 +110,7 @@ pub(crate) async fn install_immutable(
         return Ok(());
     }
     let temporary = format!(".{name}.tmp");
-    prepare(io, &temporary, bytes).await?;
+    prepare(io, &temporary, &Bytes::copy_from_slice(bytes)).await?;
     match io.link(&temporary, name).await {
         Ok(()) => {}
         Err(DirectoryError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -131,7 +133,7 @@ pub(crate) async fn replace_current(
     bytes: &[u8; crate::CURRENT_BYTES],
 ) -> Result<(), DirectoryError> {
     let temporary = format!(".CURRENT.{generation}.tmp");
-    prepare(io, &temporary, bytes).await?;
+    prepare(io, &temporary, &Bytes::copy_from_slice(bytes)).await?;
     io.rename(&temporary, CURRENT_FILE).await?;
     io.sync_directory().await?;
     Ok(())
@@ -164,7 +166,7 @@ pub(crate) async fn replace_reusable(
     io: &mut impl Io,
     target: &str,
     temporary: &str,
-    bytes: &[u8],
+    bytes: &Bytes,
 ) -> Result<(), DirectoryError> {
     // Only this unselected temporary is reusable. The target is replaced whole.
     if io.exists(temporary).await? {

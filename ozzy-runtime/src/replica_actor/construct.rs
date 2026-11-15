@@ -81,7 +81,7 @@ impl ReplicaActor {
             journal,
             wire_limits,
             metadata: vec![0; wire_limits.envelope.max_metadata_bytes],
-            payload: vec![0; config.transfer.max_body_bytes],
+            payload: Vec::new(),
             history_allocator: buffer.allocator(),
             buffer: Some(buffer),
             history_receive_allocator: None,

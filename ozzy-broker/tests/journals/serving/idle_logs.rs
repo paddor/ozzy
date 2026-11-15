@@ -147,20 +147,22 @@ async fn idle_logs_share_a_small_descriptor_budget_and_one_lock() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "measurement; OZZY_IDLE_LOGS, OZZY_IDLE_SEGMENT, OZZY_IDLE_SECONDS and OZZY_IDLE_HANDLES select the run"]
+#[ignore = "measurement; OZZY_IDLE_LOGS, OZZY_IDLE_MAX_LOGS, OZZY_IDLE_SEGMENT, OZZY_IDLE_SECONDS and OZZY_IDLE_HANDLES select the run"]
 async fn idle_replicated_logs_report_their_cost() {
     let count = setting("OZZY_IDLE_LOGS", 32);
     let segment = setting("OZZY_IDLE_SEGMENT", 2 * 1024 * 1024) as u64;
     let seconds = setting("OZZY_IDLE_SECONDS", 5) as u64;
     // Descriptors per broker device. A small budget parks idle handles.
     let handles = setting("OZZY_IDLE_HANDLES", 16 * count + 4096);
+    // The class size the brokers plan for. Budgets are split by it.
+    let planned = setting("OZZY_IDLE_MAX_LOGS", count);
     let root = tempfile::tempdir().unwrap();
     let runtime = WriterRuntime::new().unwrap();
     let deployment = deployment_with(root.path(), DeploymentMode::Three, 1, |config| {
         config.logs = Some(ozzy_config::LogClass {
             segment_bytes: segment,
             max_append_bytes: segment / 4,
-            max_logs: count,
+            max_logs: planned,
         });
         for broker in config.brokers.values_mut() {
             for device in broker.devices.values_mut() {

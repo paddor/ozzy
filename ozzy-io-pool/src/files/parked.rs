@@ -187,8 +187,8 @@ pub(super) fn file(shared: &Shared, opened: &Opened) -> io::Result<Arc<OwnedFile
     }
 }
 
-/// Room for one more descriptor on the shard `lane`, parking idle handles
-/// for it.
+/// Room for one more descriptor on the shard `lane`. Handles nobody holds
+/// any more give theirs up first, then idle handles are parked for it.
 pub(super) fn reserve(shared: &Shared, lane: usize) -> io::Result<Reservation> {
     let budget = shared.files().budget.clone();
     loop {
@@ -196,6 +196,11 @@ pub(super) fn reserve(shared: &Shared, lane: usize) -> io::Result<Reservation> {
             Ok(reservation) => return Ok(reservation),
             Err(full) => full,
         };
+        // A dropped handle may still wait for a worker to reclaim it.
+        shared.reclaim_files();
+        if let Ok(reservation) = budget.reserve(lane) {
+            return Ok(reservation);
+        }
         let parked = shared.files().park(lane);
         if parked.is_empty() {
             return Err(full);
