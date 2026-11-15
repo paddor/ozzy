@@ -12,7 +12,7 @@ name = "ozzy_jepsen_probe"
 path = "src/main.rs"
 
 [dependencies]
-omq-tokio = { version = "0.34.3", default-features = false }
+omq-tokio = { version = "0.36.0", default-features = false }
 ozzy-config = { path = "../../ozzy-config" }
 ozzy-io = { path = "../../ozzy-io" }
 ozzy-io-pool = { path = "../../ozzy-io-pool" }
