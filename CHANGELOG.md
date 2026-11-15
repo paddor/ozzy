@@ -76,6 +76,13 @@
 
 ### Changed
 
+- A shard turn finds its marked partitions and due timers without looking
+  at every partition, and a leader keeps no timer for a vote it never
+  sends. The safety sweep of `PartitionActors::with_safety_sweep` visits
+  at most `turn_actors` partitions per interval instead of all of them,
+  so a shard with more partitions sees each once per several intervals.
+  With these, the CPU time of idle replicated logs no longer grows with
+  their count.
 - A follower that restarts with its disk intact rejoins the view it last
   installed instead of requesting the next one, so restarting a follower
   no longer moves leadership. A restarted leader still requests the next

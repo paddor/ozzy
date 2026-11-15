@@ -303,9 +303,12 @@ On the SDK:
   send was refused.
 - A partition whose leader suspects stalled storage wakes when the shard's
   storage lane completes any job, also one of another partition.
-- A periodic safety sweep visits every partition. Work that only the sweep
-  finds counts as `partition_sweep_progress`; a nonzero value means a missed
-  wakeup.
+- The shard finds marked partitions in a bit set and due timers in an
+  ordered set, so a turn costs what it visits, not what the shard holds.
+- A periodic safety sweep visits the next sixteen partitions, so a shard
+  with more takes several intervals to see each once. Work that only the
+  sweep finds counts as `partition_sweep_progress`; a nonzero value means a
+  missed wakeup.
 - A partition with held scheduled records wakes when the earliest
   committed one is due, by the journal clock. While the
   [clock guard](REPLICATION.md#clock-guard) pauses, it checks once per second.

@@ -35,7 +35,9 @@ fn allocated(path: &Path) -> u64 {
     metadata.blocks() * 512 + below
 }
 
-fn usage(root: &Path) -> Usage {
+/// CPU time of the process in clock ticks. Cheap, unlike `usage`, so the
+/// idle slices measure the brokers and not the measurement.
+fn ticks() -> u64 {
     let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
     let fields: Vec<&str> = stat
         .rsplit_once(')')
@@ -43,10 +45,14 @@ fn usage(root: &Path) -> Usage {
         .1
         .split_whitespace()
         .collect();
+    fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap()
+}
+
+fn usage(root: &Path) -> Usage {
     let statm = std::fs::read_to_string("/proc/self/statm").unwrap();
     let pages: u64 = statm.split_whitespace().nth(1).unwrap().parse().unwrap();
     Usage {
-        ticks: fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap(),
+        ticks: ticks(),
         resident: pages * 4096,
         handles: std::fs::read_dir("/proc/self/fd").unwrap().count() as u64,
         disk: allocated(root),
@@ -130,20 +136,20 @@ async fn idle_replicated_logs_report_their_cost() {
         (created.handles - before.handles) as f64 / copies as f64
     );
     // One line per five seconds shows work that starts late or comes in bursts.
-    let mut last = created.ticks;
+    let mut last = ticks();
+    let first = last;
     for _ in 0..seconds / 5 {
         tokio::time::sleep(Duration::from_secs(5)).await;
-        let ticks = usage(root.path()).ticks;
-        println!("idle_slice cpu_ticks={}", ticks - last);
-        last = ticks;
+        let now = ticks();
+        println!("idle_slice cpu_ticks={}", now - last);
+        last = now;
     }
     tokio::time::sleep(Duration::from_secs(seconds % 5)).await;
+    let idle_ticks = ticks() - first;
     let idle = usage(root.path());
     println!(
-        "idle_seconds={seconds} idle_cpu_ticks={} handles={} resident={}",
-        idle.ticks - created.ticks,
-        idle.handles,
-        idle.resident
+        "idle_seconds={seconds} idle_cpu_ticks={idle_ticks} handles={} resident={}",
+        idle.handles, idle.resident
     );
     let totals = ozzy_runtime::profiling::totals();
     for ((name, _, after), (_, _, before)) in totals.rows().zip(events.rows()) {

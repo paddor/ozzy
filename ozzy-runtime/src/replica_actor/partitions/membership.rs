@@ -19,7 +19,9 @@ impl PartitionActors {
     pub fn insert(&mut self, actor: PartitionActor) -> Result<(), Box<Uninserted>> {
         let error = if self.stopped {
             Some(PartitionError::Stopped)
-        } else if self.actors.len() >= self.maximum {
+        } else if self.actors.len() >= self.maximum
+            || self.wakeups.as_ref().is_some_and(|wakeups| wakeups.full())
+        {
             Some(PartitionError::Limits)
         } else if self.index.contains_key(&actor.group()) {
             Some(PartitionError::Duplicate)

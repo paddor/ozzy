@@ -18,6 +18,7 @@ use crate::frontend::Links;
 use wakeups::Wakeups;
 
 mod actor;
+mod bits;
 mod membership;
 mod replication;
 mod resting;
@@ -46,7 +47,7 @@ pub struct PartitionActors {
     remaining: usize,
     now: Duration,
     stopped: bool,
-    wakeups: Option<Wakeups>,
+    wakeups: Option<Box<Wakeups>>,
     turns: u64,
     beats: Option<resting::ShardBeats>,
 }

@@ -303,10 +303,10 @@ fn an_interest_raised_before_a_scan_is_never_lost() {
 #[test]
 fn a_wake_racing_a_partition_visit_is_seen_or_left_marked() {
     loom::model(|| {
-        let shard = std::sync::Arc::new(loom::future::AtomicWaker::new());
+        let ready = std::sync::Arc::new(woken::Ready::new(1));
         // A new partition starts marked: an earlier wake is still pending
         // when the producer marks it again during the visit.
-        let mark = std::sync::Arc::new(woken::Woken::new(shard));
+        let mark = std::sync::Arc::new(woken::Woken::new(ready.clone(), 0));
         let work = Arc::new(AtomicBool::new(false));
         let producer = {
             let mark = mark.clone();
@@ -316,9 +316,17 @@ fn a_wake_racing_a_partition_visit_is_seen_or_left_marked() {
                 std::task::Wake::wake_by_ref(&mark);
             })
         };
-        let seen = mark.is_set() && mark.take() && work.load(Ordering::Acquire);
+        // The shard finds the partition by its bit, then takes the mark.
+        let mut found = [0];
+        ready.drain(&mut found);
+        let seen = found == [1] && mark.take() && work.load(Ordering::Acquire);
         producer.join().unwrap();
-        assert!(seen || mark.is_set(), "the wake was neither seen nor kept");
+        let mut later = [0];
+        ready.drain(&mut later);
+        assert!(
+            seen || (mark.is_set() && later == [1]),
+            "the wake was neither seen nor kept with its bit"
+        );
     });
 }
 

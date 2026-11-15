@@ -391,12 +391,13 @@ impl ReplicaActor {
         if now < self.ack_at || self.resting_backup() {
             return Ok(());
         }
-        let retransmit = self.config.timing.retransmit;
-        self.ack_at = now.saturating_add(retransmit);
+        // A primary has no vote to repeat, so it keeps no timer for one.
         let primary = self.configuration.primary(self.driver.scope().view);
         if primary == self.local {
             return Ok(());
         }
+        let retransmit = self.config.timing.retransmit;
+        self.ack_at = now.saturating_add(retransmit);
         let Some(normal) = self.driver.normal() else {
             return Ok(());
         };

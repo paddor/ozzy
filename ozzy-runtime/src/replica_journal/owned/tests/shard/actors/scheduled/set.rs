@@ -317,6 +317,19 @@ fn replaced_sessions_stop_waking_quiet_partition_actors() {
 
 #[test]
 fn woken_partitions_progress_and_quiet_partitions_wait_for_their_timer_visit() {
+    // The timer visit reaches every partition exactly once.
+    quiet_partitions_wait_for_the_sweep(3, 3);
+}
+
+#[test]
+fn a_sweep_interval_visits_no_more_partitions_than_one_turn_may() {
+    // Three partitions take three intervals, one visit each.
+    quiet_partitions_wait_for_the_sweep(1, 1);
+}
+
+/// Three groups per shard confirm a proposal and fall quiet. One sweep
+/// interval later, each shard visits `swept` of its three partitions.
+fn quiet_partitions_wait_for_the_sweep(turn_actors: usize, swept: u64) {
     let (mut controller, io) = setup();
     let mut assigned: [Vec<_>; 3] = std::array::from_fn(|_| Vec::new());
     let mut replies = Vec::new();
@@ -331,7 +344,7 @@ fn woken_partitions_progress_and_quiet_partitions_wait_for_their_timer_visit() {
     }
     let interval = Duration::from_millis(10);
     let mut shards = assigned.map(|actors| {
-        PartitionActors::new(actors, 3, 3)
+        PartitionActors::new(actors, 3, turn_actors)
             .unwrap()
             .with_safety_sweep(interval)
             .unwrap()
@@ -385,11 +398,10 @@ fn woken_partitions_progress_and_quiet_partitions_wait_for_their_timer_visit() {
             .collect::<Vec<_>>(),
         quiet
     );
-    // The timer visit reaches every partition exactly once.
     now += interval;
     budgeted_step(&mut shards, &mut routes, now, 0);
     for (shard, quiet) in shards.iter().zip(&quiet) {
-        assert_eq!(shard.turns() - quiet, 3);
+        assert_eq!(shard.turns() - quiet, swept);
     }
     for shard in shards {
         close_set(&mut controller, shard);
