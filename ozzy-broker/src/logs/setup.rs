@@ -8,7 +8,12 @@ use ozzy_journal_segment::GroupIdentity;
 use ozzy_proto::{GroupId, NodeId, PartitionIncarnation, StoreId, VolumeId};
 use ozzy_replication::{ConfigurationRecord, ConfiguredVoter, Digest, local};
 use ozzy_runtime::frontend::{Placement, RuntimeRoute};
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
+use tokio::sync::OnceCell;
 use uuid::Uuid;
 
 /// Checked deployment facts shared by every shard of one broker.
@@ -19,7 +24,13 @@ pub(crate) struct LogSetup {
     volumes: BTreeMap<String, Uuid>,
     principals: BTreeMap<Uuid, Digest>,
     pub(crate) class: LogClass,
+    /// The lock of each device's log directory, taken by the first shard
+    /// that starts on the device and held while the broker runs.
+    locks: Arc<Mutex<BTreeMap<PathBuf, Arc<OnceCell<ozzy_io::Handle>>>>>,
 }
+
+/// The file whose lock keeps other processes off a device's log stores.
+const VOLUME_LOCK: &str = "volume.lock";
 
 fn failure(reason: impl std::fmt::Display) -> StartupError {
     StartupError::Runtime(reason.to_string())
@@ -38,7 +49,27 @@ impl LogSetup {
             broker: local.broker,
             volumes: local.volumes.clone(),
             principals: principals.clone(),
+            locks: Arc::default(),
         })
+    }
+
+    /// The lane of `io` for the log stores below `directory`, which one
+    /// lock guards as a whole: the stores lock no file of their own, so an
+    /// idle log holds no descriptor. Shards of one device share the lock.
+    /// Fails while another process holds it.
+    pub(crate) async fn guarded(
+        &self,
+        io: &ozzy_io::Local,
+        directory: &Path,
+    ) -> Result<ozzy_io::Local, StartupError> {
+        let cell = {
+            let mut locks = ozzy_io::lock_unpoisoned(&self.locks);
+            locks.entry(directory.to_path_buf()).or_default().clone()
+        };
+        let lock = cell
+            .get_or_try_init(|| super::registry::lock(io, directory.join(VOLUME_LOCK)))
+            .await?;
+        Ok(io.guarded_by(lock.clone()))
     }
 
     /// The shard of this broker that owns log `id`.

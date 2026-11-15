@@ -22,13 +22,22 @@ impl Budget {
         })
     }
 
+    #[cfg(test)]
+    pub(super) fn used(&self, shard: usize) -> usize {
+        self.used[shard].load(Ordering::Acquire)
+    }
+
+    /// The descriptors `shard` may hold at once.
+    pub(super) fn share(&self, shard: usize) -> usize {
+        self.limit / self.used.len() + usize::from(shard < self.limit % self.used.len())
+    }
+
     #[allow(
         deprecated,
         reason = "Atomic::try_update requires Rust 1.95; MSRV is 1.93"
     )]
     pub(super) fn reserve(self: &Arc<Self>, shard: usize) -> io::Result<Reservation> {
-        let limit =
-            self.limit / self.used.len() + usize::from(shard < self.limit % self.used.len());
+        let limit = self.share(shard);
         self.used[shard]
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 (used < limit).then_some(used + 1)
@@ -72,6 +81,11 @@ impl OwnedFile {
             process: std::process::id(),
             _reservation: reservation,
         }
+    }
+
+    /// Whether this descriptor holds a file lock, which closing would drop.
+    pub(super) fn locked(&self) -> bool {
+        self.locked.load(Ordering::Acquire)
     }
 
     pub(super) fn lock(&self) -> Result<(), TryLockError> {

@@ -40,6 +40,33 @@ async fn open(
     }
 }
 
+/// Open the lock file at `path`, creating it if needed, and lock it. The
+/// lock lasts while the handle does.
+pub(crate) async fn lock(io: &Local, path: PathBuf) -> Result<ozzy_io::Handle, StartupError> {
+    let file = |mode| Operation::Open {
+        path: path.clone(),
+        mode,
+        direct: false,
+        data_sync: false,
+    };
+    let created = io.execute(Class::Progress, file(OpenMode::CreateNew)).await;
+    let handle = match created {
+        Ok(completed) => match &*completed {
+            Outcome::Opened(handle) => handle.clone(),
+            _ => return Err(io_error(&path, io::ErrorKind::InvalidData.into())),
+        },
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            open(io, &path, file(OpenMode::ReadWrite)).await?
+        }
+        Err(error) => return Err(io_error(&path, error)),
+    };
+    let locked = Operation::LockExclusive {
+        handle: handle.clone(),
+    };
+    run(io, &path, locked).await?;
+    Ok(handle)
+}
+
 /// Persist the directory entry changes made below `directory`.
 async fn sync_directory(io: &Local, directory: &Path) -> Result<(), StartupError> {
     let path = directory.to_path_buf();

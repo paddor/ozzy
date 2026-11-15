@@ -85,9 +85,8 @@ struct State {
     grants: Option<ozzy_runtime::frontend::ShardGrants>,
     /// Log handles by topic and partition number, until registration.
     handles: Vec<(String, u32, ozzy_runtime::log::Log)>,
-    /// This shard's ID and its lane to the device.
+    /// This shard's ID.
     shard: u32,
-    io: ozzy_io::Local,
     /// Configured partitions: the first entries of `identities`. Runtime
     /// logs follow them.
     fixed: usize,

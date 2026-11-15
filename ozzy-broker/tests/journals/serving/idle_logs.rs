@@ -6,6 +6,7 @@ use ozzy_broker::LogSpec;
 use ozzy_broker::log::LogRole;
 use ozzy_proto::{GroupId, PartitionIncarnation};
 use std::os::unix::fs::MetadataExt;
+use std::path::PathBuf;
 
 /// What the process uses now.
 #[derive(Clone, Copy, Debug)]
@@ -75,12 +76,84 @@ fn setting(name: &str, default: usize) -> usize {
     std::env::var(name).map_or(default, |value| value.parse().unwrap())
 }
 
+/// Paths below `root` this process holds open.
+fn open_below(root: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .flatten()
+        .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+        .filter(|path| path.starts_with(root))
+        .collect()
+}
+
+/// Twelve replicated logs per broker elect leaders within a budget of 24
+/// descriptors per broker, less than two per log: idle handles give their
+/// descriptors up, and one lock per device guards all its log stores.
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "measurement; OZZY_IDLE_LOGS, OZZY_IDLE_SEGMENT and OZZY_IDLE_SECONDS select the run"]
+async fn idle_logs_share_a_small_descriptor_budget_and_one_lock() {
+    let count = 12;
+    let root = tempfile::tempdir().unwrap();
+    let runtime = WriterRuntime::new().unwrap();
+    let deployment = deployment_with(root.path(), DeploymentMode::Three, 1, |config| {
+        config.logs = Some(ozzy_config::LogClass {
+            segment_bytes: 2 * 1024 * 1024,
+            max_append_bytes: 512 * 1024,
+            max_logs: count,
+        });
+        for broker in config.brokers.values_mut() {
+            for device in broker.devices.values_mut() {
+                device.workers.open_handles = 24;
+            }
+        }
+    });
+    let nodes: Vec<NodeId> = deployment
+        .iter()
+        .map(|(checked, _)| {
+            NodeId::from_bytes(*checked.identity.brokers[&checked.plan.name].as_bytes())
+        })
+        .collect();
+    let brokers = start_brokers(&runtime, deployment).await;
+    let elected = async {
+        for index in 0..count {
+            let spec = spec(index, &nodes);
+            for broker in &brokers {
+                broker.create_log(spec.clone()).await.unwrap();
+            }
+            let led = || {
+                brokers.iter().any(|broker| {
+                    broker.runtime_log(spec.id).unwrap().status().borrow().role == LogRole::Leader
+                })
+            };
+            while !led() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(60), elected)
+        .await
+        .unwrap();
+    let open = open_below(root.path());
+    assert!(open.len() <= 3 * 24, "{} descriptors", open.len());
+    let named = |name: &str| {
+        let below_logs = |path: &&PathBuf| path.components().any(|part| part.as_os_str() == "logs");
+        let count = open.iter().filter(below_logs);
+        count.filter(|path| path.ends_with(name)).count()
+    };
+    assert_eq!(named("volume.lock"), 3, "one lock per broker device");
+    assert_eq!(named("group.lock"), 0, "a log store locks no file");
+    for broker in brokers {
+        broker.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "measurement; OZZY_IDLE_LOGS, OZZY_IDLE_SEGMENT, OZZY_IDLE_SECONDS and OZZY_IDLE_HANDLES select the run"]
 async fn idle_replicated_logs_report_their_cost() {
     let count = setting("OZZY_IDLE_LOGS", 32);
     let segment = setting("OZZY_IDLE_SEGMENT", 2 * 1024 * 1024) as u64;
     let seconds = setting("OZZY_IDLE_SECONDS", 5) as u64;
+    // Descriptors per broker device. A small budget parks idle handles.
+    let handles = setting("OZZY_IDLE_HANDLES", 16 * count + 4096);
     let root = tempfile::tempdir().unwrap();
     let runtime = WriterRuntime::new().unwrap();
     let deployment = deployment_with(root.path(), DeploymentMode::Three, 1, |config| {
@@ -91,7 +164,7 @@ async fn idle_replicated_logs_report_their_cost() {
         });
         for broker in config.brokers.values_mut() {
             for device in broker.devices.values_mut() {
-                device.workers.open_handles = 16 * count + 4096;
+                device.workers.open_handles = handles;
             }
         }
     });

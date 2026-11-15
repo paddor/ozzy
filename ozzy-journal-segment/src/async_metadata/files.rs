@@ -17,6 +17,9 @@ pub(super) struct Files {
     pub(super) io: Local,
     directory: Handle,
     pub(super) lock: Handle,
+    /// The lock is this store's own file. Otherwise it guards a whole
+    /// volume and outlives the store.
+    own_lock: bool,
     evidence: Option<Handle>,
     pub(super) limits: Limits,
     pub(super) readers: crate::async_files::ReadHandles,
@@ -37,21 +40,19 @@ impl Files {
             )
             .await?,
         )?;
-        let lock = open_lock(&io, &root, create_lock).await?;
-        done(
-            io.execute(
-                Class::Progress,
-                Operation::LockExclusive {
-                    handle: lock.clone(),
-                },
-            )
-            .await?,
-        )?;
+        // A lane whose volume is locked as a whole brings that lock.
+        let guard = io.guard().cloned();
+        let own_lock = guard.is_none();
+        let lock = match guard {
+            Some(guard) => guard,
+            None => lock_store(&io, &root, create_lock).await?,
+        };
         Ok(Self {
             root,
             io,
             directory,
             lock,
+            own_lock,
             evidence: None,
             limits,
             readers: std::rc::Rc::default(),
@@ -61,7 +62,9 @@ impl Files {
     pub(super) async fn close_all(self) -> Result<(), DirectoryError> {
         drop(self.readers);
         let mut result = Ok(());
-        for handle in self.evidence.into_iter().chain([self.directory, self.lock]) {
+        let lock = self.own_lock.then_some(self.lock);
+        let handles = self.evidence.into_iter().chain([self.directory]);
+        for handle in handles.chain(lock) {
             let closed = self
                 .io
                 .execute(Class::Progress, Operation::Close { handle })
@@ -298,6 +301,17 @@ fn check_limits(io: &Local, limits: Limits) -> Result<(), DirectoryError> {
         );
     }
     Ok(())
+}
+
+/// Open and lock the store's own lock file.
+async fn lock_store(io: &Local, root: &Path, create_lock: bool) -> Result<Handle, DirectoryError> {
+    let lock = open_lock(io, root, create_lock).await?;
+    let handle = lock.clone();
+    done(
+        io.execute(Class::Progress, Operation::LockExclusive { handle })
+            .await?,
+    )?;
+    Ok(lock)
 }
 
 /// Open the lock file, creating it only when asked. A concurrent creator

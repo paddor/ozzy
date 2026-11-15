@@ -69,7 +69,6 @@ pub(super) async fn build(
         admin: admin_lane(&config, shard.plan.id)?,
         grants: config.reader_grants.shard(shard.plan.id),
         shard: shard.plan.id,
-        io: shard.io.clone(),
         fixed,
         runtime,
         config,

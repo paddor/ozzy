@@ -371,6 +371,12 @@ Only the leader releases, one step at a time.
 - Only completions that match the current journal generation advance journal
   state.
 - Segment write handles stay open until roll or shutdown.
+- A handle holds a descriptor only while its shard's share of
+  `open_handles` has room. When the share is spent, the handles used
+  longest ago give their descriptors up and open their paths again at the
+  next use. The backend follows its own renames and removals. A file whose
+  name is gone and a locked file keep their descriptors. Another file at a
+  parked handle's path fails the next use.
 - Reader and follower replay buffers take bounded shares of the shard's
   `budget.resident_bytes`.
 
@@ -513,7 +519,7 @@ the broker plan. Startup rejects conflicting active contexts.
 | `max_inflight` | Ordinary physical jobs in execution |
 | `queued_jobs`, `queued_bytes` | Retained ordinary jobs and bytes |
 | `progress_jobs`, `progress_bytes` | Reserved progress jobs and bytes |
-| `open_handles` | Open file and directory handles |
+| `open_handles` | Open file and directory descriptors; idle handles give theirs up |
 
 [Storage](STORAGE.md#operator-tuning) covers the tradeoffs.
 

@@ -31,8 +31,8 @@ const OPENS: usize = 8;
 
 /// A finished storage job, applied to the shard on its own thread.
 enum Done {
-    /// The records found at start.
-    Loaded(Result<Vec<LogRecord>, StartupError>),
+    /// The lane for log stores, and the records found at start.
+    Loaded(Result<(Local, Vec<LogRecord>), StartupError>),
     /// A ready log opened again at start.
     Opened {
         record: LogRecord,
@@ -60,6 +60,9 @@ pub(super) struct RuntimeLogs {
     setup: Arc<LogSetup>,
     /// Where this shard's device keeps log records and stores.
     directory: PathBuf,
+    /// The lane for log stores. From the load on, the lock of the device's
+    /// log directory guards them as a whole.
+    io: Local,
     commands: mpsc::Receiver<Command>,
     table: LogTable,
     routes: RuntimeRoutes,
@@ -84,11 +87,12 @@ impl RuntimeLogs {
         let jobs = FuturesUnordered::<Pin<Box<dyn Future<Output = Done>>>>::new();
         // The shard reads its records once it runs: its partitions hold
         // device budget that only their own turns release.
-        let (io, listed, maximum) = (io.clone(), directory.clone(), setup.class.max_logs);
+        let (lane, listed, locks) = (io.clone(), directory.clone(), setup.clone());
         jobs.push(Box::pin(async move {
-            Done::Loaded(registry::load(&io, &listed, maximum).await)
+            Done::Loaded(load(&lane, &locks, &listed).await)
         }));
         Ok(Self {
+            io: io.clone(),
             directory,
             setup,
             commands,
@@ -105,6 +109,18 @@ impl RuntimeLogs {
     pub(super) fn settled(&self) -> bool {
         self.starting == 0 && self.unopened.is_empty()
     }
+}
+
+/// Lock the device's log directory, then read its records.
+async fn load(
+    io: &Local,
+    setup: &LogSetup,
+    directory: &Path,
+) -> Result<(Local, Vec<LogRecord>), StartupError> {
+    crate::format::initialize_directory(io, directory).await?;
+    let guarded = setup.guarded(io, directory).await?;
+    let records = registry::load(io, directory, setup.class.max_logs).await?;
+    Ok((guarded, records))
 }
 
 fn group(record: &LogRecord) -> GroupId {
@@ -194,7 +210,7 @@ impl State {
             }
             runtime.setup.check(&record)?;
             runtime.table.set(id, record.state, None);
-            let (io, directory) = (self.io.clone(), runtime.directory.clone());
+            let (io, directory) = (runtime.io.clone(), runtime.directory.clone());
             match record.state {
                 LogState::Creating => {
                     // It never served or voted: nothing depends on it.
@@ -231,11 +247,11 @@ impl State {
     }
 
     /// Open waiting logs, at most `OPENS` at once.
-    fn open_waiting(&self, runtime: &mut RuntimeLogs) {
+    fn open_waiting(runtime: &mut RuntimeLogs) {
         while runtime.starting < OPENS
             && let Some(record) = runtime.unopened.pop()
         {
-            let (io, setup) = (self.io.clone(), runtime.setup.clone());
+            let (io, setup) = (runtime.io.clone(), runtime.setup.clone());
             runtime.starting += 1;
             runtime.jobs.push(Box::pin(async move {
                 let generation = JournalGeneration(uuid::Uuid::now_v7().as_u128());
@@ -287,7 +303,7 @@ impl State {
             }
             match runtime.commands.poll_recv(cx) {
                 Poll::Ready(Some(Command::Create { spec, reply })) => {
-                    self.start_create(runtime, &spec, reply);
+                    Self::start_create(runtime, &spec, reply);
                 }
                 Poll::Ready(Some(Command::Delete { id, reply })) => {
                     self.start_delete(runtime, id, reply);
@@ -308,13 +324,12 @@ impl State {
     ) -> Result<(), StartupError> {
         while let Poll::Ready(Some(done)) = runtime.jobs.poll_next_unpin(cx) {
             self.finish(runtime, done, binding, now)?;
-            self.open_waiting(runtime);
+            Self::open_waiting(runtime);
         }
         Ok(())
     }
 
     fn start_create(
-        &self,
         runtime: &mut RuntimeLogs,
         spec: &crate::LogSpec,
         reply: oneshot::Sender<Result<(), CreateError>>,
@@ -345,7 +360,7 @@ impl State {
         runtime.records.insert(spec.id, record.clone());
         runtime.table.set(spec.id, LogState::Creating, None);
         let (io, setup, directory) = (
-            self.io.clone(),
+            runtime.io.clone(),
             runtime.setup.clone(),
             runtime.directory.clone(),
         );
@@ -390,7 +405,11 @@ impl State {
             return;
         };
         record.state = LogState::Deleting;
-        let (io, directory, record) = (self.io.clone(), runtime.directory.clone(), record.clone());
+        let (io, directory, record) = (
+            runtime.io.clone(),
+            runtime.directory.clone(),
+            record.clone(),
+        );
         runtime.jobs.push(Box::pin(async move {
             let removed = delete(&io, &directory, &record, actor).await;
             Done::Deleted {
@@ -411,9 +430,11 @@ impl State {
         now: Duration,
     ) -> Result<(), StartupError> {
         match done {
-            Done::Loaded(records) => {
+            Done::Loaded(loaded) => {
                 runtime.starting -= 1;
-                self.recorded(runtime, records?)?;
+                let (io, records) = loaded?;
+                runtime.io = io;
+                self.recorded(runtime, records)?;
             }
             Done::Opened { record, opened } => {
                 runtime.starting -= 1;

@@ -1,17 +1,19 @@
 use ozzy_io::{
-    Entry, FileKind, Handle, HandleOwner, HandleToken, Metadata, OpenMode, Operation, Outcome,
-    ReadBuffer, SyncMode, WriteBuffer,
+    Entry, FileKind, Handle, HandleOwner, Metadata, OpenMode, Operation, Outcome, ReadBuffer,
+    SyncMode, WriteBuffer,
 };
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::{Shared, handle_waker};
 
 pub(crate) mod handles;
-use handles::{Budget, OwnedFile, Reservation};
+mod parked;
+use handles::{Budget, OwnedFile};
+use parked::{Identity, Opened, Origin};
 
 #[derive(Debug)]
 pub(super) struct Files {
@@ -19,18 +21,13 @@ pub(super) struct Files {
     next: u64,
     budget: Arc<Budget>,
     entries: HashMap<u64, Slot>,
+    /// The handles that would open each path again.
+    paths: HashMap<PathBuf, Vec<u64>>,
 }
 
 #[derive(Debug)]
 struct Slot {
     open: Option<Arc<Opened>>,
-}
-
-#[derive(Debug)]
-struct Opened {
-    file: Arc<OwnedFile>,
-    token: HandleToken,
-    direct: bool,
 }
 
 impl Files {
@@ -40,37 +37,47 @@ impl Files {
             next: 0,
             budget: Budget::new(limit, shards),
             entries: HashMap::new(),
+            paths: HashMap::new(),
         }
     }
 
-    fn reserve(&mut self, shard: usize) -> io::Result<(u64, Reservation)> {
-        let reservation = self.budget.reserve(shard)?;
+    /// A slot for a handle that is about to open.
+    fn slot(&mut self) -> io::Result<u64> {
         let key = self.next;
         self.next = key
             .checked_add(1)
             .ok_or_else(|| io::Error::other("file handle identity exhausted"))?;
         self.entries.insert(key, Slot { open: None });
-        Ok((key, reservation))
+        Ok(key)
     }
 
-    fn remove(&mut self, key: u64) -> Option<Slot> {
-        self.entries.remove(&key)
+    /// Drop the slot of `key` and return its descriptor, if it holds one,
+    /// for the caller to close outside the table lock.
+    fn remove(&mut self, key: u64) -> Option<Arc<OwnedFile>> {
+        let opened = self.entries.remove(&key)?.open?;
+        self.unname(key, &opened);
+        opened.retire()
     }
 
-    pub(super) fn reclaim(&mut self) -> Vec<Arc<OwnedFile>> {
+    /// Drop the slots of `lapsed` handles nobody holds any more, and return
+    /// their descriptors for the caller to close.
+    pub(super) fn reclaim(&mut self, lapsed: &[u64]) -> Vec<Arc<OwnedFile>> {
+        let abandoned = |slot: &Slot| {
+            let open = slot.open.as_ref();
+            open.is_some_and(|open| !open.token.is_alive())
+        };
         let mut retired = Vec::new();
-        self.entries.retain(|_, slot| {
-            let Some(abandoned) = slot.open.take_if(|open| !open.token.is_alive()) else {
-                return true;
-            };
-            retired.push(abandoned.file.clone());
-            false
-        });
+        for &key in lapsed {
+            if self.entries.get(&key).is_some_and(abandoned) {
+                retired.extend(self.remove(key));
+            }
+        }
         retired
     }
 
     pub(super) fn clear(&mut self) {
         self.entries.clear();
+        self.paths.clear();
     }
 
     fn key(&self, handle: &Handle) -> io::Result<u64> {
@@ -83,7 +90,10 @@ impl Files {
     }
 }
 
-fn get(owner: &HandleOwner, handle: &Handle) -> io::Result<(Arc<OwnedFile>, bool)> {
+/// The descriptor of an open handle, and whether it does direct I/O. A
+/// parked handle opens its file again here.
+fn get(shared: &Shared, handle: &Handle) -> io::Result<(Arc<OwnedFile>, bool)> {
+    let owner = &shared.handles;
     if owner.key(handle).is_none() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -93,7 +103,7 @@ fn get(owner: &HandleOwner, handle: &Handle) -> io::Result<(Arc<OwnedFile>, bool
     let opened = owner
         .resource::<Opened>(handle)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "closed file handle"))?;
-    Ok((opened.file.clone(), opened.direct))
+    Ok((parked::file(shared, &opened)?, opened.direct))
 }
 
 pub(super) fn direct_file(
@@ -102,11 +112,11 @@ pub(super) fn direct_file(
 ) -> io::Result<Option<Arc<OwnedFile>>> {
     if let Operation::Protected { handles, .. } = operation {
         for handle in handles {
-            get(&shared.handles, handle)?;
+            get(shared, handle)?;
         }
     }
     if let Operation::Write { handle, data, .. } = operation.unprotected() {
-        let (file, direct) = get(&shared.handles, handle)?;
+        let (file, direct) = get(shared, handle)?;
         // Zero-length writes have no kernel asynchronous work. Keep the same
         // alignment validation and zero result as the ordinary pool backend.
         Ok((direct && !data.is_empty()).then_some(file))
@@ -120,7 +130,7 @@ pub(super) fn execute(
     shared: &Arc<Shared>,
     origin: usize,
 ) -> io::Result<Outcome> {
-    let get = |handle: &Handle| get(&shared.handles, handle);
+    let get = |handle: &Handle| get(shared, handle);
     match operation {
         Operation::Protected { operation, handles } => {
             let protection: Vec<_> = handles.iter().map(get).collect::<io::Result<_>>()?;
@@ -170,13 +180,13 @@ pub(super) fn execute(
         Operation::Rename {
             source,
             destination,
-        } => fs::rename(source, destination).map(|()| Outcome::Done),
+        } => parked::rename(shared, &source, &destination).map(|()| Outcome::Done),
         Operation::HardLink {
             source,
             destination,
         } => fs::hard_link(source, destination).map(|()| Outcome::Done),
-        Operation::RemoveFile { path } => fs::remove_file(path).map(|()| Outcome::Done),
-        Operation::RemoveDirectory { path } => fs::remove_dir(path).map(|()| Outcome::Done),
+        Operation::RemoveFile { path } => parked::remove(shared, &path, false),
+        Operation::RemoveDirectory { path } => parked::remove(shared, &path, true),
     }
 }
 
@@ -209,7 +219,7 @@ fn close(shared: &Shared, handle: &Handle) -> io::Result<Outcome> {
         return Err(io::ErrorKind::NotFound.into());
     }
     files.owner.invalidate(handle)?;
-    let closed = files.remove(key).ok_or(io::ErrorKind::NotFound)?;
+    let closed = files.remove(key);
     drop(files);
     drop(closed);
     Ok(Outcome::Done)
@@ -217,7 +227,7 @@ fn close(shared: &Shared, handle: &Handle) -> io::Result<Outcome> {
 
 /// What an open expects at its path: a file with its access mode and flags, or
 /// a directory.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct Target {
     mode: Option<OpenMode>,
     direct: bool,
@@ -237,6 +247,15 @@ impl Target {
             direct,
             data_sync,
         }
+    }
+
+    /// The same file, opened again: it exists by now.
+    const fn again(self) -> Self {
+        let mode = match self.mode {
+            Some(OpenMode::CreateNew) => Some(OpenMode::ReadWrite),
+            mode => mode,
+        };
+        Self { mode, ..self }
     }
 
     fn options(self) -> OpenOptions {
@@ -268,40 +287,36 @@ impl Target {
 }
 
 fn open(shared: &Arc<Shared>, origin: usize, path: &Path, target: Target) -> io::Result<Outcome> {
-    let (key, reservation) = shared.with_reclaimed_files(|files| files.reserve(origin))?;
-    // The reserved slot bounds even concurrent opens. No table lock spans I/O.
-    let result = open_file(path, target);
+    shared.reclaim_files();
+    // The reservation bounds even concurrent opens. No table lock spans I/O.
+    let reservation = parked::reserve(shared, origin)?;
+    let (file, identity) = open_file(path, target)?;
+    let file = OwnedFile::new(file, reservation);
     let mut files = shared.files();
-    match result {
-        Ok(file) => {
-            let (handle, token) =
-                files
-                    .owner
-                    .create_with_direct_io(key, handle_waker(shared), target.direct);
-            let opened = Arc::new(Opened {
-                file: Arc::new(OwnedFile::new(file, reservation)),
-                token,
-                direct: target.direct,
-            });
-            if let Err(error) = files.owner.bind(&handle, &opened) {
-                // Close the new file only after releasing the table lock.
-                files.remove(key);
-                drop(files);
-                return Err(error);
-            }
-            // Reclamation keeps reserved slots; only abandoned opens leave.
-            let slot = files
-                .entries
-                .get_mut(&key)
-                .ok_or_else(|| io::Error::other("reserved file slot vanished"))?;
-            slot.open = Some(opened);
-            Ok(Outcome::Opened(handle))
-        }
-        Err(error) => {
-            files.remove(key);
-            Err(error)
-        }
+    let key = files.slot()?;
+    let (handle, token) =
+        files
+            .owner
+            .create_with_direct_io(key, handle_waker(shared, key), target.direct);
+    let named = Origin {
+        path: path.to_path_buf(),
+        target,
+        identity,
+    };
+    let opened = Arc::new(Opened::new(file, named, token, (origin, shared.now())));
+    if let Err(error) = files.owner.bind(&handle, &opened) {
+        files.entries.remove(&key);
+        // Close the new file only after releasing the table lock.
+        drop(files);
+        return Err(error);
     }
+    files.name(key, path);
+    let slot = files
+        .entries
+        .get_mut(&key)
+        .ok_or_else(|| io::Error::other("new file slot vanished"))?;
+    slot.open = Some(opened);
+    Ok(Outcome::Opened(handle))
 }
 
 fn read_buffer(
@@ -344,7 +359,7 @@ fn list_directory(path: &Path, max_entries: usize, max_name_bytes: usize) -> io:
     Ok(Outcome::Directory(entries))
 }
 
-fn open_file(path: &Path, target: Target) -> io::Result<File> {
+fn open_file(path: &Path, target: Target) -> io::Result<(File, Identity)> {
     #[cfg(not(target_os = "linux"))]
     if target.direct || target.data_sync {
         return Err(io::ErrorKind::Unsupported.into());
@@ -366,7 +381,7 @@ fn open_file(path: &Path, target: Target) -> io::Result<File> {
     if target.direct {
         check_direct_alignment(&file)?;
     }
-    Ok(file)
+    Ok((file, Identity::of(&metadata)))
 }
 
 /// Direct I/O buffers and offsets are 4 KiB aligned; the device must accept that.

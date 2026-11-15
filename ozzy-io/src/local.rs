@@ -1,6 +1,6 @@
 //! One submission lane shared by partition tasks on the same application shard.
 
-use crate::{Admission, Backend, Class, Completed, Completion, Operation, Rejected};
+use crate::{Admission, Backend, Class, Completed, Completion, Handle, Operation, Rejected};
 use std::{
     cell::{Cell, RefCell},
     io,
@@ -16,6 +16,9 @@ pub struct Local {
     admission: Admission,
     shard: usize,
     completed: Rc<Cell<u64>>,
+    /// A held lock that already keeps other processes off the files this
+    /// lane works on.
+    guard: Option<Handle>,
 }
 
 impl Local {
@@ -26,7 +29,26 @@ impl Local {
             shard: backend.shard(),
             backend: Rc::new(RefCell::new(Box::new(backend))),
             completed: Rc::default(),
+            guard: None,
         }
+    }
+
+    /// The same lane for stores below a directory that `lock` guards as a
+    /// whole. `lock` is a handle of this backend that holds an exclusive
+    /// file lock for as long as any such store is open. A store opened
+    /// through the returned lane takes that lock for its own and locks no
+    /// file itself.
+    #[must_use]
+    pub fn guarded_by(&self, lock: Handle) -> Self {
+        Self {
+            guard: Some(lock),
+            ..self.clone()
+        }
+    }
+
+    /// The lock that guards the stores of this lane as a whole, if any.
+    pub fn guard(&self) -> Option<&Handle> {
+        self.guard.as_ref()
     }
 
     /// Try admission without waiting; rejection returns the original operation.

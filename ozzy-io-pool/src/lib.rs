@@ -525,6 +525,26 @@ fn direct_senders(seed: Option<&direct::Senders>) -> io::Result<Option<direct::S
     .transpose()
 }
 
-fn handle_waker(shared: &Arc<Shared>) -> Waker {
-    Waker::from(shared.clone())
+/// Wakes the pool when the last reference to the handle `key` drops, and
+/// names the handle, so reclamation looks at it alone.
+fn handle_waker(shared: &Arc<Shared>, key: u64) -> Waker {
+    Waker::from(Arc::new(Lapsed {
+        shared: shared.clone(),
+        key,
+    }))
+}
+
+struct Lapsed {
+    shared: Arc<Shared>,
+    key: u64,
+}
+
+impl std::task::Wake for Lapsed {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        ozzy_io::lock_unpoisoned(&self.shared.lapsed).push(self.key);
+        self.shared.wake_by_ref();
+    }
 }

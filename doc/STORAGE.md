@@ -68,6 +68,10 @@ the directory synced.
   roots or replaces a marker, even a damaged one.
 - `group.lock` cannot fence copies elsewhere; persisted placement selects the
   writable store. Opening an existing store cannot create even a missing lock.
+- Runtime log stores live in `<device-root>/logs/<log-id>/` and have no
+  `group.lock`. One `<device-root>/logs/volume.lock`, held while the broker
+  runs, guards all log stores of the device, so an idle log holds no
+  descriptor.
 - Metadata is written to a temporary, synchronized, then published. An
   interrupted temporary selects nothing; a retry recreates it. Existing final
   names must match exactly.

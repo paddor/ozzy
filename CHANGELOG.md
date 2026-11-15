@@ -22,6 +22,12 @@
   `ozzy_replication::wire::Control` new `Rest` and `RestOk` variants. A
   broker of an older release rejects these commands, so every broker of a
   cluster must run this release.
+- A store opened through an `ozzy_io::Local` made by `guarded_by` takes
+  the lane's lock for its own and has no `group.lock`. Runtime log stores
+  are opened this way under one `logs/volume.lock` per device, so a second
+  process on the same device's logs fails at start, not per log.
+- The pool and AIO backends no longer fail an open with `WouldBlock`
+  while idle handles hold descriptors: they park those first.
 
 ### Added
 
@@ -76,6 +82,15 @@
 
 ### Changed
 
+- File handles hold descriptors on demand. When a shard's share of
+  `open_handles` is spent, the backend closes the descriptors of the
+  handles used longest ago and opens their paths again at the next use.
+  It follows the renames and removals it performs; a file without a name
+  and a locked file keep their descriptors. With one lock per device for
+  runtime logs, the descriptors a broker holds no longer grow with its
+  idle logs. Dropped handles are reclaimed without a scan of all handles.
+- `ozzy_io::Local::guarded_by` and `guard` share one held lock among the
+  stores of a lane.
 - A shard turn finds its marked partitions and due timers without looking
   at every partition, and a leader keeps no timer for a vote it never
   sends. The safety sweep of `PartitionActors::with_safety_sweep` visits
