@@ -1,5 +1,6 @@
 //! Broker lifecycle assembled from the production shard, journal, and frontend owners.
 
+mod beats;
 mod config;
 mod context;
 #[cfg(feature = "simulation")]
@@ -343,6 +344,7 @@ async fn start_frontend(
         let (mut service, handoffs) = serving_config.service(registered.into_values().collect())?;
         serving_config.handoff(&mut service, handoffs)?;
         frontend.sample_clock(serving_config.install_clock(&mut service));
+        serving_config.install_beats(&mut service);
         #[cfg(feature = "simulation")]
         frontend.cut_peers(serving_config.cut.clone());
         frontend

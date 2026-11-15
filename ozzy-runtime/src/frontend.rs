@@ -21,8 +21,8 @@ pub use crate::peer_sessions::{Handled as Negotiated, LinkIds, Sessions as LinkS
 
 mod service;
 pub use service::{
-    Access, ClockNow, ClockSampling, ClockStatus, ClockTrust, Link, Links, ReceiveError, Service,
-    ServiceError,
+    Access, BeatTiming, Beats, ClockNow, ClockSampling, ClockStatus, ClockTrust, Link, Links,
+    ReceiveError, Service, ServiceError,
 };
 
 mod port;

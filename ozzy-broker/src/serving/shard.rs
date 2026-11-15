@@ -341,6 +341,15 @@ impl Waits {
     }
 }
 
+/// Ready once a broker peer fell silent or changed what its beats say.
+/// Without beats, never.
+async fn beats_changed_after(beats: Option<&frontend::Beats>) {
+    match beats {
+        Some(beats) => beats.changed_after(beats.generation()).await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn serve(
     shard: &ShardContext,
     state: &mut State,
@@ -356,6 +365,8 @@ async fn serve(
     let mut links_changed = Box::pin(links.changed_after(links.generation()));
     let clock = state.config.clock.clone();
     let mut clock_changed = Box::pin(clock.changed_after(clock.generation()));
+    let beats = state.config.beats.clone();
+    let mut beats_changed = Box::pin(beats_changed_after(beats.as_ref()));
     let mut waits = Waits::default();
     loop {
         let port_generation = binding.port.generation();
@@ -390,6 +401,9 @@ async fn serve(
             },
             () = &mut clock_changed => {
                 clock_changed = Box::pin(clock.changed_after(clock.generation()));
+            },
+            () = &mut beats_changed => {
+                beats_changed = Box::pin(beats_changed_after(beats.as_ref()));
             },
         }
     }

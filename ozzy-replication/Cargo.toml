@@ -36,6 +36,10 @@ name = "ozzy_driver"
 path = "tests/driver.rs"
 
 [[test]]
+name = "ozzy_driver_rest"
+path = "tests/driver_rest.rs"
+
+[[test]]
 name = "ozzy_flow"
 path = "tests/flow.rs"
 

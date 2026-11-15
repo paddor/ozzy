@@ -36,9 +36,9 @@ impl ReplicaDriver {
                     snapshot.accepted != snapshot.committed || !snapshot.ready_for_appends;
                 let unpersisted = snapshot.accepted.op > snapshot.journal.durable;
                 [
-                    primary.then_some(self.retry_at),
-                    primary.then(|| self.doubt_at()),
-                    (!primary).then_some(self.contact_deadline),
+                    (primary && !self.resting()).then_some(self.retry_at),
+                    (primary && self.covered.is_empty()).then(|| self.doubt_at()),
+                    (!primary && self.covered.is_empty()).then_some(self.contact_deadline),
                     outstanding.then_some(self.progress_deadline),
                     unpersisted.then_some(self.persistence_deadline),
                     self.storage_busy_since

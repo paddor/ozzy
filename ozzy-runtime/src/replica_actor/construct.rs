@@ -74,10 +74,7 @@ impl ReplicaActor {
             configuration,
             local,
             config: *config,
-            status: Rc::new(Cell::new(ActorStatus {
-                normal: driver.normal().map(NormalReplica::snapshot),
-                ..ActorStatus::initial(driver.scope())
-            })),
+            status: initial_status(&driver),
             wanted_pin: Some((driver.scope(), source)),
             driver,
             ids,
@@ -108,6 +105,7 @@ impl ReplicaActor {
             ingress,
             submitters,
             work,
+            rest: super::rest::Rest::default(),
         })
     }
 }
@@ -158,6 +156,14 @@ pub(super) fn checked_arena(
         return Err(ActorError::Limits);
     }
     Ok(buffer)
+}
+
+/// The status of an actor that has not run yet.
+fn initial_status(driver: &ReplicaDriver) -> super::SharedStatus {
+    Rc::new(Cell::new(ActorStatus {
+        normal: driver.normal().map(NormalReplica::snapshot),
+        ..ActorStatus::initial(driver.scope())
+    }))
 }
 
 /// Start the protocol driver and its normal work. A backup stages received

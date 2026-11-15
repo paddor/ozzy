@@ -107,7 +107,7 @@ impl ReplicaDriver {
         if let Some(action) = self.activation_action()? {
             return Ok(Some(action));
         }
-        if now < self.retry_at {
+        if self.resting() || now < self.retry_at {
             return Ok(None);
         }
         self.retry_at = now.saturating_add(self.timing.heartbeat);

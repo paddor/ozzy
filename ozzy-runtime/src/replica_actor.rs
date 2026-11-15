@@ -39,6 +39,7 @@ pub use native::{
 mod reader_cursor;
 mod release_turns;
 mod response;
+mod rest;
 mod retention_turns;
 mod shared_readers;
 pub use shared_readers::SharedReaderConfig;
@@ -145,6 +146,7 @@ pub struct ReplicaActor {
     ingress: ingress::Ingress,
     submitters: Vec<ProposalSubmitter>,
     work: normal::Work,
+    rest: rest::Rest,
 }
 
 impl ReplicaActor {
@@ -204,6 +206,7 @@ impl ReplicaActor {
             return Ok(());
         }
         self.observe_storage(now)?;
+        self.rest_round(now);
         self.maintenance
             .retention
             .observe_floor(self.journal.owner_floor(), now);
@@ -261,13 +264,14 @@ impl ReplicaActor {
             Action::Broadcast(Control::Commit(commit)) => {
                 for voter in 0..3 {
                     if self.configuration.voters()[voter] != self.local {
-                        self.announce(voter, commit, true)?;
+                        self.heartbeat(voter, commit)?;
                     }
                 }
             }
             Action::Broadcast(control) => {
-                for to in *self.configuration.voters() {
-                    if to != self.local {
+                let installed = matches!(control, Control::StartView(_));
+                for (voter, to) in (*self.configuration.voters()).into_iter().enumerate() {
+                    if to != self.local && !(installed && self.rests(voter)) {
                         self.control(to, control)?;
                     }
                 }
@@ -368,6 +372,7 @@ impl ReplicaActor {
                 if matches!(control, Control::StartView(_)) {
                     self.ack_at = now;
                 }
+                self.receive_rest(index, control, now)?;
             }
             ReplicaMessage::FetchOps(request) => self.serve(from, request)?,
             ReplicaMessage::Ops(batch) => self.receive_ops(&batch, now)?,
@@ -382,7 +387,8 @@ impl ReplicaActor {
     }
 
     fn ack(&mut self, now: Duration) -> Result<(), ActorError> {
-        if now < self.ack_at {
+        // A resting backup's vote is covered by its broker's beats.
+        if now < self.ack_at || self.resting_backup() {
             return Ok(());
         }
         let retransmit = self.config.timing.retransmit;

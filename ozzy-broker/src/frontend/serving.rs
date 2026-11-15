@@ -134,6 +134,8 @@ impl FrontendContext {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut retrying = false;
         let mut clock = self.clock.as_ref().map(crate::serving::Timer::alarm);
+        // Beats run on the clock sampling's timer.
+        let mut beat = self.clock.as_ref().map(crate::serving::Timer::alarm);
         loop {
             // Process lifecycle changes before dequeuing native input. Once
             // received, admit synchronously before observing another cutover.
@@ -175,6 +177,7 @@ impl FrontendContext {
                     data.retry(lane, service)?;
                 }
                 () = clock_due(&mut clock, service.clock_deadline()) => service.clock_tick(),
+                () = clock_due(&mut beat, service.beat_deadline()) => service.beat_tick(),
                 result = service.progress_with(|message| serving.followers.send(outbound_socket(&self.peer, &self.data, &message), message), |probe| serving.followers.wait(outbound_socket(&self.peer, &self.data, &probe), probe)) => {
                     if !self.shutdown.is_closed() {
                         result.map_err(failure)?;
@@ -186,7 +189,8 @@ impl FrontendContext {
     }
 }
 
-/// Ready once the clock sampling's deadline passes. Without sampling, never.
+/// Ready once the deadline of the clock sampling or the beats passes.
+/// Without an alarm or a deadline, never.
 async fn clock_due(alarm: &mut Option<crate::serving::Alarm>, deadline: Option<Duration>) {
     std::future::poll_fn(|cx| match alarm {
         Some(alarm) => alarm.poll_at(cx, deadline),

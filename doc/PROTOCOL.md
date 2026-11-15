@@ -11,7 +11,7 @@ Ozzy frames. Transport receipt is never record confirmation.
 
 | Socket | Carries |
 | --- | --- |
-| Control PEER | HELLO/WELCOME, NACK, topic lookup, routing watches, producer open, APPENDED, subscription control and ACK, progress, groups, replica control, REPLICA_RECEIPT, CLOCK_SAMPLE |
+| Control PEER | HELLO/WELCOME, NACK, topic lookup, routing watches, producer open, APPENDED, subscription control and ACK, progress, groups, replica control, REPLICA_RECEIPT, CLOCK_SAMPLE, BEAT |
 | Data PEER | APPEND, RECORDS replay, PREPARE_FLOW, OPS, SNAPSHOT_CHUNK |
 | Reader PUB | RECORDS_PUB |
 | Follower PUB | PREPARE_PUB |
@@ -170,7 +170,7 @@ Link rules:
 | `20..28` | SUBSCRIBE, SUBSCRIBED, RECORDS, ACK, PROGRESS_COMMIT, PROGRESS_COMMITTED, unassigned, UNSUBSCRIBE, UNSUBSCRIBED |
 | `30..3f` | REPLICA_OPEN, REPLICA_STATE, PREPARE, PREPARE_OK, COMMIT, START_VIEW_CHANGE, DO_VIEW_CHANGE, START_VIEW, RECOVERY, RECOVERY_STATE, FETCH_OPS, OPS, SNAPSHOT_BEGIN, SNAPSHOT_CHUNK, SNAPSHOT_END, SNAPSHOT_INSTALLED |
 | `40..43` | STATE_SNAPSHOT_REQUEST, STATE_SNAPSHOT, STATE_UPDATE, STATE_RESYNC |
-| `50..56` | EXIT_VIEW, PREPARE_FLOW, PREPARE_PUB, RECORDS_PUB, REPLICA_RECEIPT, HISTORY_RETIRED, CLOCK_SAMPLE |
+| `50..59` | EXIT_VIEW, PREPARE_FLOW, PREPARE_PUB, RECORDS_PUB, REPLICA_RECEIPT, HISTORY_RETIRED, CLOCK_SAMPLE, REST, REST_OK, BEAT |
 | `60..67` | GROUP_JOIN, GROUP_JOINED, GROUP_ASSIGN, GROUP_ASSIGNED, GROUP_INSPECT, GROUP_INSPECTED, GROUP_DELETE, GROUP_DELETED |
 | `7f` | NACK |
 
@@ -531,6 +531,8 @@ voter, session, and configuration must match. Decoding grants no trust.
 | OPS | 196 + 86*N | Source descriptor, predecessor op position, list of canonical operation descriptors |
 | PREPARE_OK | 120 | Contiguous durable op position |
 | COMMIT | 120 | Committed op position |
+| REST | 132 | Committed op position, sender shard `u32`, shard epoch `u64` |
+| REST_OK | 132 | Contiguous durable op position, sender shard `u32`, shard epoch `u64` |
 | EXIT_VIEW | 80 | View to leave in Authority: the sender's current view, or an older view it left, answering a peer's request; volatile suspicion, no additional fields |
 | START_VIEW_CHANGE | 80 | Proposed view in Authority; no additional fields |
 | DO_VIEW_CHANGE | 184 | Frozen writer generation `u128`, last normal view `u64`, accepted end, commit floor |
@@ -547,8 +549,10 @@ bodies; all other replica payloads are empty. Descriptor (86 bytes):
   new-view forwarding. The canonical schema matches disk, not its padding.
 - The receiver's operation limit bounds each PREPARE or OPS, independent of
   record count.
-- PREPARE variants, PREPARE_OK, COMMIT, EXIT_VIEW, and election commands are
-  uncorrelated. PREPARE_OK is cumulative.
+- PREPARE variants, PREPARE_OK, COMMIT, REST, REST_OK, EXIT_VIEW, and election
+  commands are uncorrelated. PREPARE_OK is cumulative.
+- REST is a COMMIT and REST_OK a PREPARE_OK that also name the sender's
+  [beat source](#beats). See [rest](REPLICATION.md#rest).
 - Election generations are nonzero `u128` incarnations. Proposed views exceed
   the last normal view; commits never pass or conflict with accepted history.
 - [Replication](REPLICATION.md) owns voting, election, and
@@ -647,6 +651,17 @@ suspicion of the view; a restart probe still votes.
   second, and at once on a new session. Only configured brokers may send it.
 - The dispatcher consumes it. It names no partition, is lossy, and grants no
   authority. See the [clock guard](REPLICATION.md#clock-guard).
+
+### Beats
+
+- BEAT (`0x59`) is uncorrelated, with empty payload. Its metadata lists up to
+  256 of the sender's shards, 12 bytes each: shard number `u32`, shard epoch
+  `u64`. A shard number means nothing on another broker.
+- One broker sends it to another on their established session every 100 ms.
+  Only configured brokers may send it. It lists the shards that took a turn
+  within the last 500 ms.
+- The dispatcher consumes it. It names no partition, is lossy, and grants no
+  authority. See [rest](REPLICATION.md#rest).
 
 ## Admin console
 

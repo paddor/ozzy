@@ -19,6 +19,7 @@
 
 pub mod admin;
 pub mod append;
+pub mod beat;
 pub mod clock;
 pub mod data;
 pub mod directory;

@@ -48,10 +48,13 @@ use ozzy_proto::{LinkSessionId, NodeId};
 
 use crate::flow::{FlowError, ReceiveEpoch};
 use crate::{
-    Commit, Configuration, DoViewChange, Prefix, PrepareOk, Scope, StartView, StartViewChange,
+    BeatSource, Commit, Configuration, DoViewChange, Prefix, PrepareOk, Scope, StartView,
+    StartViewChange,
 };
 
 const COMMON_BYTES: usize = 80;
+/// A beat source: shard number and epoch.
+const SOURCE_BYTES: usize = 12;
 
 /// Authenticated peer and established session supplied by the transport adapter.
 ///
@@ -163,6 +166,21 @@ pub enum Control {
     },
     /// Primary's cumulative commit announcement or idle heartbeat.
     Commit(Commit),
+    /// A settled primary's heartbeat that also offers to rest: broker beats
+    /// naming `source` then stand in for this group's heartbeats.
+    Rest {
+        /// The commit this heartbeat announces.
+        commit: Commit,
+        /// The primary's shard and its epoch.
+        source: BeatSource,
+    },
+    /// A settled backup's durable vote that also accepts the offer.
+    RestOk {
+        /// The backup's cumulative durable evidence.
+        ack: PrepareOk,
+        /// The backup's shard and its epoch.
+        source: BeatSource,
+    },
     /// Volatile suspicion about this current view, not a durable promise or vote.
     ExitView(Scope),
     /// First election phase, emitted after the sender's durable view promise.
@@ -177,7 +195,7 @@ impl Control {
     /// Claimed prefix for routing/replay hints. This does not validate its evidence.
     pub const fn acknowledged(self) -> Option<Prefix> {
         match self {
-            Self::PrepareOk { ack, .. } => Some(ack.durable),
+            Self::PrepareOk { ack, .. } | Self::RestOk { ack, .. } => Some(ack.durable),
             _ => None,
         }
     }
@@ -185,8 +203,11 @@ impl Control {
     /// Exact group, immutable configuration digest, and active/proposed view.
     pub const fn scope(self) -> Scope {
         match self {
-            Self::PrepareOk { ack, .. } => ack.scope,
-            Self::Commit(message) => message.scope,
+            Self::PrepareOk { ack, .. } | Self::RestOk { ack, .. } => ack.scope,
+            Self::Commit(message)
+            | Self::Rest {
+                commit: message, ..
+            } => message.scope,
             Self::ExitView(scope) => scope,
             Self::StartViewChange(message) => message.scope,
             Self::DoViewChange(message) => message.scope,
@@ -198,6 +219,8 @@ impl Control {
         match self {
             Self::PrepareOk { .. } => Opcode::PrepareOk,
             Self::Commit(_) => Opcode::Commit,
+            Self::Rest { .. } => Opcode::Rest,
+            Self::RestOk { .. } => Opcode::RestOk,
             Self::ExitView(_) => Opcode::ExitView,
             Self::StartViewChange(_) => Opcode::StartViewChange,
             Self::DoViewChange(_) => Opcode::DoViewChange,
@@ -248,29 +271,7 @@ pub fn encode_control(
 ) -> Result<ControlEncoding, WireError> {
     let scope = message.scope();
     validate_scope(scope)?;
-    let metadata_bytes = match message {
-        Control::PrepareOk { ack, .. } => {
-            validate_prefix(ack.durable)?;
-            COMMON_BYTES + 40
-        }
-        Control::Commit(message) => {
-            validate_prefix(message.committed)?;
-            COMMON_BYTES + 40
-        }
-        Control::StartViewChange(message) => {
-            validate_election_view(message.scope)?;
-            COMMON_BYTES
-        }
-        Control::ExitView(_) => COMMON_BYTES,
-        Control::DoViewChange(message) => {
-            election::validate_report(message)?;
-            COMMON_BYTES + 16 + 8 + 40 + 40
-        }
-        Control::StartView(message) => {
-            election::validate_start(message)?;
-            COMMON_BYTES + 16 + 40 + 40
-        }
-    };
+    let metadata_bytes = control_bytes(message)?;
     if output.len() < metadata_bytes {
         return Err(WireError::Capacity);
     }
@@ -287,6 +288,14 @@ pub fn encode_control(
     match message {
         Control::PrepareOk { ack } => writer.prefix(ack.durable)?,
         Control::Commit(message) => writer.prefix(message.committed)?,
+        Control::Rest { commit, source } => {
+            writer.prefix(commit.committed)?;
+            write_source(&mut writer, source)?;
+        }
+        Control::RestOk { ack, source } => {
+            writer.prefix(ack.durable)?;
+            write_source(&mut writer, source)?;
+        }
         Control::StartViewChange(_) | Control::ExitView(_) => {}
         Control::DoViewChange(message) => election::write_report(&mut writer, message)?,
         Control::StartView(message) => election::write_start(&mut writer, message)?,
@@ -314,6 +323,8 @@ pub fn route(packet: ozzy_proto::Packet<'_>, limits: EnvelopeLimits) -> Result<S
             | Opcode::PreparePub
             | Opcode::PrepareOk
             | Opcode::Commit
+            | Opcode::Rest
+            | Opcode::RestOk
             | Opcode::ExitView
             | Opcode::StartViewChange
             | Opcode::DoViewChange
@@ -425,6 +436,54 @@ fn decode_uncorrelated(
     }
 }
 
+/// Validate the fields of `message` and return its metadata length.
+fn control_bytes(message: Control) -> Result<usize, WireError> {
+    Ok(match message {
+        Control::PrepareOk { ack, .. } => {
+            validate_prefix(ack.durable)?;
+            COMMON_BYTES + 40
+        }
+        Control::Commit(message) => {
+            validate_prefix(message.committed)?;
+            COMMON_BYTES + 40
+        }
+        Control::Rest { commit, .. } => {
+            validate_prefix(commit.committed)?;
+            COMMON_BYTES + 40 + SOURCE_BYTES
+        }
+        Control::RestOk { ack, .. } => {
+            validate_prefix(ack.durable)?;
+            COMMON_BYTES + 40 + SOURCE_BYTES
+        }
+        Control::StartViewChange(message) => {
+            validate_election_view(message.scope)?;
+            COMMON_BYTES
+        }
+        Control::ExitView(_) => COMMON_BYTES,
+        Control::DoViewChange(message) => {
+            election::validate_report(message)?;
+            COMMON_BYTES + 16 + 8 + 40 + 40
+        }
+        Control::StartView(message) => {
+            election::validate_start(message)?;
+            COMMON_BYTES + 16 + 40 + 40
+        }
+    })
+}
+
+fn write_source(writer: &mut Writer<'_>, source: BeatSource) -> Result<(), WireError> {
+    writer.u32(source.shard)?;
+    writer.u64(source.epoch)?;
+    Ok(())
+}
+
+fn read_source(reader: &mut Reader<'_>) -> Result<BeatSource, WireError> {
+    Ok(BeatSource {
+        shard: reader.u32()?,
+        epoch: reader.u64()?,
+    })
+}
+
 fn decode_control(
     scope: Scope,
     opcode: Opcode,
@@ -441,6 +500,20 @@ fn decode_control(
             scope,
             committed: reader.prefix()?,
         }),
+        Opcode::Rest => Control::Rest {
+            commit: Commit {
+                scope,
+                committed: reader.prefix()?,
+            },
+            source: read_source(&mut reader)?,
+        },
+        Opcode::RestOk => Control::RestOk {
+            ack: PrepareOk {
+                scope,
+                durable: reader.prefix()?,
+            },
+            source: read_source(&mut reader)?,
+        },
         Opcode::StartViewChange => {
             validate_election_view(scope)?;
             Control::StartViewChange(StartViewChange { scope })

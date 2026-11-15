@@ -18,6 +18,10 @@
 - `ozzy_runtime::replica_journal::OwnedConfig` has a new `lazy_spare`
   field.
 - The `[logs]` class defaults `segment_bytes` to 2 MiB instead of 4 MiB.
+- `ozzy_proto::Opcode` has new `Rest`, `RestOk`, and `Beat` variants, and
+  `ozzy_replication::wire::Control` new `Rest` and `RestOk` variants. A
+  broker of an older release rejects these commands, so every broker of a
+  cluster must run this release.
 
 ### Added
 
@@ -58,6 +62,17 @@
   a running shard. `RoutingTable::with_runtime` routes broker traffic to
   the logs a shared `RuntimeRoutes` names.
 - A `Log` handle reports `Stopped` once its log service is gone.
+- An idle replicated partition rests: it sends no heartbeats and no
+  votes. Each broker pair instead exchanges one `BEAT` every 100 ms,
+  which names the sender's live shards and their epochs. A leader's
+  heartbeat offers the rest with `REST` and a follower accepts with
+  `REST_OK`; any other message between them, or a beat that no longer
+  covers the agreement, ends it. A resting partition fails over as fast
+  as before. `ReplicaDriver::cover`, `uncover`, `rest`, and `settled`
+  are the protocol steps, `ozzy_runtime::frontend::Beats` the shared
+  beat state, and `PartitionActors::with_beats` turns it on for a shard.
+  Telemetry counts `replica_rest`, `replica_rest_end`, and
+  `shard_epoch_change`.
 
 ### Changed
 

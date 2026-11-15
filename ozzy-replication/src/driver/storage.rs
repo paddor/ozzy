@@ -29,7 +29,8 @@ impl ReplicaDriver {
         matches!(self.role, Role::Normal(_)) && self.storage_timed_out()
     }
 
-    /// A ready primary heard no backup of its view for the primary timeout.
+    /// A ready primary heard no backup of its view for the primary timeout,
+    /// and the adapter covers none.
     /// Nothing it admits can commit until one answers, so an embedder that
     /// is the only writer stops handing it work. This is not suspicion: the
     /// view ends only when two voters ask for it.
@@ -40,6 +41,7 @@ impl ReplicaDriver {
         let snapshot = normal.snapshot();
         snapshot.ready_for_appends
             && VoterIndex::primary(snapshot.scope.view) == self.local
+            && self.covered.is_empty()
             && self.now >= self.doubt_at()
     }
 

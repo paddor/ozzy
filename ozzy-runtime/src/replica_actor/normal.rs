@@ -267,7 +267,7 @@ impl ReplicaActor {
             Ok(Some(start)) => self.start = Some((from, start)),
             Ok(None) => {}
             Err(DriverError::Replication(ReplicationError::HistoryGap)) => {
-                let Control::Commit(commit) = control else {
+                let (Control::Commit(commit) | Control::Rest { commit, .. }) = control else {
                     return Err(ActorError::history(HistoryReason::ReceiveWindow));
                 };
                 if self.work.deferred_commit.is_none_or(|(_, old)| {

@@ -36,6 +36,7 @@ impl PartitionActors {
         self.coordinators.push(None);
         self.readers.push(None);
         self.logs.push(None);
+        self.install_beats(slot);
         if let Some(wakeups) = &mut self.wakeups {
             wakeups.grow();
         }
@@ -58,6 +59,10 @@ impl PartitionActors {
         drop(self.readers.swap_remove(slot));
         drop(self.logs.swap_remove(slot));
         let actor = self.actors.swap_remove(slot);
+        if matches!(actor, PartitionActor::Replicated(_)) {
+            // Its peers may still trust the role it had.
+            self.request_withdrawal();
+        }
         if let Some(wakeups) = &mut self.wakeups {
             wakeups.swap_remove(slot);
         }

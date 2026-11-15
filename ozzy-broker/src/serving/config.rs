@@ -70,6 +70,9 @@ pub(super) struct Config {
     pub clock: frontend::ClockTrust,
     /// The monotonic origin of the clock guard's readings.
     pub clock_timer: super::context::Timer,
+    /// Beats between this broker and its peers, which let idle replicated
+    /// groups rest. A single broker has none.
+    pub beats: Option<frontend::Beats>,
     /// Broker routes of replicated runtime logs, shared with every shard.
     pub runtime_routes: frontend::RuntimeRoutes,
     /// Every runtime log of this broker and its state.
@@ -160,9 +163,10 @@ impl Config {
         let buffers = ReceiveBuffers::new(envelope, storage).map_err(failure)?;
         let budgets = shard_budgets(checked);
         let catalog = catalog(checked)?;
-        let clock = clock_trust(&brokers, deployment.cluster.max_clock_offset_millis);
         let clock_timer = time.start();
         Ok(Self {
+            clock: clock_trust(&brokers, deployment.cluster.max_clock_offset_millis),
+            beats: super::beats::beats(checked, &brokers, time.timestamp(), &clock_timer),
             time,
             omq,
             local,
@@ -184,7 +188,6 @@ impl Config {
             maximum_partitions: checked.plan.partitions.len(),
             admin: None,
             receipt_handles: ozzy_runtime::replica_actor::ReceiptHandles::default(),
-            clock,
             clock_timer,
             runtime_routes,
             log_table: crate::logs::LogTable::default(),

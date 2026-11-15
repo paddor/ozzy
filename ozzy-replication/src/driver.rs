@@ -14,6 +14,7 @@ mod exit_view;
 mod installation;
 mod poll;
 mod receive;
+mod rest;
 mod step_down;
 mod storage;
 mod validation;
@@ -145,6 +146,10 @@ pub struct ReplicaDriver {
     /// Voters asking to leave a view newer than this normal voter's. Each gets
     /// a request to leave this view, which it answers with its fence.
     stale_answers: VoterSet,
+    /// Voters whose liveness the adapter proves by other means in this view.
+    covered: VoterSet,
+    /// A resting primary sends no heartbeat.
+    heartbeat: rest::Heartbeat,
 }
 
 impl ReplicaDriver {
@@ -223,6 +228,8 @@ impl ReplicaDriver {
             exit_echo_at: Voters::splat(Duration::ZERO),
             fence_answers: VoterSet::EMPTY,
             stale_answers: VoterSet::EMPTY,
+            covered: VoterSet::EMPTY,
+            heartbeat: rest::Heartbeat::Sending,
         })
     }
 
@@ -358,7 +365,9 @@ impl ReplicaDriver {
     fn normal_timed_out(&self, snapshot: &ReplicaSnapshot) -> bool {
         let primary = VoterIndex::primary(snapshot.scope.view) == self.local;
         let outstanding = snapshot.accepted != snapshot.committed || !snapshot.ready_for_appends;
-        (!primary && self.now >= self.contact_deadline)
+        (!primary
+            && !self.primary_covered(VoterIndex::primary(snapshot.scope.view))
+            && self.now >= self.contact_deadline)
             || (outstanding && self.now >= self.progress_deadline)
             || (snapshot.accepted.op > snapshot.journal.durable
                 && self.now >= self.persistence_deadline)
@@ -391,6 +400,7 @@ impl ReplicaDriver {
         }
         self.exit_votes = VoterSet::EMPTY;
         self.exit_retry_at = None;
+        self.uncover_all();
         // A new view is not durably promised yet, and this voter left the
         // view it would ask others to leave.
         self.fence_answers = VoterSet::EMPTY;

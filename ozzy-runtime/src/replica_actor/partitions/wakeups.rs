@@ -130,6 +130,7 @@ impl PartitionActors {
                 .deadlines
                 .iter()
                 .flatten()
+                .chain(&self.withdrawal_deadline())
                 .fold(sweep, |earliest, deadline| earliest.min(*deadline)),
         )
     }

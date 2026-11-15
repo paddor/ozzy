@@ -453,6 +453,18 @@ pub enum ScheduleError {
 }
 
 impl ScheduledReplica {
+    /// Let this group rest on `beats`, which report `shard`.
+    pub(super) fn install_beats(&mut self, beats: crate::frontend::Beats, shard: u32) {
+        self.actor.install_beats(beats, shard);
+    }
+    /// Whether broker beats stand in for this group's heartbeats or votes.
+    pub(super) fn resting(&self) -> bool {
+        self.actor.resting()
+    }
+    /// Whether the role left a view in which a peer may still trust it.
+    pub(super) fn take_withdrawal(&mut self) -> bool {
+        self.actor.take_withdrawal()
+    }
     pub(super) fn needs_checkpoint_recovery(&self) -> bool {
         self.actor.recovery_required
     }

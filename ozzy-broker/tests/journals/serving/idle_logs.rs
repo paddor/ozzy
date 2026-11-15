@@ -116,8 +116,7 @@ async fn idle_replicated_logs_report_their_cost() {
         }
     }
     let created = usage(root.path());
-    ozzy_runtime::profiling::enable();
-    let events = ozzy_runtime::profiling::events();
+    let events = ozzy_runtime::profiling::totals();
     let copies = 3 * count as u64;
     println!(
         "logs={count} segment={segment} create_and_elect={:?} create_cpu_ticks={}",
@@ -130,7 +129,15 @@ async fn idle_replicated_logs_report_their_cost() {
         created.resident.saturating_sub(before.resident) / copies,
         (created.handles - before.handles) as f64 / copies as f64
     );
-    tokio::time::sleep(Duration::from_secs(seconds)).await;
+    // One line per five seconds shows work that starts late or comes in bursts.
+    let mut last = created.ticks;
+    for _ in 0..seconds / 5 {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let ticks = usage(root.path()).ticks;
+        println!("idle_slice cpu_ticks={}", ticks - last);
+        last = ticks;
+    }
+    tokio::time::sleep(Duration::from_secs(seconds % 5)).await;
     let idle = usage(root.path());
     println!(
         "idle_seconds={seconds} idle_cpu_ticks={} handles={} resident={}",
@@ -138,9 +145,10 @@ async fn idle_replicated_logs_report_their_cost() {
         idle.handles,
         idle.resident
     );
-    for ((name, after), (_, before)) in ozzy_runtime::profiling::events().into_iter().zip(events) {
+    let totals = ozzy_runtime::profiling::totals();
+    for ((name, _, after), (_, _, before)) in totals.rows().zip(events.rows()) {
         if after != before {
-            println!("idle_event {name}={}", after - before);
+            println!("idle_event {name}={}", after.wrapping_sub(before));
         }
     }
     for broker in brokers {

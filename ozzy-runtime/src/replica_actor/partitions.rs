@@ -20,6 +20,7 @@ use wakeups::Wakeups;
 mod actor;
 mod membership;
 mod replication;
+mod resting;
 mod services;
 mod wakeups;
 mod woken;
@@ -47,6 +48,7 @@ pub struct PartitionActors {
     stopped: bool,
     wakeups: Option<Wakeups>,
     turns: u64,
+    beats: Option<resting::ShardBeats>,
 }
 
 #[derive(Debug)]
@@ -95,6 +97,7 @@ impl PartitionActors {
             stopped: false,
             wakeups: None,
             turns: 0,
+            beats: None,
         })
     }
 
@@ -187,6 +190,7 @@ impl PartitionActors {
         if let Err(error) = self.observe(now) {
             return Poll::Ready(Err(error));
         }
+        self.beat_round(now);
         if let Some(wakeups) = self.wakeups.take() {
             let (wakeups, result) = self.poll_woken(wakeups, cx, now, &mut try_send);
             self.wakeups = Some(wakeups);
@@ -242,6 +246,8 @@ impl PartitionActors {
             if let Some(log) = &mut self.logs[slot] {
                 log.detach();
             }
+            // Its peers may still trust the role it had.
+            self.request_withdrawal();
             self.actors.push(actor);
             let last = self.actors.len() - 1;
             self.actors.swap(slot, last);
@@ -254,9 +260,13 @@ impl PartitionActors {
             });
         if recovering && matches!(self.actors[slot], PartitionActor::Replicated(_)) {
             self.recovered.push_back(self.actors[slot].group());
+            self.install_beats(slot);
         }
+        self.collect_withdrawal(slot);
         if result.is_err() {
             self.stopped = true;
+            // No group of this shard acts again.
+            self.withdraw_now();
         }
         result
     }

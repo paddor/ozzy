@@ -37,7 +37,7 @@ pub(super) async fn build(
     let routes = routing(shard.plan.id, &identities, &config)?;
     let runtime = runtime_logs(shard, journals, &config)?;
     let fixed = identities.len();
-    let actors = scheduled(actors, fixed + log_capacity(journals))?;
+    let actors = scheduled(actors, fixed + log_capacity(journals), shard, &config)?;
     let indices = identities
         .iter()
         .enumerate()
@@ -302,10 +302,16 @@ fn initialize_started(
 fn scheduled(
     actors: Vec<ozzy_runtime::replica_actor::PartitionActor>,
     partitions: usize,
+    shard: &ShardContext,
+    config: &Config,
 ) -> Result<PartitionActors, StartupError> {
-    PartitionActors::new(actors, partitions.max(1), 16)
+    let actors = PartitionActors::new(actors, partitions.max(1), 16)
         .and_then(|actors| actors.with_safety_sweep(super::SAFETY_SWEEP))
-        .map_err(failure)
+        .map_err(failure)?;
+    Ok(match &config.beats {
+        Some(beats) => actors.with_beats(beats.clone(), shard.plan.id),
+        None => actors,
+    })
 }
 
 fn outbound(config: &Config) -> Outbound {

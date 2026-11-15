@@ -15,9 +15,11 @@ use crate::dispatch::Class;
 use crate::signal::StateSignal;
 
 mod admission;
+mod beats;
 mod clock;
 mod directory;
 mod links;
+pub use beats::{BeatTiming, Beats};
 pub use clock::{ClockNow, ClockSampling, ClockStatus, ClockTrust};
 use links::LinkState;
 pub use links::{Access, Link, Links};
@@ -83,6 +85,8 @@ pub struct Service {
     pub(super) refused_replies: BTreeMap<(u32, NodeId, Class), u64>,
     /// Sampling of this broker's clock against its peers, when it has peers.
     clock: Option<ClockSampling>,
+    /// Beats to and from broker peers, when resting groups rely on them.
+    beats: Option<beats::BeatSchedule>,
 }
 
 impl Service {
@@ -156,6 +160,7 @@ impl Service {
             publications: [None, None],
             publication_next: 0,
             clock: None,
+            beats: None,
         })
     }
 

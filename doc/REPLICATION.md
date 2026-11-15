@@ -177,6 +177,32 @@ The follower leads only once it installs that view.
 - Equal-ranked reports with different digests halt selection. Missing
   ancestry is never an empty suffix.
 
+## Rest
+
+An idle partition sends nothing. Its brokers prove each other alive with one
+[BEAT](PROTOCOL.md#beats) per broker pair every 100 ms instead of heartbeats
+and votes per partition.
+
+- A leader with nothing uncommitted, unapplied, or undurable sends REST as
+  its heartbeat. REST names the leader's shard and that shard's epoch. A
+  follower in the same state at the same commit answers REST_OK with its own.
+  Each side then rests toward the other.
+- A resting follower expects no contact and sends no vote. A leader sends a
+  resting follower no heartbeat and no START_VIEW, and is not in doubt. Once
+  every follower rests or has no link, the leader's heartbeat timer stops.
+- A side trusts the other while that broker's beats arrive on the same
+  session, name the agreed shard and epoch, and the last one is younger than
+  the primary timeout. When that fails, contact and doubt count from the last
+  beat, so a resting partition fails over as fast as a busy one.
+- Any other replica control from the peer ends the rest, and so does local
+  work: an accepted operation makes the leader and its followers speak again.
+- A voter that leaves its view while a peer may still trust it changes its
+  shard's epoch, at most once per beat interval. So does a shard that loses
+  an actor or stops. A new epoch ends every rest agreed under the old one;
+  healthy partitions agree again on their next heartbeat.
+- A beat lists only shards that took a turn within half the primary timeout,
+  so a stalled shard ends the rests of its partitions.
+
 ## Restart
 
 ```mermaid
@@ -345,5 +371,7 @@ wall clock. A broker whose clock disagrees with the others stops them.
   `view_change/`), recovery (`recovery/`), repair (`flow/`), single durable
   (`local.rs`).
 - `ozzy-runtime/src/replica_actor/` and `replica_journal/`: actors, startup
-  probe, donors, promises, installation, writeback.
+  probe, donors, promises, installation, writeback, rest (`rest.rs`,
+  `partitions/resting.rs`).
+- `ozzy-runtime/src/frontend/service/beats.rs`: beats.
 - `ozzy-broker/src/journals/recovery.rs`: `recover` intents.
