@@ -15,6 +15,9 @@
   `ozzy_broker::FollowerRoutes` new `shards` and `runtime` fields.
 - The re-exported `Context` and `Endpoint` come from the omq-tokio 0.36
   release instead of 0.34.
+- `ozzy_runtime::replica_journal::OwnedConfig` has a new `lazy_spare`
+  field.
+- The `[logs]` class defaults `segment_bytes` to 2 MiB instead of 4 MiB.
 
 ### Added
 

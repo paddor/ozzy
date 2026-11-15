@@ -16,6 +16,9 @@ pub(super) struct Spare {
     /// started before then cannot claim it.
     epoch: u64,
     running: bool,
+    /// Allocate only once the active segment passes its fill mark or a
+    /// write waits for the spare.
+    lazy: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +59,17 @@ impl SpareWork {
 }
 
 impl Spare {
+    pub(super) fn new(lazy: bool) -> Self {
+        Self {
+            lazy,
+            ..Self::default()
+        }
+    }
+
+    pub(super) const fn lazy(&self) -> bool {
+        self.lazy
+    }
+
     pub(super) fn ready(&self) -> bool {
         self.state == State::Ready
     }
@@ -95,6 +109,16 @@ impl OwnedJournal {
             JournalOwner::Writing(pipeline) => pipeline.journal(),
             _ => return None,
         };
+        // Below the mark every append still fits the active segment beside
+        // the reserve a missing spare calls for.
+        let header = journal.writer().header();
+        let written = journal.writer().written_position().end_offset();
+        if self.spare.lazy
+            && !self.room.awaiting_spare()
+            && written.saturating_add(self.writeback.queued_bytes() as u64) < header.capacity() / 4
+        {
+            return None;
+        }
         let preparation = match journal.prepare_spare() {
             Ok(preparation) => preparation,
             Err(error) => {

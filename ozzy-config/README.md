@@ -69,7 +69,7 @@ labels. Field names and enum values are fixed.
 | `[topics.NAME.retention]` | `max_age_secs`, `max_bytes` (unset: keep all) |
 | `[topics.NAME.deduplication]` | `window_millis` (300000), `max_entries`, `max_bytes` |
 | `[topics.NAME.delay]` | `max_secs`, `max_entries` (100000) |
-| `[logs]` | `max_logs`, `segment_bytes` (4 MiB), `max_append_bytes` (1 MiB) |
+| `[logs]` | `max_logs`, `segment_bytes` (2 MiB), `max_append_bytes` (1 MiB) |
 
 The rustdoc of each field in `src/schema.rs` lists the rest, including
 `workers` and shard `budget` defaults.

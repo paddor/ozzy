@@ -18,6 +18,7 @@ pub(crate) struct Settings {
     pipeline: PipelineLimits,
     reads: PartitionReadLimits,
     clients: usize,
+    lazy_spare: bool,
 }
 
 /// The sizes one partition's bounds derive from, and how many partitions
@@ -30,6 +31,8 @@ pub(crate) struct Shape {
     pub(crate) segment_bytes: u64,
     /// Partitions the shard's budgets are split across.
     pub(crate) sharers: usize,
+    /// Allocate the spare segment only once the active one fills.
+    pub(crate) lazy_spare: bool,
 }
 
 impl Shape {
@@ -45,6 +48,7 @@ impl Shape {
             max_append_bytes: topic.max_append_bytes,
             segment_bytes: topic.segment_bytes,
             sharers: static_sharers(plan, placement.shard),
+            lazy_spare: false,
         })
     }
 
@@ -68,6 +72,7 @@ impl Shape {
                 .filter(|partition| partition.shard == placement.shard)
                 .count()
                 + logs.max_logs.div_ceil(plan.shards.len().max(1)),
+            lazy_spare: true,
         })
     }
 }
@@ -132,6 +137,7 @@ impl Settings {
                 execution.resident_bytes,
             ),
             clients: deployment.deployment().limits.max_clients,
+            lazy_spare: shape.lazy_spare,
         })
     }
 
@@ -157,6 +163,7 @@ impl Settings {
             write_group_bytes: self.pipeline.max_body_bytes,
             reads: self.reads,
             producer_idle: Some(std::time::Duration::from_secs(placement.producer_idle_secs)),
+            lazy_spare: self.lazy_spare,
         }
     }
 

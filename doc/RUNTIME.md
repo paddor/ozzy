@@ -416,6 +416,8 @@ partition with one writer, reached only through its `Log` handle from
   the shard.
 - The `[logs]` class sets segment size, append bound, and the number of
   logs per broker. A log keeps the sizes it was created with.
+- An empty log holds one segment. Its spare is allocated once the active
+  segment is a quarter full.
 - The dispatcher routes only broker traffic to a runtime log and holds no
   leader observation of it. Followers check the view of every PREPARE.
 

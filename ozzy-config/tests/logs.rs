@@ -28,7 +28,7 @@ fn the_log_class_is_opt_in_with_small_default_sizes() {
     assert_eq!(
         logs,
         LogClass {
-            segment_bytes: 4 * 1024 * 1024,
+            segment_bytes: 2 * 1024 * 1024,
             max_append_bytes: 1024 * 1024,
             max_logs: 8,
         }

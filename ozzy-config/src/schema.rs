@@ -260,7 +260,7 @@ const fn default_append_bytes() -> u64 {
 }
 
 const fn default_log_segment_bytes() -> u64 {
-    4 * 1024 * 1024
+    2 * 1024 * 1024
 }
 
 const fn default_log_append_bytes() -> u64 {

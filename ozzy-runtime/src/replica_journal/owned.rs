@@ -291,7 +291,7 @@ impl OwnedJournal {
             images,
             committed_base: None,
             room: room::Room::default(),
-            spare: spare::Spare::default(),
+            spare: spare::Spare::new(config.lazy_spare),
             indexing: indexing::Indexing::default(),
             dedup: dedup::State::new(config.deduplication),
             delay: config.delay,

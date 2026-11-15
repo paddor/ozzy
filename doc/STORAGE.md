@@ -369,6 +369,9 @@ With the `aio` backend (the Linux default), segment data writes use a separate
 - A job beside writes allocates the spare at full capacity: at open and
   after each roll, installation, and cleanup. A roll waits for it, so it
   needs no new space.
+- A runtime log allocates its spare only once the active segment is a
+  quarter full, or when a write waits for it. Until then every append fits
+  the active segment beside the reserve a missing spare calls for.
 - `format` writes up to 128 MiB of zeros once where a new store's first
   appends land: the first segment of a local store, or a spare in a
   replicated store, whose first election installs its log into a new segment.

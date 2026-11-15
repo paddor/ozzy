@@ -64,6 +64,36 @@ fn spare_job(controller: &mut Controller, replica: &mut Replica, now: u64) -> bo
     true
 }
 
+/// A lazy spare leaves an empty partition with its one segment: it is
+/// allocated once the active segment is a quarter full, or when a write
+/// waits for it.
+#[test]
+fn a_lazy_spare_waits_for_the_fill_mark_or_a_held_write() {
+    let (mut controller, io) = setup();
+    // One operation per 4 KiB group in a 32 KiB segment: the mark is 8 KiB.
+    let mut replica = replica_with_pending(&mut controller, io, 0, 16, 64);
+    replica.journal.spare = crate::replica_journal::owned::spare::Spare::new(true);
+    assert!(!spare_job(&mut controller, &mut replica, 0));
+    assert!(!replica.journal.spare.ready());
+    // Records still fit beside the reserve a missing spare calls for.
+    assert!(room(&mut replica, OperationKind::Barrier).is_ok());
+    fill(&mut controller, &mut replica, 2);
+    assert!(spare_job(&mut controller, &mut replica, 0));
+    assert!(replica.journal.spare.ready());
+
+    // A roll takes the spare. The new segment is empty, so the next spare
+    // waits again, until a write holds for it.
+    fill(&mut controller, &mut replica, 5);
+    let work = replica.journal.begin_roll(16).unwrap();
+    let done = drive(&mut controller, work.publish());
+    replica.journal.complete_roll(done).unwrap();
+    assert!(!spare_job(&mut controller, &mut replica, 0));
+    replica.journal.await_spare().unwrap();
+    assert!(spare_job(&mut controller, &mut replica, 0));
+    assert!(replica.journal.spare.ready());
+    drive(&mut controller, replica.journal.shutdown()).unwrap();
+}
+
 #[test]
 fn full_device_refuses_records_in_the_tail_and_holds_writes_without_faulting() {
     let (mut controller, io) = setup();
