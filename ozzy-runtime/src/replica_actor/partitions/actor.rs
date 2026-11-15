@@ -85,6 +85,14 @@ impl PartitionActor {
         }
     }
 
+    /// Give a replicated actor's reserved but unused capacity back. See
+    /// [`ReplicaActor::trim`](crate::replica_actor::ReplicaActor::trim).
+    pub fn trim(&mut self) {
+        if let Self::Replicated(actor) = self {
+            actor.trim();
+        }
+    }
+
     /// Select the shared frontend's follower publication transport.
     pub fn enable_publication(&mut self) {
         if let Self::Replicated(actor) = self {

@@ -98,10 +98,20 @@
   so a shard with more partitions sees each once per several intervals.
   With these, the CPU time of idle replicated logs no longer grows with
   their count.
+- A runtime log reserves its pipeline at first use, not at start. The
+  broker trims each log actor it installs (`ReplicaActor::trim`,
+  `ScheduledReplica::trim`, `PartitionActor::trim`, `ProposalBuffer::trim`,
+  `AppendBuffer::trim`, and `trim` on the `ozzy_replication` driver, normal
+  replica, flow transmitter and receiver): queues, ledgers and arena
+  descriptors sized for a full pipeline are given back and grow again
+  with use, so the first writes to a log allocate. Topics still reserve
+  at start. A log reserves its read descriptors at its first read.
 - A replica allocates its history payload scratch when it first sends
-  history, and a fresh `DURABLE` file is written from its image without a
-  copy. A replicated log that never sent history holds about 60 KiB less
-  resident memory.
+  history, as large as its largest batch. A fresh `DURABLE` file is
+  written from its image without a copy. A segment writer that a view
+  change installed no longer keeps the encode buffer reserved for the
+  staged copy. With these and the trim, an idle replicated log copy holds
+  about 150 KiB resident memory instead of about 365 KiB.
 - A follower that restarts with its disk intact rejoins the view it last
   installed instead of requesting the next one, so restarting a follower
   no longer moves leadership. A restarted leader still requests the next

@@ -87,6 +87,15 @@ pub struct Transmitter {
 }
 
 impl Transmitter {
+    /// Give the unused part of the reserved window back. It grows again as
+    /// operations are sent. For a replica that expects to stay idle.
+    pub fn trim(&mut self) {
+        self.spare.shrink_to_fit();
+        if let Some(sender) = &mut self.sender {
+            sender.trim();
+        }
+    }
+
     /// Reserve this sender's local metadata window and start fresh probe correlation.
     /// Remote receipt reports cannot increase this allocation.
     pub fn new(

@@ -34,6 +34,12 @@ pub(in crate::replica_actor) struct Receive {
 }
 
 impl Receive {
+    pub(super) fn trim(&mut self) {
+        self.queued.trim();
+        self.ledger.trim();
+        self.operations.shrink_to_fit();
+    }
+
     #[cfg(test)]
     pub(in crate::replica_actor) fn retry_pending(&self) -> bool {
         self.retry.is_some()

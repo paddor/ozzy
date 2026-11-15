@@ -361,6 +361,8 @@ impl Installer {
             next = self.publish_checkpoint_source(next, checkpoint).await?;
         }
         self.journal.install_selected(next).await?;
+        // The reserve served the staged copy. A writer in service holds none.
+        self.writer.release_encode_buffer();
         let old = std::mem::replace(&mut self.journal.writer, self.writer);
         old.close().await?;
         Ok(self.journal)

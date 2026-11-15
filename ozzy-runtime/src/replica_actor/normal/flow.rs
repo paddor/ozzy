@@ -69,6 +69,14 @@ pub(in crate::replica_actor) fn remote_transmitters(
 }
 
 impl Flow {
+    pub(super) fn trim(&mut self) {
+        self.history.shrink_to_fit();
+        self.scratch.shrink_to_fit();
+        for peer in self.peers.iter_mut().flatten() {
+            peer.trim();
+        }
+    }
+
     pub(in crate::replica_actor) fn new(
         peers: [Option<Transmitter>; 3],
         key: Option<(Scope, JournalGeneration)>,

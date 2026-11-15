@@ -58,7 +58,8 @@ impl LogLane {
             max_operations: 1,
             max_body_bytes: read_bytes,
         })?;
-        let reads = PartitionReadBuffer::new(arena, read_limits, Arc::new(AtomicWaker::new()))?;
+        // Most logs are never read here: the first read reserves.
+        let reads = PartitionReadBuffer::lazy(arena, read_limits, Arc::new(AtomicWaker::new()));
         let append = PipelineLimits {
             max_operations: 1,
             max_body_bytes: limits.append_bytes.min(pipeline.max_body_bytes),

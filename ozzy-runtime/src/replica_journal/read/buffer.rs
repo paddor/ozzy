@@ -68,6 +68,17 @@ impl PartitionReadBuffer {
         Ok(Self(Rc::new(RefCell::new(Lent::new(arena, wake)))))
     }
 
+    /// Like `new`, but the descriptors are reserved by the first read.
+    pub(crate) fn lazy(
+        buffer: AppendBuffer,
+        limits: PartitionReadLimits,
+        wake: Arc<AtomicWaker>,
+    ) -> Self {
+        let mut arena = Arena::new(buffer);
+        arena.bounds = Some((limits.max_records, limits.max_parts));
+        Self(Rc::new(RefCell::new(Lent::new(arena, wake))))
+    }
+
     /// Take the existing arena when no disk command or delivery still owns it.
     /// The lease reserves its return slot now, so dropping it cannot fail.
     pub(crate) fn try_lease(&self) -> Option<PartitionReadLease> {

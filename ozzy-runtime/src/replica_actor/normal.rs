@@ -68,6 +68,15 @@ pub(super) struct Work {
 }
 
 impl Work {
+    /// Give unused reserved capacity back. Everything grows again with use.
+    pub(super) fn trim(&mut self) {
+        self.live.shrink_to_fit();
+        self.persisting_bytes.shrink_to_fit();
+        self.receive.trim();
+        self.recent.trim();
+        self.flow.trim();
+    }
+
     pub(super) fn new(
         config: &ActorConfig,
         channel: ozzy_replication::flow::Channel,

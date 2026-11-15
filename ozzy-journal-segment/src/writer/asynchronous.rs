@@ -229,6 +229,11 @@ impl Writer {
             .await
     }
 
+    /// Give the reserved encode buffer back. Appends grow it as they need.
+    pub(crate) fn release_encode_buffer(&mut self) {
+        self.state.encode_buffer = Vec::new();
+    }
+
     pub(crate) fn reserve_encode_buffer(
         &mut self,
         bytes: usize,

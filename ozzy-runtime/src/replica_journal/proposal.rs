@@ -116,6 +116,11 @@ pub enum OwnerAppendError {
 pub struct ProposalBuffer(pub(crate) AppendBuffer);
 
 impl ProposalBuffer {
+    /// Give the unused descriptor capacity back. It grows again with use.
+    pub fn trim(&mut self) {
+        self.0.trim();
+    }
+
     /// Bind an empty startup arena to a shard-owned bounded memory pool.
     /// Direct producer backpressure controls admission before allocation.
     pub fn bind_owner(&mut self, owner: &crate::memory::Owner) -> Result<(), JournalError> {

@@ -153,6 +153,14 @@ pub struct ReplicaDriver {
 }
 
 impl ReplicaDriver {
+    /// Give a normal replica's unused reserved capacity back. It grows again
+    /// with use. For a replica that expects to stay idle.
+    pub fn trim(&mut self) {
+        if let Role::Normal(replica) = &mut self.role {
+            replica.trim();
+        }
+    }
+
     /// Attach scheduling to a bootstrapped or completely installed normal core.
     /// Intact restart must instead enter the existing nonvoting recovery path.
     pub fn from_normal(

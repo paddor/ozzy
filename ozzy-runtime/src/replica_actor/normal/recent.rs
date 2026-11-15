@@ -30,6 +30,10 @@ pub(super) struct Recent {
 }
 
 impl Recent {
+    pub(super) fn trim(&mut self) {
+        self.entries.shrink_to_fit();
+    }
+
     pub(super) fn new(limits: PipelineLimits) -> Self {
         Self {
             entries: VecDeque::with_capacity(limits.max_operations),

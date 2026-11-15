@@ -19,6 +19,10 @@ pub struct Sender {
 }
 
 impl Sender {
+    pub(super) fn trim(&mut self) {
+        self.pending.shrink_to_fit();
+    }
+
     /// Open after a fresh correlated exchange with the bound peer and epoch.
     ///
     /// `verified_received` must come from exact local-history lookup, not a copied

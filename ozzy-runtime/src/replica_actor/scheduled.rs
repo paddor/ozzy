@@ -73,6 +73,11 @@ impl ScheduledReplica {
         Ok(())
     }
 
+    /// See [`ReplicaActor::trim`].
+    pub fn trim(&mut self) {
+        self.actor.trim();
+    }
+
     /// The adapter provides group PUB delivery and bounded PEER gap repair.
     pub fn enable_publication(&mut self) {
         self.actor.work.flow.publication_enabled = true;

@@ -107,6 +107,12 @@ pub struct NormalReplica {
 }
 
 impl NormalReplica {
+    /// Give the unused part of the reserved operation ring back. It grows
+    /// again as operations are prepared.
+    pub fn trim(&mut self) {
+        self.operations.shrink_to_fit();
+    }
+
     /// Exact prefix released from the live window after application and persistence.
     pub const fn reclaimed_prefix(&self) -> Prefix {
         self.retained_base

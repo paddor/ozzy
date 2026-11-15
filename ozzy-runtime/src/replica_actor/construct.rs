@@ -12,6 +12,20 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 impl ReplicaActor {
+    /// Give reserved but unused capacity back: queues, ledgers and arena
+    /// descriptors sized for a full pipeline. All of it grows again with
+    /// use, so the first writes allocate. For a replica that expects to
+    /// stay idle, where many of them share a process.
+    pub fn trim(&mut self) {
+        self.driver.trim();
+        self.work.trim();
+        self.ingress.trim();
+        self.pending_persistence.shrink_to_fit();
+        for buffer in [&mut self.buffer, &mut self.spare].into_iter().flatten() {
+            buffer.trim();
+        }
+    }
+
     /// Consume storage-validated startup and reserve actor buffers before serving.
     /// The journal must have two available append-buffer leases at these bounds:
     /// one for journal/transfer work and one for contiguous backup receive staging.

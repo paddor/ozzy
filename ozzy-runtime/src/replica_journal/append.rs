@@ -311,6 +311,15 @@ impl AppendBuffer {
         self.body_digests.clear();
     }
 
+    /// Give the unused descriptor capacity back and keep the journal lease.
+    /// It grows again with use. For a log that expects to stay idle.
+    pub fn trim(&mut self) {
+        self.progress_riders.shrink_to_fit();
+        self.entries.shrink_to_fit();
+        self.prepared.shrink_to_fit();
+        self.body_digests.shrink_to_fit();
+    }
+
     pub(crate) fn allocator(&self) -> Option<crate::memory::Allocator> {
         self.bodies.allocator()
     }

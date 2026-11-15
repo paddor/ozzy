@@ -512,6 +512,9 @@ impl State {
             .map_err(failure)?;
         started.actor.enable_publication();
         started.prepare_partition()?;
+        // Most logs idle: each keeps only what it uses.
+        started.actor.trim();
+        started.buffer.trim();
         let lane = LogLane::new(&mut started.actor, limits).map_err(failure)?;
         self.actors
             .insert(started.actor)
