@@ -73,6 +73,8 @@ pub(super) struct RuntimeLogs {
     unopened: Vec<LogRecord>,
     /// Start jobs in flight: the load, opens, and resumed removals.
     starting: usize,
+    /// Logs opened at start that still look for their leader.
+    pub(super) settling: super::waves::Settling,
 }
 
 impl RuntimeLogs {
@@ -102,6 +104,7 @@ impl RuntimeLogs {
             jobs,
             unopened: Vec::new(),
             starting: 1,
+            settling: super::waves::Settling::new(),
         })
     }
 
@@ -246,9 +249,11 @@ impl State {
         Ok(())
     }
 
-    /// Open waiting logs, at most `OPENS` at once.
+    /// Open waiting logs, at most `OPENS` at once and within the window of
+    /// logs that settle.
     fn open_waiting(runtime: &mut RuntimeLogs) {
         while runtime.starting < OPENS
+            && runtime.settling.room(runtime.starting)
             && let Some(record) = runtime.unopened.pop()
         {
             let (io, setup) = (runtime.io.clone(), runtime.setup.clone());
@@ -291,6 +296,8 @@ impl State {
         binding: &Binding,
         now: Duration,
     ) -> Result<(), StartupError> {
+        runtime.settling.observe(now, |log| self.log_ready(log));
+        Self::open_waiting(runtime);
         self.poll_jobs(runtime, cx, binding, now)?;
         // Commands wait until every log recorded at start is back.
         if !runtime.settled() {
@@ -439,6 +446,7 @@ impl State {
             Done::Opened { record, opened } => {
                 runtime.starting -= 1;
                 self.install_log(runtime, &record, opened?, Some((binding, now)))?;
+                runtime.settling.opened(group(&record), now);
             }
             Done::Discarded { id, discarded } => {
                 runtime.starting -= 1;

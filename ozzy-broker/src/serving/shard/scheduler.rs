@@ -255,6 +255,11 @@ impl State {
             .next_deadline()
             .into_iter()
             .chain(self.outbound.next_retry(now))
+            .chain(
+                self.runtime
+                    .as_ref()
+                    .and_then(|logs| logs.settling.next_deadline()),
+            )
             .min()
     }
 
@@ -265,6 +270,14 @@ impl State {
                 .identities
                 .iter()
                 .all(|&(group, partition)| self.client_ready(group, partition))
+    }
+
+    /// Whether a runtime log knows its leader. A log that left the shard
+    /// waits for none.
+    pub(super) fn log_ready(&self, log: GroupId) -> bool {
+        self.indices
+            .get(&log)
+            .is_none_or(|&index| self.client_ready(log, self.identities[index].1))
     }
 
     /// The partition finished its bootstrap here, or a remote leader serves it.

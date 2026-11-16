@@ -139,6 +139,14 @@
   that change view at once, no longer spin their shards: three brokers
   restarting on 512 idle replicated logs took 57 s and 164 s of CPU time,
   and now take about 42 s and 73 s.
+- A shard opens its runtime logs at start a window at a time: 16 logs
+  may open or look for their leader at once. All copies electing at once
+  queued on the disk for longer than an election waits, so elections
+  repeated. A log without a leader after 8 s gives up its place and
+  doubles the window, so a broker that starts alone still opens all its
+  logs. Three brokers restarting on 512 idle replicated logs took 41 to
+  58 s with two to five view changes per log, and now take 31 to 42 s
+  with one, at less than half the CPU time.
 - A check of a journal's selected metadata synchronizes the unchanged
   `CONFIGURATION` file once per journal owner, not at every check. A
   reopened replicated log made nine such checks, each with two disk

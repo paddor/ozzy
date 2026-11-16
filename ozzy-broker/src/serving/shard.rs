@@ -1,6 +1,7 @@
 mod build;
 mod logs;
 mod scheduler;
+mod waves;
 use build::build;
 
 use super::{
