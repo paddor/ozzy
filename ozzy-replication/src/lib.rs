@@ -262,14 +262,15 @@ pub struct Commit {
     pub committed: Prefix,
 }
 
-/// Where a voter runs its group: one shard of its broker, at the epoch that
-/// shard reported. A broker beat that still names the pair says the voter
-/// stands by what it sent under it.
+/// Where a voter runs its group: one beat source of its broker, at the
+/// epoch that source reported. A broker beat that still names the pair says
+/// the voter stands by what it sent under it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BeatSource {
-    /// The voter's own shard number. It means nothing on another broker.
+    /// The voter's own number of the source. It means nothing on another
+    /// broker.
     pub shard: u32,
-    /// The shard's epoch when the voter sent this.
+    /// The source's epoch when the voter sent this.
     pub epoch: u64,
 }
 

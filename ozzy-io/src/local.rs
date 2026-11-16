@@ -7,6 +7,9 @@ use std::{
     rc::Rc,
 };
 
+mod turns;
+use turns::Turns;
+
 /// Clones share one lane and its budgets. Intentionally not Send or Sync: move
 /// the backend onto its shard before constructing this value. No mutable lane
 /// borrow survives a submission, capacity wait or physical-completion wait.
@@ -16,6 +19,8 @@ pub struct Local {
     admission: Admission,
     shard: usize,
     completed: Rc<Cell<u64>>,
+    /// The jobs that wait for capacity, in the order they came.
+    turns: Rc<Turns>,
     /// A held lock that already keeps other processes off the files this
     /// lane works on.
     guard: Option<Handle>,
@@ -29,6 +34,7 @@ impl Local {
             shard: backend.shard(),
             backend: Rc::new(RefCell::new(Box::new(backend))),
             completed: Rc::default(),
+            turns: Rc::default(),
             guard: None,
         }
     }
@@ -72,15 +78,36 @@ impl Local {
         self.completed.get()
     }
 
-    /// Wait for admission, then physical completion. The caller must account
-    /// for pending bytes in its own bounded state until admission succeeds.
+    /// Wait for admission, then physical completion. Waiting jobs of a
+    /// class are admitted in the order they came, except that one that fits
+    /// passes those whose bytes do not fit yet. A capacity change wakes the
+    /// first of that order only, so poll a waiting job when it is woken, or
+    /// drop it: left alone, it keeps the jobs behind it asleep. The caller
+    /// must account for pending bytes in its own bounded state until
+    /// admission succeeds.
     /// Canceling after submission does not cancel physical execution.
     pub async fn execute(&self, class: Class, mut operation: Operation) -> io::Result<Completed> {
         let bytes = operation.retained_bytes()?;
+        let fits = |bytes| !self.admission.full(self.shard, class, bytes);
+        let turn = self.turns.join(class, bytes, fits);
         loop {
-            self.admission.ready(self.shard, class, bytes).await?;
+            turn.taken(|| fits(bytes)).await;
+            if !fits(bytes) && !turn.first() {
+                // Another job took the room. Only the first job waits for
+                // the next change.
+                turn.rest();
+                continue;
+            }
+            self.admission
+                .ready_or(self.shard, class, bytes, || turn.promote(fits))
+                .await?;
             match self.submit(class, operation) {
                 Ok(completion) => {
+                    // What is left may fit a job that sleeps.
+                    if self.admission.operation_free(self.shard, class) {
+                        turn.promote(fits);
+                    }
+                    drop(turn);
                     let result = completion.await;
                     self.completed.set(self.completed.get().wrapping_add(1));
                     return result;

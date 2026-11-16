@@ -466,6 +466,10 @@ impl ScheduledReplica {
     pub(super) fn resting(&self) -> bool {
         self.actor.resting()
     }
+    /// Whether an agreement to rest no longer stands on the beats.
+    pub(super) fn rest_broken(&self) -> bool {
+        self.actor.rest_broken()
+    }
     /// Whether the role left a view in which a peer may still trust it.
     pub(super) fn take_withdrawal(&mut self) -> bool {
         self.actor.take_withdrawal()

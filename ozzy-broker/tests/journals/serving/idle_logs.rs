@@ -86,6 +86,23 @@ fn open_below(root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Wait until each of the first `count` logs has a leader.
+async fn all_led(brokers: &[Broker], count: usize, nodes: &[NodeId]) {
+    for index in 0..count {
+        let id = spec(index, nodes).id;
+        let led = || {
+            brokers.iter().any(|broker| {
+                broker
+                    .runtime_log(id)
+                    .is_some_and(|log| log.status().borrow().role == LogRole::Leader)
+            })
+        };
+        while !led() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+}
+
 /// Twelve replicated logs per broker elect leaders within a budget of 24
 /// descriptors per broker, less than two per log: idle handles give their
 /// descriptors up, and one lock per device guards all its log stores.
@@ -147,7 +164,7 @@ async fn idle_logs_share_a_small_descriptor_budget_and_one_lock() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "measurement; OZZY_IDLE_LOGS, OZZY_IDLE_MAX_LOGS, OZZY_IDLE_SEGMENT, OZZY_IDLE_SECONDS and OZZY_IDLE_HANDLES select the run"]
+#[ignore = "measurement; OZZY_IDLE_LOGS, OZZY_IDLE_MAX_LOGS, OZZY_IDLE_SEGMENT, OZZY_IDLE_SECONDS, OZZY_IDLE_HANDLES and OZZY_IDLE_RESTART select the run"]
 async fn idle_replicated_logs_report_their_cost() {
     let count = setting("OZZY_IDLE_LOGS", 32);
     let segment = setting("OZZY_IDLE_SEGMENT", 2 * 1024 * 1024) as u64;
@@ -176,8 +193,10 @@ async fn idle_replicated_logs_report_their_cost() {
             NodeId::from_bytes(*checked.identity.brokers[&checked.plan.name].as_bytes())
         })
         .collect();
+    let again = deployment.clone();
     let brokers = start_brokers(&runtime, deployment).await;
     let before = usage(root.path());
+    let fresh = ozzy_runtime::profiling::totals();
     let started = std::time::Instant::now();
     for index in 0..count {
         let spec = spec(index, &nodes);
@@ -185,19 +204,24 @@ async fn idle_replicated_logs_report_their_cost() {
             broker.create_log(spec.clone()).await.unwrap();
         }
     }
-    for index in 0..count {
-        let id = spec(index, &nodes).id;
-        let led = || {
-            brokers.iter().any(|broker| {
-                broker.runtime_log(id).unwrap().status().borrow().role == LogRole::Leader
-            })
-        };
-        while !led() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    }
+    all_led(&brokers, count, &nodes).await;
     let created = usage(root.path());
     let events = ozzy_runtime::profiling::totals();
+    let views = (0..count).map(|index| {
+        let id = spec(index, &nodes).id;
+        let view = |broker: &Broker| broker.runtime_log(id).unwrap().status().borrow().view;
+        brokers.iter().map(view).max().unwrap()
+    });
+    let mut by_view = std::collections::BTreeMap::<_, usize>::new();
+    for view in views {
+        *by_view.entry(view).or_default() += 1;
+    }
+    println!("logs_by_view={by_view:?}");
+    for ((name, _, after), (_, _, before)) in events.rows().zip(fresh.rows()) {
+        if after != before {
+            println!("create_event {name}={}", after.wrapping_sub(before));
+        }
+    }
     let copies = 3 * count as u64;
     println!(
         "logs={count} segment={segment} create_and_elect={:?} create_cpu_ticks={}",
@@ -235,4 +259,117 @@ async fn idle_replicated_logs_report_their_cost() {
     for broker in brokers {
         broker.shutdown().await.unwrap();
     }
+    if setting("OZZY_IDLE_RESTART", 0) == 0 {
+        return;
+    }
+    // Every broker starts again on the logs it has.
+    let (stopped, started) = (ticks(), std::time::Instant::now());
+    let events = ozzy_runtime::profiling::totals();
+    let mut brokers = Vec::new();
+    for (checked, local) in again {
+        let context = runtime.context().clone();
+        brokers.push(
+            Broker::start_trusted_with_context(checked, local, context)
+                .await
+                .unwrap(),
+        );
+    }
+    let opened = started.elapsed();
+    all_led(&brokers, count, &nodes).await;
+    println!(
+        "restart: started={opened:?} led={:?} cpu_ticks={}",
+        started.elapsed(),
+        ticks() - stopped
+    );
+    let totals = ozzy_runtime::profiling::totals();
+    for ((name, _, after), (_, _, before)) in totals.rows().zip(events.rows()) {
+        if after != before {
+            println!("restart_event {name}={}", after.wrapping_sub(before));
+        }
+    }
+    for broker in brokers {
+        broker.shutdown().await.unwrap();
+    }
+}
+
+/// The `logs` directory below `root` that holds record files.
+fn records_directory(root: &Path) -> PathBuf {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        if directory.ends_with("logs") {
+            return directory;
+        }
+        let entries = std::fs::read_dir(&directory).unwrap().flatten();
+        pending.extend(
+            entries
+                .map(|entry| entry.path())
+                .filter(|path| path.is_dir()),
+        );
+    }
+    panic!("no logs directory below {}", root.display());
+}
+
+/// A broker starts on more records than one listing job holds, whatever
+/// the size of its log class, and removes a staged record left behind.
+#[tokio::test(flavor = "current_thread")]
+async fn a_broker_starts_on_more_log_records_than_one_listing_holds() {
+    let tombstones = 2500;
+    let root = tempfile::tempdir().unwrap();
+    let runtime = WriterRuntime::new().unwrap();
+    let deployment = deployment_with(root.path(), DeploymentMode::Single, 1, |config| {
+        config.logs = Some(ozzy_config::LogClass {
+            segment_bytes: 2 * 1024 * 1024,
+            max_append_bytes: 512 * 1024,
+            max_logs: 4,
+        });
+    });
+    let again = deployment.clone();
+    let nodes: Vec<NodeId> = deployment
+        .iter()
+        .map(|(checked, _)| {
+            NodeId::from_bytes(*checked.identity.brokers[&checked.plan.name].as_bytes())
+        })
+        .collect();
+    let mut brokers = start_brokers(&runtime, deployment).await;
+    let broker = brokers.pop().unwrap();
+    let (kept, dropped) = (spec(1, &nodes), spec(2, &nodes));
+    for spec in [&kept, &dropped] {
+        broker.create_log(spec.clone()).await.unwrap();
+    }
+    broker.delete_log(dropped.id).await.unwrap();
+    broker.shutdown().await.unwrap();
+
+    // Copies of the deleted log's record under other IDs, and a staged
+    // record a crash left.
+    let directory = records_directory(root.path());
+    let label = uuid::Uuid::from_bytes(*dropped.id.as_bytes()).simple();
+    let text = std::fs::read_to_string(directory.join(format!("{label}.record"))).unwrap();
+    let deleted = ozzy_config::LogRecord::decode(&text).unwrap();
+    for index in 0..tombstones {
+        let record = ozzy_config::LogRecord {
+            log: uuid::Uuid::from_bytes(*spec(100 + index, &nodes).id.as_bytes()),
+            ..deleted.clone()
+        };
+        let path = directory.join(format!("{}.record", record.log.simple()));
+        std::fs::write(path, record.encode().unwrap()).unwrap();
+    }
+    let staged = directory.join(format!("{label}.staged"));
+    std::fs::write(&staged, text).unwrap();
+
+    let (checked, local) = again.into_iter().next().unwrap();
+    let broker = Broker::start_trusted_with_context(checked, local, runtime.context().clone())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(60), broker.ready())
+        .await
+        .unwrap()
+        .unwrap();
+    let logs = broker.logs();
+    assert_eq!(logs.len(), tombstones + 2);
+    let ready =
+        |(_, state): &&(GroupId, ozzy_config::LogState)| *state == ozzy_config::LogState::Ready;
+    assert_eq!(logs.iter().filter(ready).count(), 1);
+    assert!(broker.runtime_log(kept.id).is_some());
+    assert!(!staged.exists());
+    broker.shutdown().await.unwrap();
 }

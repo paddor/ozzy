@@ -18,7 +18,7 @@ pub enum Class {
 }
 
 impl Class {
-    const fn index(self) -> usize {
+    pub(crate) const fn index(self) -> usize {
         match self {
             Self::Data => 0,
             Self::Progress => 1,
@@ -182,6 +182,43 @@ impl Admission {
             .changed
             .wait_for(|| match self.check(shard, class, bytes) {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => None,
+                result => Some(result),
+            })
+            .await
+    }
+
+    /// Whether an operation of `class` with `bytes` must wait for capacity
+    /// on `shard` now.
+    pub fn full(&self, shard: usize, class: Class, bytes: usize) -> bool {
+        let checked = self.check(shard, class, bytes);
+        checked.is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock)
+    }
+
+    /// Whether one more operation of `class` fits on `shard`, whatever its
+    /// bytes.
+    pub fn operation_free(&self, shard: usize, class: Class) -> bool {
+        let limit = self.0.limits.share(shard, class);
+        limit.is_ok_and(|limit| self.used(shard, class).operations < limit.operations)
+    }
+
+    /// Like [`Self::ready`]. Calls `short` whenever an operation is free
+    /// but its `bytes` are not, which is when a smaller request fits.
+    pub async fn ready_or(
+        &self,
+        shard: usize,
+        class: Class,
+        bytes: usize,
+        mut short: impl FnMut(),
+    ) -> io::Result<()> {
+        self.0
+            .changed
+            .wait_for(|| match self.check(shard, class, bytes) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if self.operation_free(shard, class) {
+                        short();
+                    }
+                    None
+                }
                 result => Some(result),
             })
             .await

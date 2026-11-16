@@ -119,7 +119,7 @@ async fn load(
 ) -> Result<(Local, Vec<LogRecord>), StartupError> {
     crate::format::initialize_directory(io, directory).await?;
     let guarded = setup.guarded(io, directory).await?;
-    let records = registry::load(io, directory, setup.class.max_logs).await?;
+    let records = registry::load(io, directory).await?;
     Ok((guarded, records))
 }
 

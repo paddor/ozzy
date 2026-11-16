@@ -291,6 +291,12 @@ fn scenario() {
                 .is_pending()
         );
     }
+    // The leader dies with its broker: its actors and the jobs they had
+    // waiting are gone.
+    drop(std::mem::replace(
+        &mut shards[0],
+        PartitionActors::new(Vec::new(), 2, 1).unwrap(),
+    ));
     let mut elected = None;
     for tick in 1..10000 {
         let now = Duration::from_millis(1100 + tick / 10);

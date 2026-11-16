@@ -208,29 +208,57 @@ async fn list(
     ))
 }
 
-/// Every record in `directory`, which holds at most `maximum` logs. A
-/// missing directory holds none. Leftover staged files are removed.
-pub(crate) async fn load(
+/// Entries one listing job of [`load`] holds.
+const PAGE: usize = 1024;
+
+/// The entries of `directory` right after `after` by name, at most
+/// [`PAGE`], with the listing job released. Empty at the end and for a
+/// missing directory.
+async fn page(
     io: &Local,
     directory: &Path,
-    maximum: usize,
-) -> Result<Vec<LogRecord>, StartupError> {
-    // A log has a record and a directory, and may have a staged file and
-    // a directory in the trash.
-    let bound = maximum.saturating_mul(4).saturating_add(16);
-    let Some(entries) = list(io, directory, bound).await? else {
-        return Ok(Vec::new());
+    after: Option<std::ffi::OsString>,
+) -> Result<Vec<(std::ffi::OsString, FileKind)>, StartupError> {
+    let listing = Operation::ReadDirectoryPage {
+        path: directory.into(),
+        after,
+        max_entries: PAGE,
+        max_name_bytes: PAGE * 64,
     };
+    let entries = match io.execute(Class::Progress, listing).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(io_error(directory, error)),
+    };
+    let Outcome::Directory(entries) = &*entries else {
+        return Err(io_error(directory, io::ErrorKind::InvalidData.into()));
+    };
+    Ok(entries
+        .iter()
+        .map(|entry| (entry.name.clone(), entry.kind))
+        .collect())
+}
+
+/// Every record in `directory`, however many it holds, a page at a time. A
+/// missing directory holds none. Leftover staged files are removed.
+pub(crate) async fn load(io: &Local, directory: &Path) -> Result<Vec<LogRecord>, StartupError> {
     let mut records = Vec::new();
-    for (name, _) in entries.iter().filter(|(_, kind)| *kind == FileKind::File) {
-        let path = directory.join(name);
-        match path.extension().and_then(|extension| extension.to_str()) {
-            Some(RECORD) => records.push(read(io, &path).await?),
-            Some(STAGED) => remove_file(io, &path).await?,
-            _ => {}
+    let mut after = None;
+    loop {
+        let entries = page(io, directory, after).await?;
+        let Some((last, _)) = entries.last() else {
+            return Ok(records);
+        };
+        after = Some(last.clone());
+        for (name, _) in entries.iter().filter(|(_, kind)| *kind == FileKind::File) {
+            let path = directory.join(name);
+            match path.extension().and_then(|extension| extension.to_str()) {
+                Some(RECORD) => records.push(read(io, &path).await?),
+                Some(STAGED) => remove_file(io, &path).await?,
+                _ => {}
+            }
         }
     }
-    Ok(records)
 }
 
 /// Remove the directory tree at `path`, if any, a bounded listing at a

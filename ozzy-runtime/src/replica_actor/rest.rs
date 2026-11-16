@@ -1,15 +1,16 @@
 //! Rest: an idle group stops its own heartbeats and votes.
 //!
 //! A settled primary's heartbeat offers a rest and names its beat source,
-//! the shard it runs on and that shard's epoch. A settled backup accepts
+//! the part of its shard the group belongs to and that part's epoch. A
+//! settled backup accepts
 //! with its own. Each side then trusts the other while that broker's beats
 //! still name the source it agreed on, and sends nothing for the group. A
 //! primary rests once every backup agreed or has no link.
 //!
 //! Either side ends the rest by speaking: any other message from the peer
 //! drops the agreement, and so does a beat that no longer covers it. A voter
-//! that leaves its view asks its shard to change the epoch, which ends
-//! whatever its peers still believe.
+//! that leaves its view asks its shard to change the epoch of its part,
+//! which ends whatever its peers still believe.
 
 use super::{ActorError, Control, ReplicaActor};
 use crate::frontend::Beats;
@@ -29,8 +30,9 @@ struct Held {
 
 #[derive(Debug, Default)]
 pub(super) struct Rest {
-    /// The broker's beats and this actor's shard, once its shard has them.
-    beats: Option<(Beats, u32)>,
+    /// The broker's beats, this actor's shard and its part of the shard,
+    /// once its shard has them.
+    beats: Option<(Beats, u32, u32)>,
     held: [Option<Held>; 3],
     /// The view and epoch this voter last offered or accepted a rest in.
     spoke: Option<(Scope, u64)>,
@@ -41,15 +43,15 @@ pub(super) struct Rest {
 
 impl Rest {
     fn source(&self) -> Option<BeatSource> {
-        let (beats, shard) = self.beats.as_ref()?;
-        beats.source(*shard)
+        let (beats, shard, part) = self.beats.as_ref()?;
+        beats.source(*shard, *part)
     }
 
     /// Whether `held` still stands: the same local epoch, the same link,
     /// and a peer whose beats still name its source.
     fn trusted(&self, held: Held, peer: ozzy_proto::NodeId, session: LinkSessionId) -> bool {
-        self.beats.as_ref().is_some_and(|(beats, shard)| {
-            beats.source(*shard).map(|source| source.epoch) == Some(held.local)
+        self.beats.as_ref().is_some_and(|(beats, ..)| {
+            self.source().map(|source| source.epoch) == Some(held.local)
                 && held.session == session
                 && beats.covers(peer, session, held.peer)
         })
@@ -60,7 +62,7 @@ impl Rest {
         let age = self
             .beats
             .as_ref()
-            .and_then(|(beats, _)| beats.heard(peer).map(|age| age.min(beats.timing().timeout)));
+            .and_then(|(beats, ..)| beats.heard(peer).map(|age| age.min(beats.timing().timeout)));
         age.map_or(now, |age| now.saturating_sub(age))
     }
 }
@@ -68,7 +70,19 @@ impl Rest {
 impl ReplicaActor {
     /// Let this actor rest on `beats`, which report `shard`.
     pub(super) fn install_beats(&mut self, beats: Beats, shard: u32) {
-        self.rest.beats = Some((beats, shard));
+        let part = Beats::part(self.driver.scope().group_id);
+        self.rest.beats = Some((beats, shard, part));
+    }
+
+    /// Whether an agreement this voter holds no longer stands on the
+    /// beats. The voter must then look at it.
+    pub(super) fn rest_broken(&self) -> bool {
+        (0..3).any(|voter| {
+            self.rest.held[voter].is_some_and(|held| {
+                let peer = self.configuration.voters()[voter];
+                !self.rest.trusted(held, peer, self.config.sessions[voter])
+            })
+        })
     }
 
     /// Whether the role left a view in which a peer may still trust this
@@ -235,7 +249,7 @@ impl ReplicaActor {
         source: BeatSource,
     ) -> Option<BeatSource> {
         let local = self.rest.source()?;
-        let (beats, _) = self.rest.beats.as_ref()?;
+        let (beats, ..) = self.rest.beats.as_ref()?;
         let peer = self.configuration.voters()[voter];
         let session = self.session(peer)?;
         let snapshot = self.driver.normal()?.snapshot();

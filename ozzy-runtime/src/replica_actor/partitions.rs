@@ -248,7 +248,7 @@ impl PartitionActors {
                 log.detach();
             }
             // Its peers may still trust the role it had.
-            self.request_withdrawal();
+            self.request_withdrawal(actor.group());
             self.actors.push(actor);
             let last = self.actors.len() - 1;
             self.actors.swap(slot, last);

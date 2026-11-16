@@ -171,11 +171,9 @@ pub(super) fn execute(
         Operation::Sync { handle, mode } => sync(&get(&handle)?.0, mode).map(|()| Outcome::Done),
         Operation::LockExclusive { handle } => lock(&get(&handle)?.0).map(|()| Outcome::Done),
         Operation::Close { handle } => close(shared, &handle),
-        Operation::ReadDirectory {
-            path,
-            max_entries,
-            max_name_bytes,
-        } => list_directory(&path, max_entries, max_name_bytes),
+        listing @ (Operation::ReadDirectory { .. } | Operation::ReadDirectoryPage { .. }) => {
+            list(listing)
+        }
         Operation::CreateDirectory { path } => fs::create_dir(path).map(|()| Outcome::Done),
         Operation::Rename {
             source,
@@ -335,6 +333,24 @@ fn read_buffer(
     Ok(Outcome::Read(ReadBuffer::new(bytes, count)?))
 }
 
+/// Run a listing, whole or one page of it.
+fn list(listing: Operation) -> io::Result<Outcome> {
+    match listing {
+        Operation::ReadDirectory {
+            path,
+            max_entries,
+            max_name_bytes,
+        } => list_directory(&path, max_entries, max_name_bytes),
+        Operation::ReadDirectoryPage {
+            path,
+            after,
+            max_entries,
+            max_name_bytes,
+        } => list_page(&path, after.as_deref(), (max_entries, max_name_bytes)),
+        _ => Err(io::ErrorKind::InvalidInput.into()),
+    }
+}
+
 fn list_directory(path: &Path, max_entries: usize, max_name_bytes: usize) -> io::Result<Outcome> {
     let mut entries = Vec::with_capacity(max_entries);
     let mut bytes = 0_usize;
@@ -357,6 +373,50 @@ fn list_directory(path: &Path, max_entries: usize, max_name_bytes: usize) -> io:
     }
     entries.sort_unstable_by(|a, b| a.name.cmp(&b.name));
     Ok(Outcome::Directory(entries))
+}
+
+/// The entries right after `after` by name that fit `(entries, bytes)`.
+/// The directory is read whole, and only the page is kept.
+fn list_page(
+    path: &Path,
+    after: Option<&std::ffi::OsStr>,
+    (max_entries, max_name_bytes): (usize, usize),
+) -> io::Result<Outcome> {
+    if max_entries == 0 {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    // The smallest names seen so far.
+    let mut kept = std::collections::BTreeMap::new();
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let full = kept.len() == max_entries;
+        if after.is_some_and(|after| name.as_os_str() <= after)
+            || full && kept.last_key_value().is_some_and(|(last, _)| name >= *last)
+        {
+            continue;
+        }
+        if full {
+            kept.pop_last();
+        }
+        kept.insert(name, kind(entry.file_type()?));
+    }
+    let mut page = Vec::with_capacity(kept.len());
+    let mut bytes = 0_usize;
+    for (name, kind) in kept {
+        bytes = bytes.saturating_add(name.len());
+        if bytes > max_name_bytes {
+            break;
+        }
+        page.push(Entry { name, kind });
+    }
+    if page.is_empty() && bytes > max_name_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "directory entry name exceeds admitted bound",
+        ));
+    }
+    Ok(Outcome::Directory(page))
 }
 
 fn open_file(path: &Path, target: Target) -> io::Result<(File, Identity)> {

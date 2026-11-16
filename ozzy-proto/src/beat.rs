@@ -1,20 +1,23 @@
-//! A broker's live shards and their epochs, sent to a peer on an
-//! established link.
+//! The sources of a broker's live shards and their epochs, sent to a peer
+//! on an established link. A shard reports several sources, each for a
+//! part of its groups, under numbers of its own.
 
 use crate::{ENVELOPE_BYTES, Envelope, EnvelopeLimits, Opcode, Packet, data::CodecError};
 
-/// Metadata bytes of one shard: its number and its epoch.
+/// Metadata bytes of one source: its number and its epoch.
 pub const SHARD_BYTES: usize = 12;
 
-/// Most shards one beat names.
-pub const MAX_SHARDS: usize = 256;
+/// Most sources one beat names.
+pub const MAX_SHARDS: usize = 4096;
 
-/// One shard of the sender and the epoch it reports.
+/// One source of the sender and the epoch it reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShardEpoch {
-    /// The sender's own shard number. It means nothing on another broker.
+    /// The sender's own number of the source. It means nothing on another
+    /// broker.
     pub shard: u32,
-    /// Changes whenever the shard withdraws what it said under the last one.
+    /// Changes whenever the source withdraws what was said under the last
+    /// one.
     pub epoch: u64,
 }
 

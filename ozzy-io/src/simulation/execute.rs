@@ -211,6 +211,7 @@ impl Execution<'_> {
                 Ok(Outcome::Done)
             }
             namespace @ (Operation::ReadDirectory { .. }
+            | Operation::ReadDirectoryPage { .. }
             | Operation::CreateDirectory { .. }
             | Operation::Rename { .. }
             | Operation::HardLink { .. }
@@ -227,6 +228,16 @@ impl Execution<'_> {
                 max_name_bytes,
             } => {
                 let entries = self.image.list(&path, max_entries, max_name_bytes)?;
+                return Ok(Outcome::Directory(entries));
+            }
+            Operation::ReadDirectoryPage {
+                path,
+                after,
+                max_entries,
+                max_name_bytes,
+            } => {
+                let bounds = (max_entries, max_name_bytes);
+                let entries = self.image.page(&path, after.as_deref(), bounds)?;
                 return Ok(Outcome::Directory(entries));
             }
             Operation::CreateDirectory { path } => {

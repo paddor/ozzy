@@ -5,15 +5,17 @@
 //!
 //! A replica group that rests sends no heartbeat of its own. Its voters
 //! instead agree on each other's [`BeatSource`], and each side trusts the
-//! other while that broker's beats still name the same shard and epoch. A
-//! shard changes its epoch to withdraw everything said under the old one.
+//! other while that broker's beats still name the same source and epoch.
+//! A shard has [`Beats::PARTS`] sources, and a group belongs to one by its
+//! ID. A shard changes the epoch of one to withdraw everything its groups
+//! said under the old one, which leaves the groups of the others at rest.
 
 use super::{Class, Kind, NodeId, ReceiveError, Service, routed};
 use crate::signal::StateSignal;
 use arc_swap::ArcSwapOption;
 use bytes::Bytes;
 use ozzy_proto::{
-    Envelope, EnvelopeLimits, LinkSessionId, Opcode,
+    Envelope, EnvelopeLimits, GroupId, LinkSessionId, Opcode,
     beat::{self, ShardEpoch},
 };
 use ozzy_replication::BeatSource;
@@ -39,7 +41,8 @@ pub struct BeatTiming {
 #[derive(Debug)]
 struct Local {
     shard: u32,
-    epoch: AtomicU64,
+    /// One epoch per part.
+    epochs: [AtomicU64; Beats::PARTS as usize],
     /// Nanoseconds of its last turn plus one, or zero before the first.
     turned: AtomicU64,
 }
@@ -58,7 +61,8 @@ struct Peer {
 #[derive(Debug, Eq, PartialEq)]
 struct Said {
     session: LinkSessionId,
-    shards: Vec<ShardEpoch>,
+    /// By source number.
+    sources: Vec<ShardEpoch>,
 }
 
 struct Shared {
@@ -94,7 +98,26 @@ fn age(stamp: u64, now: Duration) -> Option<Duration> {
     Some(now.saturating_sub(at))
 }
 
+/// The number a beat names one part of a shard by.
+fn number(shard: u32, part: u32) -> Option<u32> {
+    shard.checked_mul(Beats::PARTS)?.checked_add(part)
+}
+
 impl Beats {
+    /// Parts of a shard's epoch. A withdrawal changes one, so it ends the
+    /// rests of the groups in that part only.
+    pub const PARTS: u32 = 16;
+
+    /// The part of its shard `group` belongs to.
+    pub fn part(group: GroupId) -> u32 {
+        let (halves, _) = group.as_bytes().as_chunks::<8>();
+        // The top bits of a product depend on every bit below them.
+        let mixed = halves.iter().fold(0_u64, |sum, half| {
+            (sum ^ u64::from_be_bytes(*half)).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        });
+        u32::try_from(mixed >> (u64::BITS - Self::PARTS.trailing_zeros())).unwrap_or(0)
+    }
+
     /// State for `shards` of this broker and its broker `peers`. `clock` is
     /// one monotonic clock for every thread. Epochs start at `seed`, which
     /// should differ between runs of a broker.
@@ -112,7 +135,7 @@ impl Beats {
                 .into_iter()
                 .map(|shard| Local {
                     shard,
-                    epoch: AtomicU64::new(seed),
+                    epochs: std::array::from_fn(|_| AtomicU64::new(seed)),
                     turned: AtomicU64::new(0),
                 })
                 .collect(),
@@ -154,21 +177,31 @@ impl Beats {
         }
     }
 
-    /// What a voter on `shard` sends its peers now. `None` for a shard
-    /// these beats do not report.
-    pub fn source(&self, shard: u32) -> Option<BeatSource> {
+    /// What a voter in `part` of `shard` sends its peers now. `None` for a
+    /// shard these beats do not report.
+    pub fn source(&self, shard: u32, part: u32) -> Option<BeatSource> {
+        let epoch = self.local(shard)?.epochs.get(part as usize)?;
         // The epoch is read by the dispatcher thread: Acquire pairs with
         // the Release in `withdraw`.
-        self.local(shard).map(|local| BeatSource {
-            shard,
-            epoch: local.epoch.load(Ordering::Acquire),
+        Some(BeatSource {
+            shard: number(shard, part)?,
+            epoch: epoch.load(Ordering::Acquire),
         })
     }
 
-    /// Withdraw everything voters on `shard` sent under its current epoch.
-    pub fn withdraw(&self, shard: u32) {
-        if let Some(local) = self.local(shard) {
-            local.epoch.fetch_add(1, Ordering::Release);
+    /// Withdraw everything voters in `part` of `shard` sent under its
+    /// current epoch.
+    pub fn withdraw(&self, shard: u32, part: u32) {
+        let epoch = (self.local(shard)).and_then(|local| local.epochs.get(part as usize));
+        if let Some(epoch) = epoch {
+            epoch.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    /// Withdraw everything voters on `shard` sent.
+    pub fn withdraw_all(&self, shard: u32) {
+        for part in 0..Self::PARTS {
+            self.withdraw(shard, part);
         }
     }
 
@@ -183,11 +216,9 @@ impl Beats {
         let heard = age(state.heard.load(Ordering::Acquire), (self.0.clock)());
         heard.is_some_and(|heard| heard < self.0.timing.timeout)
             && state.said.load().as_deref().is_some_and(|said| {
+                let named = (said.sources).binary_search_by_key(&source.shard, |named| named.shard);
                 said.session == session
-                    && said
-                        .shards
-                        .iter()
-                        .any(|named| named.shard == source.shard && named.epoch == source.epoch)
+                    && named.is_ok_and(|index| said.sources[index].epoch == source.epoch)
             })
     }
 
@@ -218,10 +249,9 @@ impl Beats {
         let Some(state) = self.peer(peer) else {
             return;
         };
-        let said = Said {
-            session,
-            shards: shards.into_iter().collect(),
-        };
+        let mut sources: Vec<ShardEpoch> = shards.into_iter().collect();
+        sources.sort_unstable_by_key(|named| named.shard);
+        let said = Said { session, sources };
         let changed = state.said.load().as_deref() != Some(&said);
         if changed {
             state.said.store(Some(Arc::new(said)));
@@ -249,18 +279,23 @@ impl Beats {
         }
     }
 
-    /// The shards a beat names now: those that turned within half the
-    /// timeout.
-    pub fn report(&self, shards: &mut Vec<ShardEpoch>) {
+    /// The sources a beat names now: every part of the shards that turned
+    /// within half the timeout.
+    pub fn report(&self, sources: &mut Vec<ShardEpoch>) {
         let now = (self.0.clock)();
-        shards.clear();
-        shards.extend(self.0.shards.iter().filter_map(|local| {
-            let turned = age(local.turned.load(Ordering::Relaxed), now)?;
-            (turned < self.0.timing.timeout / 2).then(|| ShardEpoch {
-                shard: local.shard,
-                epoch: local.epoch.load(Ordering::Acquire),
-            })
-        }));
+        sources.clear();
+        let live = self.0.shards.iter().filter(|local| {
+            age(local.turned.load(Ordering::Relaxed), now)
+                .is_some_and(|turned| turned < self.0.timing.timeout / 2)
+        });
+        for local in live {
+            for (part, epoch) in (0..Self::PARTS).zip(&local.epochs) {
+                if let Some(shard) = number(local.shard, part) {
+                    let epoch = epoch.load(Ordering::Acquire);
+                    sources.push(ShardEpoch { shard, epoch });
+                }
+            }
+        }
     }
 }
 
@@ -400,7 +435,7 @@ mod tests {
         let source = BeatSource { shard: 1, epoch: 5 };
         assert!(!beats.covers(node(2), session(1), source), "never heard");
         assert_eq!(beats.heard(node(2)), None);
-        beats.observe(node(2), session(1), [named(1, 5), named(2, 9)]);
+        beats.observe(node(2), session(1), [named(2, 9), named(1, 5)]);
         assert!(beats.covers(node(2), session(1), source));
         assert!(!beats.covers(node(3), session(1), source), "another peer");
         assert!(
@@ -456,14 +491,54 @@ mod tests {
         beats.turn(9);
         pass(&time, (TIMING.timeout / 2).checked_sub(NANO).unwrap());
         beats.turn(4);
-        beats.withdraw(4);
-        beats.withdraw(9);
-        assert_eq!(beats.source(4), Some(BeatSource { shard: 4, epoch: 8 }));
-        assert_eq!(beats.source(9), None);
+        beats.withdraw(4, 3);
+        beats.withdraw(9, 3);
+        beats.withdraw(4, Beats::PARTS);
+        let source = |part, epoch| BeatSource {
+            shard: 4 * Beats::PARTS + part,
+            epoch,
+        };
+        assert_eq!(beats.source(4, 3), Some(source(3, 8)));
+        assert_eq!(beats.source(4, 2), Some(source(2, 7)), "another part");
+        assert_eq!(beats.source(4, Beats::PARTS), None);
+        assert_eq!(beats.source(9, 3), None);
         beats.report(&mut shards);
-        assert_eq!(shards, [named(0, 7), named(4, 8)]);
+        let parts = |shard: u32, changed: Option<u32>| {
+            (0..Beats::PARTS).map(move |part| {
+                named(
+                    shard * Beats::PARTS + part,
+                    7 + u64::from(changed == Some(part)),
+                )
+            })
+        };
+        let both: Vec<_> = parts(0, None).chain(parts(4, Some(3))).collect();
+        assert_eq!(shards, both);
         pass(&time, NANO);
         beats.report(&mut shards);
-        assert_eq!(shards, [named(4, 8)], "shard 0 stopped turning");
+        let turning: Vec<_> = parts(4, Some(3)).collect();
+        assert_eq!(shards, turning, "shard 0 stopped turning");
+        beats.withdraw_all(4);
+        beats.report(&mut shards);
+        let withdrawn = parts(4, Some(3)).map(|part| named(part.shard, part.epoch + 1));
+        assert_eq!(shards, withdrawn.collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn group_ids_spread_over_the_parts() {
+        let mut groups = [0_usize; Beats::PARTS as usize];
+        for index in 0..1600_u64 {
+            let mut id = [0xA5; 16];
+            id[..8].copy_from_slice(&index.to_le_bytes());
+            let part = Beats::part(GroupId::from_bytes(id));
+            groups[part as usize] += 1;
+        }
+        // IDs of one repeated byte spread too.
+        let repeated = |byte: u8| Beats::part(GroupId::from_bytes([byte; 16]));
+        let parts: std::collections::BTreeSet<_> = (1..=24).map(repeated).collect();
+        assert!(parts.len() >= 8, "{parts:?}");
+        assert!(
+            groups.iter().all(|&count| (50..=150).contains(&count)),
+            "{groups:?}"
+        );
     }
 }

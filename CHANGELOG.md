@@ -28,6 +28,15 @@
   process on the same device's logs fails at start, not per log.
 - The pool and AIO backends no longer fail an open with `WouldBlock`
   while idle handles hold descriptors: they park those first.
+- `ozzy_io::Operation` has a new `ReadDirectoryPage` variant.
+- `ozzy_io::Local::execute` admits the waiting jobs of a class in the
+  order they came, and a capacity change wakes only the front of that
+  order. A waiting job must be polled when woken, or dropped: left alone,
+  it keeps the jobs behind it asleep.
+- A broker beat names sixteen sources per shard instead of one, so every
+  broker of a cluster must run this release for groups to rest.
+  `Beats::source` and `Beats::withdraw` take the part of the shard, and
+  `ozzy_proto::beat::MAX_SHARDS` is 4096.
 
 ### Added
 
@@ -119,6 +128,25 @@
   protocol steps; `InstallTicket::rejoins` marks such an installation.
 - Each partition takes a fourth proposal lane and five more arenas from its
   journal pool for its log. Arenas allocate only when used.
+- A shard splits the epoch its resting groups stand on into sixteen parts
+  by group ID. A voter that leaves its view withdraws its part only, and
+  only the groups whose agreement broke are visited. A view change of one
+  log used to end the rest of every group on its shard, so creating many
+  logs cost CPU time that grew with the square of their number.
+- Jobs that wait for a full device lane take it in the order they came,
+  and a capacity change wakes only the front of that order instead of
+  every waiting job. A broker that starts on many logs, or many groups
+  that change view at once, no longer spin their shards: three brokers
+  restarting on 512 idle replicated logs took 57 s and 164 s of CPU time,
+  and now take about 42 s and 73 s.
+
+### Fixed
+
+- A broker starts on any number of runtime log records. It listed the
+  `logs` directory in one job sized by the log class, which a class of
+  about 8,000 logs or a directory of many deleted logs pushed past what a
+  device lane admits, and the shard stopped. It now reads the directory a
+  page at a time.
 
 ## [0.11.1] - 2026-11-12
 

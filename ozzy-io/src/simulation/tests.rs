@@ -1,5 +1,6 @@
 // Fault schedules are driven explicitly, with no wall-clock sleeps.
 
+mod lane;
 mod namespace;
 
 use super::*;

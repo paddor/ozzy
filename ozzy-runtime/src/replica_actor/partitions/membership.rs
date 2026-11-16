@@ -63,7 +63,7 @@ impl PartitionActors {
         let actor = self.actors.swap_remove(slot);
         if matches!(actor, PartitionActor::Replicated(_)) {
             // Its peers may still trust the role it had.
-            self.request_withdrawal();
+            self.request_withdrawal(actor.group());
         }
         if let Some(wakeups) = &mut self.wakeups {
             wakeups.swap_remove(slot);
