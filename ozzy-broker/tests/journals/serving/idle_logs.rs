@@ -275,7 +275,36 @@ async fn idle_replicated_logs_report_their_cost() {
         );
     }
     let opened = started.elapsed();
-    all_led(&brokers, count, &nodes).await;
+    loop {
+        let led = (0..count)
+            .filter(|&index| {
+                let id = spec(index, &nodes).id;
+                brokers.iter().any(|broker| {
+                    broker
+                        .runtime_log(id)
+                        .is_some_and(|log| log.status().borrow().role == LogRole::Leader)
+                })
+            })
+            .count();
+        println!(
+            "restart_progress t={:.1} led={led} ticks={}",
+            started.elapsed().as_secs_f64(),
+            ticks() - stopped
+        );
+        if led == count {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+    }
+    let mut after = std::collections::BTreeMap::<_, usize>::new();
+    for index in 0..count {
+        let id = spec(index, &nodes).id;
+        let view = |broker: &Broker| broker.runtime_log(id).unwrap().status().borrow().view;
+        *after
+            .entry(brokers.iter().map(view).max().unwrap())
+            .or_default() += 1;
+    }
+    println!("restart_logs_by_view={after:?}");
     println!(
         "restart: started={opened:?} led={:?} cpu_ticks={}",
         started.elapsed(),
