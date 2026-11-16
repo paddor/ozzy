@@ -80,3 +80,32 @@ fn a_selection_that_replaces_or_resizes_is_not_kept() {
     resized.replacement.segment_capacity *= 2;
     assert!(!journal.keeps_suffix(&resized).unwrap());
 }
+
+#[test]
+fn a_selection_that_ends_at_the_own_log_keeps_an_unconfirmed_tail() {
+    let (mut controller, journal, old) = settled(2);
+    let io = journal.access.io.clone();
+    let segments = journal.manifest.segments.clone();
+    let end = journal.accepted_position().unwrap();
+    let replacement = SuffixReplacement {
+        segment_capacity: journal.manifest.segments[0].capacity,
+        ..request(&journal, position(old[1]))
+    };
+    assert_eq!(replacement.retained, position(old[1]));
+    let request = stream_request(replacement, end);
+    assert!(journal.keeps_suffix(&request).unwrap());
+    let journal = drive(&mut controller, journal.keep_suffix(request)).unwrap();
+    assert_eq!(journal.manifest.segments, segments);
+    assert_eq!(journal.accepted_position().unwrap(), position(old[3]));
+    assert_eq!(journal.committed_position().unwrap(), position(old[1]));
+    let expected = old
+        .iter()
+        .map(|op| (op.op_number, op.body.to_vec()))
+        .collect::<Vec<_>>();
+    assert_eq!(drive(&mut controller, replay(&journal)), expected);
+    drop(journal);
+    let journal = drive(&mut controller, open(io, 12)).unwrap();
+    assert_eq!(journal.manifest.segments, segments);
+    assert_eq!(journal.committed_position().unwrap(), position(old[1]));
+    assert_eq!(drive(&mut controller, replay(&journal)), expected);
+}

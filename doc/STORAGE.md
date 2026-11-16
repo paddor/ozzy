@@ -442,8 +442,8 @@ generation.
 - Replacements are staged, validated, synchronized, and selected atomically.
   The old selection stays authoritative until then. Shutdown aborts unpublished
   work without lowering a durable promise.
-- A request that keeps the copy's whole log, all of it committed, and adds
-  nothing stages no segment when the segment size stays. One manifest
+- A request whose selected log ends at the copy's own durable end, digest
+  included, stages no segment when the segment size stays. One manifest
   publication installs it, and the active segment continues under the new
   writer generation.
 - Quarantine replaces `CONFIGURATION` with the `OZYRECOV` marker, removing

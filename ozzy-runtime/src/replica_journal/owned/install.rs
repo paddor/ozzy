@@ -44,7 +44,7 @@ pub(super) async fn stage_chunks(
 enum Staging {
     /// The selection follows staged segments.
     Segments(Box<SuffixInstaller>),
-    /// The copy keeps its whole log and nothing follows: its segments stay.
+    /// The selection ends at the copy's own end: its segments stay.
     Kept(Box<(GroupJournal, SuffixRequest)>),
 }
 
@@ -152,11 +152,11 @@ impl OwnedJournal {
         }) {
             return Err(JournalError::InstallationMismatch);
         }
-        // A kept log has nothing to stage.
-        let Staging::Segments(staging) = &mut installing.staging else {
-            return Err(JournalError::InstallationMismatch);
-        };
-        stage_chunks(staging, installing.limits, &operations).await?;
+        // A kept log already holds these operations: the selection ends at
+        // its own end, digest included.
+        if let Staging::Segments(staging) = &mut installing.staging {
+            stage_chunks(staging, installing.limits, &operations).await?;
+        }
         for operation in &operations {
             prepared.push(PreparedOperation::from_verified(
                 operation,

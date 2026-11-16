@@ -1,6 +1,7 @@
-//! A selection that replaces nothing: the copy's whole log is retained and
-//! no operation follows it. The segments stay as they are and only the
-//! manifest and the writer generation change.
+//! A selection that replaces nothing: it ends at the copy's own durable end,
+//! digest included, so the copy already holds every selected operation.
+//! The segments stay as they are and only the manifest and the writer
+//! generation change.
 
 use super::{Journal, SuffixRequest};
 use crate::SuffixReplacementError as Error;
@@ -9,16 +10,15 @@ use crate::metadata::position_before;
 use crate::suffix::streaming;
 
 impl Journal {
-    /// Whether `request` keeps this journal's whole log and stages nothing,
-    /// so `keep_suffix` can install it without a new segment. An invalid
-    /// request fails as it would at `begin_suffix_replacement`.
+    /// Whether `request` selects exactly this journal's log, so `keep_suffix`
+    /// can install it without a new segment. The tail after the retained
+    /// prefix is then the one the caller would stage. An invalid request
+    /// fails as it would at `begin_suffix_replacement`.
     pub fn keeps_suffix(&self, request: &SuffixRequest) -> Result<bool, Error> {
         streaming::validate_stream_request(&self.suffix_source(), request)?;
         let replacement = request.replacement;
         let end = position_before(self.writer.durable_position().next_chain())?;
-        Ok(replacement.retained == end
-            && replacement.committed == end
-            && request.accepted == end
+        Ok(request.accepted == end
             && active_segment(&self.manifest.segments)?.capacity == replacement.segment_capacity)
     }
 

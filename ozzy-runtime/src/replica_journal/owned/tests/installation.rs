@@ -187,15 +187,19 @@ fn request(ticket: &InstallTicket) -> FetchOps {
 }
 
 fn stage_local(controller: &mut Controller, voter: &mut Voter) -> InstallTicket {
+    stage_local_with(controller, voter, policy())
+}
+
+fn stage_local_with(
+    controller: &mut Controller,
+    voter: &mut Voter,
+    config: InstallationConfig,
+) -> InstallTicket {
     let ticket = voter
         .driver
         .begin_primary_install(JournalGeneration(101))
         .unwrap();
-    drive(
-        controller,
-        voter.journal.begin_installation(ticket, policy()),
-    )
-    .unwrap();
+    drive(controller, voter.journal.begin_installation(ticket, config)).unwrap();
     let mut fetch = request(&ticket);
     let mut buffer = voter.journal.lease_append_buffer().unwrap();
     while fetch.predecessor != ticket.accepted() {
@@ -729,7 +733,7 @@ fn owned_aborted_kept_installation_leaves_the_old_writer() {
     let (mut controller, io) = setup();
     let (mut primary, ticket) = begin_kept(&mut controller, io);
     let buffer = primary.journal.lease_append_buffer().unwrap();
-    // Nothing follows a kept log, so there is no chunk to stage.
+    // An empty chunk is refused, kept log or not.
     assert!(
         drive(
             &mut controller,
@@ -745,5 +749,30 @@ fn owned_aborted_kept_installation_leaves_the_old_writer() {
     assert_eq!(
         journal.writer().durable_position().generation(),
         primary.source.generation
+    );
+}
+
+#[test]
+fn owned_installation_that_ends_at_the_own_log_keeps_an_unconfirmed_tail() {
+    let (mut controller, io) = setup();
+    let (mut primary, _) = selected_from(&mut controller, io, (3, 1));
+    let config = InstallationConfig {
+        segment_capacity: 32768,
+        ..policy()
+    };
+    // The tail after the retained prefix passes through the driver, and
+    // the journal stages none of it.
+    let ticket = stage_local_with(&mut controller, &mut primary, config);
+    assert_ne!(ticket.retained(), ticket.accepted());
+    finish(&mut controller, &mut primary, &ticket);
+    assert_eq!(segment_ids(&primary), [1]);
+    let journal = primary.journal.journal.ready().unwrap();
+    assert_eq!(
+        journal.accepted_position().unwrap(),
+        crate::replica_journal::authority::position(ticket.accepted())
+    );
+    assert_eq!(
+        journal.committed_position().unwrap(),
+        crate::replica_journal::authority::position(ticket.committed())
     );
 }

@@ -143,6 +143,11 @@
   `CONFIGURATION` file once per journal owner, not at every check. A
   reopened replicated log made nine such checks, each with two disk
   synchronizations.
+- A view change whose selected log ends at the copy's own durable end
+  keeps the copy's segments also when part of that log is not yet
+  confirmed, as the one operation of an idle log is. Three brokers that
+  restarted on idle replicated logs made about 51 disk synchronizations
+  per copy, and now make about 21.
 - A view change that keeps a copy's whole log and adds nothing to it no
   longer copies that log into a new segment. The copy publishes the new
   view in its manifest and continues its active segment under the new
