@@ -287,6 +287,13 @@ async fn idle_replicated_logs_report_their_cost() {
             println!("restart_event {name}={}", after.wrapping_sub(before));
         }
     }
+    // Cleanup of what the view change replaced runs after the election.
+    let settle = setting("OZZY_IDLE_SETTLE", 10) as u64;
+    tokio::time::sleep(Duration::from_secs(settle)).await;
+    println!(
+        "restart_per_copy: disk={} settle_seconds={settle}",
+        (usage(root.path()).disk - before.disk) / copies
+    );
     for broker in brokers {
         broker.shutdown().await.unwrap();
     }

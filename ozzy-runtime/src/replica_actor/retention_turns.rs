@@ -47,6 +47,12 @@ impl RetentionDue {
         }
     }
 
+    /// A view change selected other files: a turn is due now, so cleanup
+    /// frees what it replaced even when retention is unlimited.
+    pub(super) fn observe_selection(&mut self, now: Duration) {
+        self.repeat(now);
+    }
+
     /// When the next turn is due, if any.
     pub(super) fn at(&self) -> Option<Duration> {
         self.schedule

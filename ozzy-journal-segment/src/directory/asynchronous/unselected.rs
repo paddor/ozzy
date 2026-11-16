@@ -47,6 +47,8 @@ struct Reclaim<'a> {
     manifest: &'a Manifest,
     current: CurrentReference,
     bounds: Bounds,
+    /// Unlink every unselected segment; keep none as the spare.
+    discard: bool,
     interrupted: &'a mut bool,
 }
 
@@ -168,8 +170,8 @@ impl Reclaim<'_> {
         };
         // A preallocated spare keeps its length at zero: it has no written
         // blocks, and a retired file replaces it.
-        let mut spare = false;
-        if entries.iter().any(|entry| entry.name == SPARE_SEGMENT) {
+        let mut spare = self.discard;
+        if !spare && entries.iter().any(|entry| entry.name == SPARE_SEGMENT) {
             let path = self.root.join("segments").join(SPARE_SEGMENT);
             spare = regular_file_length(self.access, path)
                 .await?
@@ -436,8 +438,16 @@ impl Journal {
             manifest: &self.manifest,
             current: self.current,
             bounds: Bounds::Exclusive,
+            discard: self.discard,
             interrupted: &mut self.interrupted,
         }
+    }
+
+    /// Whether cleanup, from now on, unlinks every unselected segment
+    /// instead of keeping one as the spare. For a store that wants no spare
+    /// yet. An existing spare stays.
+    pub const fn discard_retired(&mut self, discard: bool) {
+        self.discard = discard;
     }
 
     /// Checks shared by the exclusive passes. Authority validation fences

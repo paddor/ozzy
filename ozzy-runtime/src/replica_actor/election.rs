@@ -378,7 +378,10 @@ impl ReplicaActor {
                 self.activated = None;
             }
             Completed::Activate(ticket) => match self.driver.complete_activation(ticket) {
-                Ok(()) => self.activated = Some((ticket.scope(), ticket.generation())),
+                Ok(()) => {
+                    self.activated = Some((ticket.scope(), ticket.generation()));
+                    self.maintenance.retention.observe_selection(now);
+                }
                 Err(DriverError::StaleValidation) => {}
                 Err(error) => return Err(error.into()),
             },

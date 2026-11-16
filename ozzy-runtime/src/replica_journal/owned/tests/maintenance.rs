@@ -237,6 +237,32 @@ fn owned_cleanup_obeys_removal_bound_and_canceled_mutation_requires_reopen() {
     drive(&mut controller, journal.shutdown()).unwrap();
 }
 
+/// A lazy store below its fill mark wants no spare, so cleanup keeps no
+/// retired segment as one: an idle log holds one segment after a view change.
+#[test]
+fn a_lazy_store_below_its_mark_keeps_no_retired_segment_as_the_spare() {
+    let (mut controller, io) = setup();
+    let mut replica = replica(&mut controller, io.clone(), 0, 16);
+    replica.journal.spare = crate::replica_journal::owned::spare::Spare::new(true);
+    let segments = replica.config.root.join("segments");
+    orphan(&mut controller, &io, segments.join("999.log"));
+    let ticket = replica.driver.begin_validation().unwrap();
+    let result = drive(
+        &mut controller,
+        replica
+            .journal
+            .cleanup_storage(ticket, StorageCleanup::Segments, 4),
+    )
+    .unwrap();
+    assert_eq!(result.removed_objects, 1);
+    assert_eq!(result.reclaimed_bytes, 16);
+    assert!(!controller.image().exists(&segments.join("999.log"), false));
+    // The fixture preallocated a spare; no written file replaced it.
+    let spare = segments.join("spare.log");
+    assert_eq!(controller.image().bytes(&spare, false).unwrap(), b"");
+    drive(&mut controller, replica.journal.shutdown()).unwrap();
+}
+
 #[test]
 fn owned_identity_refresh_frees_bounded_overlay_without_forgetting_old_controls() {
     use ozzy_journal::operation::{CanonicalOperation, OperationKind};

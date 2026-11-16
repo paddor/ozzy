@@ -2,7 +2,7 @@
 //! nothing, so a device without room for another segment refuses new records
 //! instead of faulting. A preparation job allocates the spare beside writes.
 
-use super::{JournalOwner, OwnedJournal};
+use super::{GroupJournal, JournalOwner, OwnedJournal};
 use ozzy_journal_segment::{DirectoryError, SparePreparation};
 
 /// Wait after a device had no room before allocating again, unless cleanup
@@ -109,14 +109,7 @@ impl OwnedJournal {
             JournalOwner::Writing(pipeline) => pipeline.journal(),
             _ => return None,
         };
-        // Below the mark every append still fits the active segment beside
-        // the reserve a missing spare calls for.
-        let header = journal.writer().header();
-        let written = journal.writer().written_position().end_offset();
-        if self.spare.lazy
-            && !self.room.awaiting_spare()
-            && written.saturating_add(self.writeback.queued_bytes() as u64) < header.capacity() / 4
-        {
+        if !self.spare_due(journal) {
             return None;
         }
         let preparation = match journal.prepare_spare() {
@@ -133,6 +126,18 @@ impl OwnedJournal {
             started: now,
             preparation,
         })
+    }
+
+    /// Whether the store holds a spare now: always, or a lazy one once its
+    /// active segment passes the fill mark or a write waits for the spare.
+    /// Below the mark every append still fits the active segment beside the
+    /// reserve a missing spare calls for.
+    pub(super) fn spare_due(&self, journal: &GroupJournal) -> bool {
+        let capacity = journal.writer().header().capacity();
+        let written = journal.writer().written_position().end_offset();
+        !self.spare.lazy
+            || self.room.awaiting_spare()
+            || written.saturating_add(self.writeback.queued_bytes() as u64) >= capacity / 4
     }
 
     /// Install a spare allocation. A full device refuses records until a

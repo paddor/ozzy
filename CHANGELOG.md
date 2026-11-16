@@ -147,6 +147,15 @@
   about 8,000 logs or a directory of many deleted logs pushed past what a
   device lane admits, and the shard stopped. It now reads the directory a
   page at a time.
+- A partition without a retention limit cleans up after a view change.
+  Cleanup ran only in a retention turn that had a plan, so such a
+  partition kept every segment and manifest a view change replaced, for
+  good. It now takes a turn at start and after each view change it
+  activates. Three brokers that restarted on idle replicated logs held
+  about 6.5 MiB per log copy and now hold about 3.7 MiB.
+- An idle runtime log no longer keeps a segment that a view change
+  replaced as its spare. `ozzy_journal_segment::GroupJournal::discard_retired`
+  makes cleanup unlink every unselected segment.
 
 ## [0.11.1] - 2026-11-12
 

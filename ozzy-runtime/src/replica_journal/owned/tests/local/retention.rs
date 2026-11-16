@@ -47,6 +47,36 @@ fn retention_waits_for_partition_creation_before_disabling_an_unlimited_policy()
     drive(&mut controller, journal.shutdown()).unwrap();
 }
 
+/// An unlimited policy plans nothing, yet its turn frees what the selection
+/// no longer names, as after a view change.
+#[test]
+fn an_unlimited_policy_still_cleans_unselected_storage() {
+    let (mut controller, io) = setup();
+    let config = local_config();
+    let stale = config.root.join("segments/999.log");
+    let (mut journal, mut driver) = drive(
+        &mut controller,
+        OwnedJournal::format_local(config, io.clone(), JournalGeneration(1), 32768),
+    )
+    .unwrap();
+    initialize(&mut controller, &mut journal, &mut driver);
+    super::super::maintenance::orphan(&mut controller, &io, stale.clone());
+    let turn = drive(
+        &mut controller,
+        journal.retention_turn(
+            driver.begin_validation().unwrap(),
+            999.into(),
+            OperationId::from_bytes([95; 16]),
+            true,
+        ),
+    )
+    .unwrap();
+    run_retention_jobs(&mut controller, &mut journal);
+    assert!(!controller.image().exists(&stale, false));
+    assert!(!turn.enabled, "a clean pass ends the turns");
+    drive(&mut controller, journal.shutdown()).unwrap();
+}
+
 fn append(
     controller: &mut Controller,
     journal: &mut OwnedJournal,

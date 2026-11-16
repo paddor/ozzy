@@ -117,6 +117,33 @@ fn cleanup_keeps_one_unselected_segment_as_the_spare() {
 }
 
 #[test]
+fn a_store_that_wants_no_spare_unlinks_every_unselected_segment() {
+    let (mut controller, io) = setup(baseline());
+    let mut journal = drive(&mut controller, open(io, 2)).unwrap();
+    journal.discard_retired(true);
+    for (id, bytes) in [(2, &b"two"[..]), (3, b"three")] {
+        let path = format!("/group/segments/{id}.log");
+        drive(&mut controller, put_file(&journal, path.into(), bytes));
+    }
+    let cleanup = drive(&mut controller, journal.reclaim_unreferenced_segments(8)).unwrap();
+    assert_eq!(cleanup.removed_segment_ids, [2, 3]);
+    assert_eq!(cleanup.reclaimed_bytes, 8);
+    assert!(!controller.image().exists(Path::new(SPARE), false));
+    // A captured pass follows the same rule.
+    drive(
+        &mut controller,
+        put_file(&journal, "/group/segments/0.log".into(), b"zero"),
+    );
+    let mut files = journal.capture_unselected().unwrap();
+    drive(&mut controller, files.validate()).unwrap();
+    let cleanup = drive(&mut controller, files.reclaim_segments(8)).unwrap();
+    assert_eq!(cleanup.reclaimed_bytes, 4);
+    assert!(!controller.image().exists(Path::new(SPARE), false));
+    drop(files);
+    drive(&mut controller, journal.close()).unwrap();
+}
+
+#[test]
 fn a_retired_segment_replaces_a_preallocated_spare() {
     let (mut controller, io) = setup(baseline());
     let journal = drive(&mut controller, open(io, 2)).unwrap();

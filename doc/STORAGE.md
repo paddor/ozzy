@@ -582,10 +582,16 @@ Topics set `retention.max_age_secs` and `retention.max_bytes`; see
   and changes no record or retry floor. A background job removes only objects
   older than its captured selection, and only while `CURRENT` names that
   generation or a newer one. A failed cleanup job fences the owner.
+- A pass runs in a retention turn. A partition without a retention limit
+  takes a turn at start and after each view change it activates, and repeats
+  it until a pass leaves nothing.
+- A copy's last election source stays pinned until its next election or
+  retirement, so the segment a view change replaced can outlive cleanup.
 - Cleanup renames one unselected segment file to `segments/spare.log` instead
   of unlinking it, unless a spare with written bytes exists. It replaces a
   preallocated spare, which has none. So a byte-limited partition can use one
-  segment more than `max_bytes` on disk.
+  segment more than `max_bytes` on disk. A runtime log whose active segment
+  is under a quarter full wants no spare and unlinks instead.
 - Opening a store removes recognized `staging/` leftovers.
 
 ### Full partitions
