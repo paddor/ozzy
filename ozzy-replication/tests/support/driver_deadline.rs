@@ -41,3 +41,12 @@ fn a_silent_primary_times_out_a_backup_then_its_election_retries_on_time() {
     }
     assert!(now <= timeout + 3 * timing().retransmit);
 }
+
+#[test]
+fn timeouts_begin_at_the_first_turn_not_when_the_driver_was_built() {
+    let mut backup = driver(normal(1));
+    let first = Duration::from_secs(60);
+    backup.begin_timing(first).unwrap();
+    let timeout = next_timed_action(&mut backup, first);
+    assert_eq!(timeout, first + timing().primary_timeout);
+}

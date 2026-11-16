@@ -241,6 +241,21 @@ impl ReplicaDriver {
         })
     }
 
+    /// Begin every timeout at `now`, the adapter's first turn. The driver is
+    /// built before that turn, and the time until then is evidence of
+    /// nothing: no peer was heard or asked yet.
+    pub fn begin_timing(&mut self, now: Duration) -> Result<(), DriverError> {
+        self.observe_time(now)?;
+        let timing = self.timing;
+        self.contact_deadline = now.saturating_add(timing.primary_timeout);
+        self.backup_heard_at = now;
+        self.persistence_deadline = now.saturating_add(timing.primary_timeout);
+        self.progress_deadline = now.saturating_add(self.progress_timeout());
+        self.election_deadline = now.saturating_add(self.election_delay);
+        self.retry_at = self.retry_at.max(now);
+        Ok(())
+    }
+
     /// Inspect normal evidence. No mutable access can bypass scheduling/fencing.
     pub fn normal(&self) -> Option<&NormalReplica> {
         match &self.role {

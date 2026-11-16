@@ -80,6 +80,7 @@ impl ReplicaActor {
             outbox: ReplicaOutbox::new(configuration, local, config.control, config.data)?,
             bindings: peer_bindings(configuration, local, config, Some(work.receive_epoch()))?,
             startup_probe: startup_probe(config, source, &driver, &mut ids)?,
+            timed: false,
             maintenance: maintenance::Turns::new(config.retention_interval),
             releases: super::release_turns::Releases::default(),
             recovery_required: false,

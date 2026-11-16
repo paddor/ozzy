@@ -162,6 +162,14 @@
 - An idle runtime log no longer keeps a segment that a view change
   replaced as its spare. `ozzy_journal_segment::GroupJournal::discard_retired`
   makes cleanup unlink every unselected segment.
+- A replica's timeouts start at its actor's first turn, through the new
+  `ozzy_replication::driver::ReplicaDriver::begin_timing`. The driver was
+  built at time zero of the shard clock, so on an actor that first ran
+  more than an election timeout later, every timeout had already
+  expired. A new runtime log then changed view once right after its
+  creation, and a restarted follower gave up rejoining its view before
+  it began. Creating 512 idle replicated logs on three brokers made
+  about 59,500 disk synchronizations, and now makes about 30,800.
 
 ## [0.11.1] - 2026-11-12
 

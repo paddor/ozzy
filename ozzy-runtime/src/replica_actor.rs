@@ -96,6 +96,8 @@ pub struct ReplicaActor {
     maintenance: maintenance::Turns,
     releases: release_turns::Releases,
     startup_probe: Option<startup::Probe>,
+    /// Whether the driver's timeouts began, at the first turn.
+    timed: bool,
     recovery_required: bool,
     donors: Option<Box<donors::Donors>>,
     configuration: Configuration,
@@ -201,6 +203,10 @@ impl ReplicaActor {
         // Work marked during this turn stays for the next observation.
         self.more_work = false;
         self.ingress.begin_round();
+        if !std::mem::replace(&mut self.timed, true) {
+            // The shard may reach a new actor long after it was built.
+            self.driver.begin_timing(now)?;
+        }
         if self.startup_round(now)? {
             self.publish_status(true);
             return Ok(());
