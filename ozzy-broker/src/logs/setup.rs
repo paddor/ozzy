@@ -1,5 +1,6 @@
 //! What a broker needs to turn a log spec into a record and a journal.
 
+use super::stops::Stops;
 use super::{CreateError, LogSpec};
 use crate::journals::limits::{Settings, Shape};
 use crate::{ActorSettings, CheckedConfig, JournalConfig, PartitionJournal, StartupError};
@@ -27,7 +28,13 @@ pub(crate) struct LogSetup {
     /// The lock of each device's log directory, taken by the first shard
     /// that starts on the device and held while the broker runs.
     locks: Arc<Mutex<BTreeMap<PathBuf, Arc<OnceCell<ozzy_io::Handle>>>>>,
+    /// The clean stops found on each device, taken off it by the first
+    /// shard that starts there.
+    stops: Arc<Mutex<BTreeMap<PathBuf, Taken>>>,
 }
+
+/// The clean stops of one device, once a shard took them.
+type Taken = Arc<OnceCell<Arc<Stops>>>;
 
 /// The file whose lock keeps other processes off a device's log stores.
 const VOLUME_LOCK: &str = "volume.lock";
@@ -50,6 +57,7 @@ impl LogSetup {
             volumes: local.volumes.clone(),
             principals: principals.clone(),
             locks: Arc::default(),
+            stops: Arc::default(),
         })
     }
 
@@ -70,6 +78,27 @@ impl LogSetup {
             .get_or_try_init(|| super::registry::lock(io, directory.join(VOLUME_LOCK)))
             .await?;
         Ok(io.guarded_by(lock.clone()))
+    }
+
+    /// The clean stops the last run left below `directory`, taken off the
+    /// device once for all its shards. `io` is the guarded lane.
+    pub(crate) async fn stops(
+        &self,
+        io: &ozzy_io::Local,
+        directory: &Path,
+    ) -> Result<Arc<Stops>, StartupError> {
+        let cell = {
+            let mut stops = ozzy_io::lock_unpoisoned(&self.stops);
+            stops.entry(directory.to_path_buf()).or_default().clone()
+        };
+        let taken = cell
+            .get_or_try_init(|| async {
+                super::stops::take(io, directory, self.class.max_logs)
+                    .await
+                    .map(Arc::new)
+            })
+            .await?;
+        Ok(taken.clone())
     }
 
     /// The shard of this broker that owns log `id`.

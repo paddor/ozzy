@@ -78,7 +78,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use omq_tokio::Message;
 use ozzy_proto::{LinkSessionId, NodeId};
-use ozzy_replication::driver::{Action, DriverError, ReplicaDriver, Timing};
+use ozzy_replication::driver::{Action, CleanStop, DriverError, ReplicaDriver, Timing};
 use ozzy_replication::wire::{self, Control, PeerBinding, ReplicaMessage, WireLimits};
 use ozzy_replication::{
     Configuration, JournalGeneration, LogSource, NormalReplica, PipelineLimits, Prefix,
@@ -194,9 +194,18 @@ impl ReplicaActor {
     }
 
     async fn shutdown(&mut self) -> Result<(), ActorError> {
+        self.stop().await.map(drop)
+    }
+
+    /// Shut down, and say whether this was a primary whose whole log was
+    /// durable. Nothing is admitted or sent from here on, so that evidence
+    /// holds once the journal has drained.
+    async fn stop(&mut self) -> Result<Option<CleanStop>, ActorError> {
+        let stop = self.driver.clean_stop();
         self.publish_status(false);
         self.ingress.close();
-        self.journal.shutdown().await.map_err(ActorError::Journal)
+        self.journal.shutdown().await.map_err(ActorError::Journal)?;
+        Ok(stop)
     }
 
     fn advance(&mut self, now: Duration) -> Result<(), ActorError> {

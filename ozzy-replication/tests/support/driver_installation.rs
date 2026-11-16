@@ -279,7 +279,7 @@ fn lost_start_view_retries_then_installed_quorum_releases_fresh_admission() {
 }
 
 #[test]
-fn installed_backup_rejects_changed_same_view_descriptor_without_reinstalling() {
+fn installed_backup_takes_a_resumed_primarys_descriptor_without_reinstalling() {
     let (mut primary, mut backup, now) = selected_pair();
     let ticket = primary
         .begin_primary_install(JournalGeneration(10))
@@ -289,6 +289,11 @@ fn installed_backup_rejects_changed_same_view_descriptor_without_reinstalling() 
         .complete_installation(ticket, Prefix::GENESIS, now)
         .unwrap();
     let start = primary.normal().unwrap().start_view().unwrap().unwrap();
+    // Every backup of an elected view installs the whole selected log.
+    assert_eq!(
+        primary.normal().unwrap().replay_floor().unwrap(),
+        start.accepted
+    );
     let ticket = backup
         .begin_backup_install(node(1), start, JournalGeneration(20), |_, _| None)
         .unwrap();
@@ -313,12 +318,20 @@ fn installed_backup_rejects_changed_same_view_descriptor_without_reinstalling() 
         generation: JournalGeneration(99),
         ..start
     };
-    assert!(
+    // A primary that resumed the view after a clean stop announces its
+    // own log under a new writer incarnation.
+    assert_eq!(
         backup
             .receive(node(1), Control::StartView(conflicting), now)
-            .is_err()
+            .unwrap(),
+        None
     );
-    assert!(backup.normal().unwrap().acknowledgment().is_err());
+    assert_eq!(backup.normal().unwrap().snapshot(), before);
+    assert_eq!(backup.installation_ticket(), None);
+    assert_eq!(
+        backup.normal().unwrap().acknowledgment().unwrap().durable,
+        operation().prefix()
+    );
 }
 
 #[test]

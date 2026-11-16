@@ -5,6 +5,7 @@ use crate::replica_actor::{
     ActorError, ActorStatus, LocalActor, ProposalSubmitter, ScheduledRecovery, ScheduledReplica,
 };
 use ozzy_proto::{GroupId, LinkSessionId, NodeId, PartitionIncarnation, directory::RouteState};
+use ozzy_replication::driver::CleanStop;
 
 /// Explicit partition mode. A failed group can never become a local actor.
 #[derive(Debug)]
@@ -210,6 +211,15 @@ impl PartitionActor {
             Self::Local(actor) => actor.shutdown().await,
             Self::Replicated(actor) => actor.shutdown().await,
             Self::Recovering(actor) => Box::pin(actor.shutdown()).await,
+        }
+    }
+
+    /// Shut down like [`Self::shutdown`], and return a replicated primary's
+    /// evidence of a clean stop.
+    pub async fn stop(self) -> Result<Option<CleanStop>, ActorError> {
+        match self {
+            Self::Replicated(actor) => actor.stop().await,
+            other => other.shutdown().await.map(|()| None),
         }
     }
 }

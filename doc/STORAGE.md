@@ -60,6 +60,12 @@ record of the log: IDs, members, store, class sizes, and state.
 A record is replaced through `<id>.staged`: written, synced, renamed, and
 the directory synced.
 
+`<device-root>/logs/stops/<shard>` holds the clean stops of a shard's
+replicated logs: for each log this broker led with everything durable when
+it stopped, the view and the end of the log. A start takes the files of
+the whole device and removes them before it opens a log. See
+[restart](REPLICATION.md#restart).
+
 ## Volumes and exclusive ownership
 
 - Each device root holds a checksummed `OZZY_VOLUME` marker binding cluster,

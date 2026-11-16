@@ -145,10 +145,12 @@ impl OwnedJournal {
         let mut prepared = std::mem::take(&mut buffer.prepared);
         prepared.clear();
         let operations: Vec<_> = buffer.operations().collect();
-        // Only a rejoining backup restages operations of the view itself.
+        // A rejoining copy restages operations of the view itself, and so
+        // does a backup that installs a resumed primary's log.
         let view = ticket.scope().view;
         if operations.iter().any(|operation| {
-            operation.original_view > view || (operation.original_view == view && !ticket.rejoins())
+            operation.original_view > view
+                || (operation.original_view == view && !ticket.admits_view_tail())
         }) {
             return Err(JournalError::InstallationMismatch);
         }

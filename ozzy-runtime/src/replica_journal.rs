@@ -102,6 +102,9 @@ pub struct JournalStartup {
     /// The store was rebuilt from other copies: it may lack what this
     /// voter acknowledged before, so it must not rejoin its view.
     rebuilt: bool,
+    /// The copy stopped cleanly as the primary of its installed view, with
+    /// exactly the log found now: it may resume that view.
+    resumes: bool,
 }
 
 impl JournalStartup {
@@ -126,7 +129,22 @@ impl JournalStartup {
     #[must_use]
     pub(crate) const fn rebuilt(mut self) -> Self {
         self.rebuilt = true;
+        self.resumes = false;
         self
+    }
+
+    /// Supply the evidence this copy left at its last stop. If it stopped
+    /// cleanly as the primary of its installed view with exactly the log
+    /// recovered now, its driver resumes that view instead of leaving it.
+    /// The caller must have durably removed the evidence first, so that a
+    /// later crash cannot find it again.
+    pub fn clean_stop(&mut self, stop: ozzy_replication::driver::CleanStop) {
+        self.resumes = !self.rebuilt
+            && self.recovered.is_some_and(|recovered| {
+                recovered.scope.view == stop.view
+                    && recovered.log.last_normal_view == stop.view
+                    && recovered.log.accepted == stop.accepted
+            });
     }
 
     /// Stored intact history; `None` means successful explicit fresh format only.
@@ -160,6 +178,8 @@ impl JournalStartup {
                 )?;
                 if self.rebuilt {
                     changing.decline_rejoin();
+                } else if self.resumes {
+                    changing.resume_primary(self.generation, recovered);
                 }
                 ReplicaDriver::from_view_change(changing, now, timing)
             }

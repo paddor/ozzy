@@ -209,7 +209,7 @@ and votes per partition.
 stateDiagram-v2
     direction LR
     [*] --> Election: serve
-    [*] --> Voting: serve, follower rejoins its view
+    [*] --> Voting: serve, copy rejoins its view
     [*] --> Nonvoting: recover
     Election --> Voting: view installed and activated
     Voting --> Election: view change
@@ -221,10 +221,10 @@ stateDiagram-v2
 - `format` creates a group. `serve` never creates missing identity or history.
 - An intact reopen validates configuration, history, promises, and installed
   lineage, and takes a fresh writer incarnation.
-- A restart never resumes old leader authority. A leader may have sent
-  operations it never stored, so it requests the next view. A copy with an
-  uninstalled promise resumes that election. A promise alone grants no
-  authority.
+- A leader may have sent operations it never stored, so a restarted
+  leader without evidence of a clean stop requests the next view. A copy
+  with an uninstalled promise resumes that election. A promise alone grants
+  no authority.
 - A follower of its last installed view rejoins that view. It installs its
   own log there: the committed prefix stays, the tail after it is staged
   again, and both publish atomically. Then it votes as before and catches
@@ -237,6 +237,21 @@ stateDiagram-v2
 - The right to rejoin ends when a peer shows a later view or the attempt
   fails. The copy then requests the next view. A rejoined follower whose
   leader is gone times out like any other.
+- A leader that stops cleanly, with its whole log durable, leaves evidence
+  of it: the view and the end of its log. A shard writes the evidence of
+  its runtime logs once it has stopped, and the next start removes it from
+  the disk before any log opens, so only that one start can use it. A
+  leader that finds its log as the evidence names it rejoins its view the
+  same way and leads it again. It stored everything it sent, so its
+  restart is a pause too.
+- A resumed leader announces its log under its new writer incarnation with
+  START_VIEW, also in view zero. Followers that kept running take it as
+  contact. A copy that never installed the view installs that log, which
+  may hold operations of the view itself. Fresh appends wait until a
+  follower acknowledges the whole log.
+- A view that an election installed starts with its whole log applied on
+  every follower, and a leader replays nothing at or below it. A resumed
+  leader replays from wherever a follower's receipt stands.
 - Each segment roll publishes the applied prefix as the commit. After a
   restart, installation keeps local history through it and fetches only the
   rest, and replays only after the state the reopen rebuilt.

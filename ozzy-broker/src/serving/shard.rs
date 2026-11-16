@@ -145,7 +145,14 @@ pub(super) async fn run(
     drop(state.coordinators);
     drop(state.bootstrap);
     drop(state.outbound);
-    let drained = state.actors.shutdown().await.map_err(failure);
+    let runtime = state.runtime.take();
+    let drained = match (state.actors.stop().await, runtime) {
+        // A primary that stopped with everything durable resumes its view
+        // at the next start.
+        (Ok(stops), Some(runtime)) => runtime.keep_stops(shard.plan.id, stops).await,
+        (Ok(_), None) => Ok(()),
+        (Err(error), _) => Err(failure(error)),
+    };
     result.and(drained)
 }
 

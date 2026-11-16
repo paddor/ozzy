@@ -38,6 +38,9 @@ mod liveness;
 #[path = "support/driver_deadline.rs"]
 mod deadline;
 
+#[path = "support/driver_resume.rs"]
+mod resume;
+
 fn wire_control(from: u8, control: Control) -> Control {
     let session = LinkSessionId::from_bytes([11; 16]);
     let mut metadata = [0; 184];

@@ -26,7 +26,8 @@ impl ViewChange {
     ///
     /// Restart from an installed normal view requests its successor, fencing a
     /// primary that sent prepares before its local write completed. A backup
-    /// of that view may instead rejoin it through `begin_rejoin_install`. An already
+    /// of that view may instead rejoin it through `begin_rejoin_install`, and
+    /// so may a primary with evidence of a clean stop (`resume_primary`). An already
     /// promised but never installed election resumes that same view: it could
     /// not have assigned normal operations there. Repeated restarts cannot
     /// ratchet that unfinished election. Quorum selection and durable selected
@@ -95,5 +96,33 @@ impl ViewChange {
             Promise::Prior(recovered.scope.view)
         };
         Ok(changing)
+    }
+
+    /// Let the restarted primary of the last installed view rejoin it, as a
+    /// backup may. The caller asserts a clean stop: this primary stored
+    /// every operation it ever sent, the exact log `recovered` names, and
+    /// has sent nothing since. Its restart is then a pause too. Without
+    /// that evidence it must leave the view.
+    ///
+    /// Returns whether the right was granted. It is not when the copy is
+    /// not that primary or already promised a later view.
+    pub fn resume_primary(
+        &mut self,
+        generation: JournalGeneration,
+        recovered: RecoveredState,
+    ) -> bool {
+        let installed = recovered.scope.view;
+        if self.promise != Promise::Prior(installed)
+            || recovered.log.last_normal_view != installed
+            || self.configuration.primary(installed) != self.configuration.voter(self.local)
+        {
+            return false;
+        }
+        self.rejoin = Some(PromiseTicket {
+            scope: recovered.scope,
+            generation,
+            log: recovered.log,
+        });
+        true
     }
 }

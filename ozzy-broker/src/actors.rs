@@ -268,6 +268,16 @@ fn replay_cache_limits(
 }
 
 impl OpenedPartition {
+    /// Supply the evidence, if any, that this copy stopped cleanly as the
+    /// primary of its view. The caller removed it from the disk first.
+    #[must_use]
+    pub fn stopped_cleanly(mut self, stop: Option<ozzy_replication::driver::CleanStop>) -> Self {
+        if let (Some(stop), PartitionAuthority::Replicated(startup)) = (stop, &mut self.authority) {
+            startup.clean_stop(stop);
+        }
+        self
+    }
+
     /// Construct on the assigned shard after journal startup. Sessions come
     /// from the broker's established link table, never incoming packet claims.
     /// Absent brokers remain unbound; startup does not wait for their links.

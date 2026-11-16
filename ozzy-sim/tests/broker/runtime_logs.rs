@@ -227,3 +227,88 @@ async fn a_single_broker_keeps_its_runtime_logs_across_a_restart() {
     .await
     .expect("single runtime log made no bounded progress");
 }
+
+/// A replicated log on every broker, led by broker 1, with three records.
+async fn led_log(cluster: &broker::Cluster) -> (LogSpec, u64, u64) {
+    let nodes = [cluster.node(1), cluster.node(2), cluster.node(0)];
+    let stream = spec(1, &nodes);
+    for broker in &cluster.brokers {
+        assert_eq!(broker.create_log(stream.clone()).await, Ok(()));
+    }
+    let (index, view, end) = appends_and_reads(&handles(cluster, stream.id)).await;
+    assert_eq!(index, 1, "the first member leads the first view");
+    (stream, view, end)
+}
+
+/// The status of broker `index`'s copy of `id` once it leads.
+async fn leads(cluster: &broker::Cluster, index: usize, id: GroupId) -> (Log, u64, u64) {
+    cluster.brokers[index].ready().await.unwrap();
+    let log = cluster.brokers[index].runtime_log(id).unwrap();
+    let mut status = log.status();
+    let leading = *status
+        .wait_for(|status| status.role == LogRole::Leader)
+        .await
+        .unwrap();
+    (log, leading.view, leading.committed_end.get())
+}
+
+/// A leader that stops cleanly and comes straight back leads the same view
+/// again: it stored everything it sent. Its followers, which never
+/// stopped, take its new writer incarnation, and either is enough to
+/// commit.
+#[tokio::test(flavor = "current_thread")]
+async fn a_replicated_log_keeps_its_view_across_a_clean_leader_restart() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let mut cluster = cluster(DeploymentMode::Three, 4).await;
+        let (stream, view, end) = led_log(&cluster).await;
+        let image = cluster.stop(1).await;
+        cluster.restore_clean(1, image).await;
+        let (log, resumed, committed) = leads(&cluster, 1, stream.id).await;
+        assert_eq!(resumed, view, "the clean restart moved the view");
+        assert_eq!(committed, end);
+        let appended = append(&log, view, end, &[4]).await.unwrap();
+        assert_eq!(appended.end.get(), end + 1);
+        for follower in [2, 0] {
+            let image = cluster.stop(follower).await;
+            let at = appended.end.get() + u64::from(follower == 0);
+            let last = append(&log, view, at, &[5]).await.unwrap();
+            assert_eq!(last.end.get(), at + 1);
+            cluster.restore_clean(follower, image).await;
+            cluster.brokers[follower].ready().await.unwrap();
+        }
+        assert_eq!(read_all(&log, 0, end + 3).await.len() as u64, end + 3);
+        let leading = *log.status().borrow();
+        assert_eq!((leading.role, leading.view), (LogRole::Leader, view));
+        cluster.shutdown().await;
+    })
+    .await
+    .expect("clean leader restart made no bounded progress");
+}
+
+/// After every broker stopped cleanly and started again, the log has its
+/// leader and its view back without an election, twice in a row.
+#[tokio::test(flavor = "current_thread")]
+async fn a_replicated_log_keeps_its_view_across_a_cluster_restart() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let mut cluster = cluster(DeploymentMode::Three, 4).await;
+        let (stream, view, mut end) = led_log(&cluster).await;
+        for round in 0..2 {
+            let mut images = Vec::new();
+            for index in [2, 1, 0] {
+                images.push(cluster.stop(index).await);
+            }
+            for index in 0..3 {
+                cluster.restore_clean(index, images.pop().unwrap()).await;
+            }
+            let (log, resumed, committed) = leads(&cluster, 1, stream.id).await;
+            assert_eq!(resumed, view, "restart {round} moved the view");
+            assert_eq!(committed, end);
+            assert_eq!(read_all(&log, 0, end).await.len() as u64, end);
+            let appended = append(&log, view, end, &[6 + round]).await.unwrap();
+            end = appended.end.get();
+        }
+        cluster.shutdown().await;
+    })
+    .await
+    .expect("cluster restart made no bounded progress");
+}

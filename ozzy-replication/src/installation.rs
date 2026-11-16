@@ -50,6 +50,7 @@ pub struct InstallTicket {
     retained: Prefix,
     committed: Prefix,
     rejoin: bool,
+    view_tail: bool,
 }
 
 impl InstallTicket {
@@ -87,6 +88,13 @@ impl InstallTicket {
     /// it last installed. Its tail may then hold operations of that view.
     pub const fn rejoins(self) -> bool {
         self.rejoin
+    }
+    /// Whether the installed tail may hold operations of the view itself:
+    /// a rejoining copy's own log, or the log a backup takes from a primary
+    /// that may have resumed the view. A log an election selected never
+    /// does.
+    pub const fn admits_view_tail(self) -> bool {
+        self.view_tail
     }
     /// Effective local committed prefix, never lower than prior local knowledge.
     pub const fn committed(self) -> Prefix {

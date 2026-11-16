@@ -5,6 +5,7 @@ use crate::replica_transport::FlushProgress;
 use crate::replica_transport::SendClass;
 use omq_tokio::{Message, TrySendError};
 use ozzy_proto::{LinkSessionId, NodeId};
+use ozzy_replication::driver::CleanStop;
 use ozzy_replication::wire::PeerBinding;
 use std::time::Duration;
 
@@ -417,6 +418,12 @@ impl ScheduledReplica {
     /// Close intake and drain admitted journal work without adding confirmation.
     pub async fn shutdown(mut self) -> Result<(), ActorError> {
         self.actor.shutdown().await
+    }
+
+    /// Shut down like [`Self::shutdown`], and return the evidence of a clean
+    /// stop when this copy was a primary whose whole log was durable.
+    pub async fn stop(mut self) -> Result<Option<CleanStop>, ActorError> {
+        self.actor.stop().await
     }
 
     fn observe(&mut self, now: Duration) -> Result<(), ScheduleError> {

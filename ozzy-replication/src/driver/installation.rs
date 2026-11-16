@@ -46,7 +46,32 @@ impl ActivationTicket {
     }
 }
 
+/// Evidence that a stopping primary stored every operation it admitted in
+/// its view. Kept across a clean stop, it lets the restarted primary resume
+/// that view instead of leaving it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CleanStop {
+    /// The view this copy leads.
+    pub view: u64,
+    /// Its whole log, durable when it stopped.
+    pub accepted: Prefix,
+}
+
 impl ReplicaDriver {
+    /// Clean-stop evidence of a normal primary whose whole log is durable.
+    /// Valid only if the caller admits and sends nothing afterwards.
+    pub fn clean_stop(&self) -> Option<CleanStop> {
+        let snapshot = self.normal()?.snapshot();
+        (snapshot.status == crate::Status::Normal
+            && crate::VoterIndex::primary(snapshot.scope.view) == self.local
+            && !snapshot.journal.faulted
+            && snapshot.journal.durable == snapshot.accepted.op)
+            .then_some(CleanStop {
+                view: snapshot.scope.view,
+                accepted: snapshot.accepted,
+            })
+    }
+
     /// Send one pending new-view activation commit. A voter set only while an
     /// installed view exists, so a missing view drops the pending set.
     pub(super) fn activation_action(&mut self) -> Result<Option<Action>, DriverError> {

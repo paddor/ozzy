@@ -3,6 +3,7 @@
 use futures::{StreamExt, stream::FuturesUnordered};
 use omq_tokio::{Message, TrySendError};
 use ozzy_proto::{GroupId, PartitionIncarnation, directory::RouteState};
+use ozzy_replication::driver::CleanStop;
 use std::{
     collections::{BTreeMap, VecDeque},
     future::Future,
@@ -318,6 +319,12 @@ impl PartitionActors {
     /// Drain every partition concurrently, including after one partition errors.
     /// No first slow drain can prevent another actor's barriers from progressing.
     pub async fn shutdown(self) -> Result<(), PartitionError> {
+        self.stop().await.map(drop)
+    }
+
+    /// Shut down like [`Self::shutdown`], and return the evidence of each
+    /// replicated primary that stopped cleanly.
+    pub async fn stop(self) -> Result<Vec<(GroupId, CleanStop)>, PartitionError> {
         // Drop protocol observers and unused proposal arenas before draining.
         // Already admitted work stays owned by the partition actors.
         drop(self.native);
@@ -329,18 +336,22 @@ impl PartitionActors {
             drains.push(async move {
                 let group = actor.group();
                 actor
-                    .shutdown()
+                    .stop()
                     .await
+                    .map(|stop| stop.map(|stop| (group, stop)))
                     .map_err(|source| PartitionError::Actor { group, source })
             });
         }
-        let mut failure = None;
+        let (mut stops, mut failure) = (Vec::new(), None);
         while let Some(result) = drains.next().await {
-            if let Err(error) = result {
-                failure.get_or_insert(error);
+            match result {
+                Ok(stop) => stops.extend(stop),
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
             }
         }
-        failure.map_or(Ok(()), Err)
+        failure.map_or(Ok(stops), Err)
     }
 
     fn observe(&mut self, now: Duration) -> Result<(), PartitionError> {

@@ -100,8 +100,8 @@ pub struct NormalReplica {
     acknowledged: Voters<OpNumber>,
     activation_tail: OpNumber,
     installed_view: Option<crate::StartView>,
-    /// This backup rejoined its view after a restart, so `installed_view`
-    /// is its own descriptor, not the primary's.
+    /// This copy rejoined or resumed its view after a restart, so
+    /// `installed_view` describes its own log as the restart found it.
     rejoined: bool,
     journal_tail: Option<Prefix>,
 }

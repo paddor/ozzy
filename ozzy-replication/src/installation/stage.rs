@@ -194,8 +194,12 @@ impl ViewChange {
         } else {
             start.committed
         };
+        let ticket = InstallTicket {
+            view_tail: true,
+            ..self.install_ticket(generation, source, committed, local_commit)?
+        };
         Ok(Admitted {
-            ticket: self.install_ticket(generation, source, committed, local_commit)?,
+            ticket,
             start,
             promise,
             body_bytes: 0,
@@ -238,6 +242,7 @@ impl ViewChange {
             },
             committed,
             rejoin: false,
+            view_tail: false,
         })
     }
 
@@ -272,6 +277,7 @@ impl ViewChange {
         let ticket = InstallTicket {
             scope: promise.scope(),
             rejoin: true,
+            view_tail: true,
             ..self.install_ticket(generation, source, local.committed, local.committed)?
         };
         Ok(Admitted {

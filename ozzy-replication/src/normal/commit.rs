@@ -60,6 +60,19 @@ impl NormalReplica {
         Ok(self.installed_view)
     }
 
+    /// The prefix every backup of this primary's view holds applied, so
+    /// that none is replayed operations at or below it. A view that an
+    /// election installed starts with its whole selected log applied on
+    /// every backup. A primary that resumed its view announces its log as
+    /// it found it: a backup may hold the end of that log unapplied and
+    /// need it again in a new receive epoch.
+    pub fn replay_floor(&self) -> Result<Prefix, ReplicationError> {
+        Ok(self
+            .start_view()?
+            .filter(|_| !self.rejoined)
+            .map_or(Prefix::GENESIS, |start| start.accepted))
+    }
+
     pub(crate) fn activation_prefix(&self) -> Result<Prefix, ReplicationError> {
         self.require_normal()?;
         let snapshot = self.snapshot();
@@ -85,10 +98,9 @@ impl NormalReplica {
         if self.is_primary() {
             return Err(ReplicationError::WrongRole);
         }
-        // A rejoined backup installed its own log, not this descriptor.
-        if !self.rejoined && self.installed_view != Some(start) {
-            return Err(self.conflict());
-        }
+        // A view has one descriptor per incarnation of its primary: one that
+        // resumed the view after a clean stop announces its own log. A
+        // rejoined backup installed its own log, not any descriptor.
         Ok(())
     }
 

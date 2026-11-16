@@ -4,6 +4,7 @@
 
 pub(crate) mod registry;
 mod setup;
+pub(crate) mod stops;
 
 pub use ozzy_config::LogState;
 pub(crate) use setup::LogSetup;

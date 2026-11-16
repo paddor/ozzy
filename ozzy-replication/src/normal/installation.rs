@@ -39,7 +39,7 @@ impl NormalReplica {
             if operation.group_id != ticket.scope().group_id
                 || operation.configuration_epoch != ticket.scope().configuration_epoch
                 || operation.original_view > ticket.scope().view
-                || (operation.original_view == ticket.scope().view && !ticket.rejoins())
+                || (operation.original_view == ticket.scope().view && !ticket.admits_view_tail())
             {
                 return Err(ReplicationError::ScopeMismatch);
             }

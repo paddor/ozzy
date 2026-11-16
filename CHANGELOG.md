@@ -37,6 +37,11 @@
   broker of a cluster must run this release for groups to rest.
   `Beats::source` and `Beats::withdraw` take the part of the shard, and
   `ozzy_proto::beat::MAX_SHARDS` is 4096.
+- START_VIEW is valid in view zero, and a follower takes a START_VIEW of
+  its view under another writer generation as contact instead of a
+  conflict: a leader that resumed its view after a clean stop sends both.
+  A broker of an older release rejects them, so every broker of a cluster
+  must run this release.
 
 ### Added
 
@@ -123,8 +128,8 @@
   about 150 KiB resident memory instead of about 365 KiB.
 - A follower that restarts with its disk intact rejoins the view it last
   installed instead of requesting the next one, so restarting a follower
-  no longer moves leadership. A restarted leader still requests the next
-  view. `ReplicaDriver::begin_rejoin_install` and `rejoin_pending` are the
+  no longer moves leadership. A restarted leader requests the next view
+  unless it stopped cleanly. `ReplicaDriver::begin_rejoin_install` and `rejoin_pending` are the
   protocol steps; `InstallTicket::rejoins` marks such an installation.
 - Each partition takes a fourth proposal lane and five more arenas from its
   journal pool for its log. Arenas allocate only when used.
@@ -147,6 +152,20 @@
   logs. Three brokers restarting on 512 idle replicated logs took 41 to
   58 s with two to five view changes per log, and now take 31 to 42 s
   with one, at less than half the CPU time.
+- A leader of a runtime log that stops cleanly leads the same view again
+  after a restart, without an election. A shard that stops writes which of
+  its logs it led with everything durable to `logs/stops/<shard>` on the
+  device, and the next start takes that evidence off the disk before it
+  opens a log. `ReplicaDriver::clean_stop` and `ViewChange::resume_primary`
+  are the protocol steps; `PartitionActors::stop`,
+  `JournalStartup::clean_stop` and `OpenedPartition::stopped_cleanly`
+  carry the evidence. A resumed leader replays to a follower from where
+  its receipt stands (`NormalReplica::replay_floor`), and a follower may
+  install operations of the view itself from it
+  (`InstallTicket::admits_view_tail`). Three brokers that stop one after
+  the other and restart on 512 idle replicated logs keep the view of
+  every log that still had its leader, and make about 29k disk
+  synchronizations instead of 35.7k.
 - A check of a journal's selected metadata synchronizes the unchanged
   `CONFIGURATION` file once per journal owner, not at every check. A
   reopened replicated log made nine such checks, each with two disk

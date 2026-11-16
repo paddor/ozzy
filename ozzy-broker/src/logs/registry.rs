@@ -19,7 +19,7 @@ fn record_path(directory: &Path, label: &str) -> PathBuf {
     directory.join(format!("{label}.{RECORD}"))
 }
 
-async fn run(
+pub(super) async fn run(
     io: &Local,
     path: &Path,
     operation: Operation,
@@ -29,7 +29,7 @@ async fn run(
         .map_err(|error| io_error(path, error))
 }
 
-async fn open(
+pub(super) async fn open(
     io: &Local,
     path: &Path,
     operation: Operation,
@@ -68,7 +68,7 @@ pub(crate) async fn lock(io: &Local, path: PathBuf) -> Result<ozzy_io::Handle, S
 }
 
 /// Persist the directory entry changes made below `directory`.
-async fn sync_directory(io: &Local, directory: &Path) -> Result<(), StartupError> {
+pub(super) async fn sync_directory(io: &Local, directory: &Path) -> Result<(), StartupError> {
     let path = directory.to_path_buf();
     let handle = open(io, directory, Operation::OpenDirectory { path }).await?;
     let mode = SyncMode::All;
@@ -86,7 +86,7 @@ async fn sync_directory(io: &Local, directory: &Path) -> Result<(), StartupError
 }
 
 /// Remove `path` if it exists.
-async fn remove_file(io: &Local, path: &Path) -> Result<(), StartupError> {
+pub(super) async fn remove_file(io: &Local, path: &Path) -> Result<(), StartupError> {
     let operation = Operation::RemoveFile { path: path.into() };
     match io.execute(Class::Progress, operation).await {
         Ok(_) => Ok(()),
@@ -182,7 +182,7 @@ async fn read(io: &Local, path: &Path) -> Result<LogRecord, StartupError> {
 
 /// The entries of `directory`, owned, with the listing job released. `None`
 /// for a missing directory.
-async fn list(
+pub(super) async fn list(
     io: &Local,
     directory: &Path,
     max_entries: usize,

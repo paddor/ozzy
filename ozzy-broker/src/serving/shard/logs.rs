@@ -2,13 +2,13 @@
 //! handle, their storage jobs, and the logs opened again at start.
 
 use super::{Binding, Bootstrap, State, failure};
-use crate::logs::{Command, CreateError, DeleteError, LogSetup, LogTable, registry};
+use crate::logs::{Command, CreateError, DeleteError, LogSetup, LogTable, registry, stops::Stops};
 use crate::{JournalConfig, OpenedPartition, StartupError};
 use futures::{StreamExt, stream::FuturesUnordered};
 use ozzy_config::{LogRecord, LogState};
 use ozzy_io::Local;
 use ozzy_proto::GroupId;
-use ozzy_replication::JournalGeneration;
+use ozzy_replication::{JournalGeneration, driver::CleanStop};
 use ozzy_runtime::{
     frontend::RuntimeRoutes,
     replica_actor::{ActorIds, LogLane, PartitionActor},
@@ -32,7 +32,7 @@ const OPENS: usize = 8;
 /// A finished storage job, applied to the shard on its own thread.
 enum Done {
     /// The lane for log stores, and the records found at start.
-    Loaded(Result<(Local, Vec<LogRecord>), StartupError>),
+    Loaded(Result<Loaded, StartupError>),
     /// A ready log opened again at start.
     Opened {
         record: LogRecord,
@@ -56,6 +56,9 @@ enum Done {
     },
 }
 
+/// The guarded lane, the records, and the clean stops of the last run.
+type Loaded = (Local, Vec<LogRecord>, Arc<Stops>);
+
 pub(super) struct RuntimeLogs {
     setup: Arc<LogSetup>,
     /// Where this shard's device keeps log records and stores.
@@ -75,6 +78,8 @@ pub(super) struct RuntimeLogs {
     starting: usize,
     /// Logs opened at start that still look for their leader.
     pub(super) settling: super::waves::Settling,
+    /// Logs this broker led when it last stopped cleanly.
+    stops: Arc<Stops>,
 }
 
 impl RuntimeLogs {
@@ -105,6 +110,7 @@ impl RuntimeLogs {
             unopened: Vec::new(),
             starting: 1,
             settling: super::waves::Settling::new(),
+            stops: Arc::default(),
         })
     }
 
@@ -112,18 +118,29 @@ impl RuntimeLogs {
     pub(super) fn settled(&self) -> bool {
         self.starting == 0 && self.unopened.is_empty()
     }
+
+    /// Keep the clean stops of this shard's logs for the next start.
+    pub(super) async fn keep_stops(
+        &self,
+        shard: u32,
+        stops: Vec<(GroupId, CleanStop)>,
+    ) -> Result<(), StartupError> {
+        let known = |(id, _): &(GroupId, CleanStop)| self.records.contains_key(id);
+        let kept: Vec<_> = stops.into_iter().filter(known).collect();
+        if kept.is_empty() {
+            return Ok(());
+        }
+        crate::logs::stops::publish(&self.io, &self.directory, shard, &kept).await
+    }
 }
 
 /// Lock the device's log directory, then read its records.
-async fn load(
-    io: &Local,
-    setup: &LogSetup,
-    directory: &Path,
-) -> Result<(Local, Vec<LogRecord>), StartupError> {
+async fn load(io: &Local, setup: &LogSetup, directory: &Path) -> Result<Loaded, StartupError> {
     crate::format::initialize_directory(io, directory).await?;
     let guarded = setup.guarded(io, directory).await?;
+    let stops = setup.stops(&guarded, directory).await?;
     let records = registry::load(io, directory).await?;
-    Ok((guarded, records))
+    Ok((guarded, records, stops))
 }
 
 fn group(record: &LogRecord) -> GroupId {
@@ -257,6 +274,7 @@ impl State {
             && let Some(record) = runtime.unopened.pop()
         {
             let (io, setup) = (runtime.io.clone(), runtime.setup.clone());
+            let stop = runtime.stops.get(&group(&record)).copied();
             runtime.starting += 1;
             runtime.jobs.push(Box::pin(async move {
                 let generation = JournalGeneration(uuid::Uuid::now_v7().as_u128());
@@ -264,6 +282,8 @@ impl State {
                     Ok(journal) => journal.open(io, generation).await,
                     Err(error) => Err(error),
                 };
+                // The evidence left the disk before this log opened.
+                let opened = opened.map(|opened| opened.stopped_cleanly(stop));
                 Done::Opened { record, opened }
             }));
         }
@@ -439,8 +459,8 @@ impl State {
         match done {
             Done::Loaded(loaded) => {
                 runtime.starting -= 1;
-                let (io, records) = loaded?;
-                runtime.io = io;
+                let (io, records, stops) = loaded?;
+                (runtime.io, runtime.stops) = (io, stops);
                 self.recorded(runtime, records)?;
             }
             Done::Opened { record, opened } => {

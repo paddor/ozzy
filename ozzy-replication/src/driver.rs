@@ -19,7 +19,7 @@ mod step_down;
 mod storage;
 mod validation;
 
-pub use installation::ActivationTicket;
+pub use installation::{ActivationTicket, CleanStop};
 pub use validation::ValidationTicket;
 
 use std::time::Duration;
