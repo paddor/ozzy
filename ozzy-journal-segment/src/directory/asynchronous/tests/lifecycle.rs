@@ -277,3 +277,29 @@ async fn allocated_segments_keep_their_full_size_across_append_roll_and_restart(
         backend.shutdown().await;
     }
 }
+
+#[test]
+fn an_unchanged_configuration_is_synchronized_once_per_owner() {
+    fn syncs<T>(controller: &mut Controller, work: impl Future<Output = T>) -> (T, usize) {
+        let mut count = 0;
+        let result = drive_with(controller, work, |operation| {
+            count += usize::from(matches!(operation, Operation::Sync { .. }));
+            Effect::Normal
+        });
+        (result, count)
+    }
+    let (mut controller, io) = setup(baseline());
+    let (journal, opening) = syncs(&mut controller, open(io.clone(), 2));
+    let mut journal = journal.unwrap();
+    assert!(opening >= 2, "an open synchronizes the configuration");
+    for _ in 0..2 {
+        let (checked, again) = syncs(&mut controller, journal.validate_authority_files());
+        checked.unwrap();
+        assert_eq!(again, 0, "a later check only compares the bytes");
+    }
+    // The next owner cannot know what the last one synchronized.
+    drop(journal);
+    let (journal, reopening) = syncs(&mut controller, open(io, 3));
+    journal.unwrap();
+    assert!(reopening >= 2);
+}

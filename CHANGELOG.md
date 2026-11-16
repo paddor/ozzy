@@ -139,6 +139,10 @@
   that change view at once, no longer spin their shards: three brokers
   restarting on 512 idle replicated logs took 57 s and 164 s of CPU time,
   and now take about 42 s and 73 s.
+- A check of a journal's selected metadata synchronizes the unchanged
+  `CONFIGURATION` file once per journal owner, not at every check. A
+  reopened replicated log made nine such checks, each with two disk
+  synchronizations.
 - A view change that keeps a copy's whole log and adds nothing to it no
   longer copies that log into a new segment. The copy publishes the new
   view in its manifest and continues its active segment under the new

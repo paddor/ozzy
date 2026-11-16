@@ -307,6 +307,7 @@ impl Journal {
         let candidate = self.recover_canonical_candidate(limits).await?;
         let temporary = format!(".CONFIGURATION.recovered.{}.tmp", publication.generation.0);
         self.interrupted = true;
+        self.directory.configuration_replaced();
         self.directory
             .install_immutable(&temporary, configuration)
             .await?;

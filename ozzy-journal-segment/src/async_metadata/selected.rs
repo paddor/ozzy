@@ -95,7 +95,8 @@ impl Directory {
     }
 
     /// The stored configuration, if any. An expected configuration must match
-    /// it exactly and is synchronized before success.
+    /// it exactly and is synchronized before the first success. Until the
+    /// file is replaced, later checks only compare it.
     async fn read_configuration(
         &mut self,
         expected: Option<&[u8]>,
@@ -114,8 +115,11 @@ impl Directory {
             if configuration.as_deref() != Some(expected) {
                 return Err(DirectoryError::ConfigurationMismatch);
             }
-            self.files.sync_file(CONFIGURATION_FILE).await?;
-            self.files.sync_directory().await?;
+            if !self.configuration_durable {
+                self.files.sync_file(CONFIGURATION_FILE).await?;
+                self.files.sync_directory().await?;
+                self.configuration_durable = true;
+            }
         }
         Ok(configuration)
     }
