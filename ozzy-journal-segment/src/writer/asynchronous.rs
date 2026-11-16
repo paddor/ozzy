@@ -179,6 +179,12 @@ impl Writer {
         result.map_err(Into::into)
     }
 
+    /// Hand a settled segment to a new journal owner generation.
+    pub(crate) fn rebind(&mut self, generation: JournalGeneration) -> Result<(), WriterError> {
+        self.healthy()?;
+        self.state.rebind(generation)
+    }
+
     /// Validated physical segment header.
     pub const fn header(&self) -> &SegmentHeader {
         self.state.header()

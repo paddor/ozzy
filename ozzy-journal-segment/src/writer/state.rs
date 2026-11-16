@@ -78,6 +78,19 @@ impl SegmentState {
         self.durable
     }
 
+    /// Hand the segment to a new journal owner. Positions and completions of
+    /// the old generation no longer match it.
+    pub(crate) fn rebind(&mut self, generation: JournalGeneration) -> Result<(), WriterError> {
+        self.require_healthy()?;
+        if self.written != self.durable {
+            return Err(WriterError::InvalidSyncPosition);
+        }
+        self.generation = generation;
+        self.written.generation = generation;
+        self.durable.generation = generation;
+        Ok(())
+    }
+
     pub(crate) fn structural_digest(&self) -> Digest {
         self.segment_digest.finish()
     }

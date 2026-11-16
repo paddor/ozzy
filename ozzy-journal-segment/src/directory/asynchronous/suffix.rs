@@ -15,6 +15,7 @@ use std::io;
 
 mod begin;
 mod checkpoint;
+mod kept;
 pub use checkpoint::CanonicalCheckpointImport;
 
 /// Owns the old selected journal plus bounded, unselected replacement files.

@@ -139,6 +139,12 @@
   that change view at once, no longer spin their shards: three brokers
   restarting on 512 idle replicated logs took 57 s and 164 s of CPU time,
   and now take about 42 s and 73 s.
+- A view change that keeps a copy's whole log and adds nothing to it no
+  longer copies that log into a new segment. The copy publishes the new
+  view in its manifest and continues its active segment under the new
+  writer generation, through `GroupJournal::keeps_suffix` and
+  `keep_suffix`. Three brokers that restarted on idle replicated logs
+  held about 3.7 MiB per log copy and now hold about 2.8 MiB.
 
 ### Fixed
 

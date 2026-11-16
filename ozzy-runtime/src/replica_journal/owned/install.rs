@@ -1,13 +1,15 @@
 //! Selected-history staging and activation on the owning application shard.
 
-use super::{AppendBuffer, JournalError, JournalOwner, OwnedJournal, history, prefix};
+use super::{
+    AppendBuffer, GroupJournal, JournalError, JournalOwner, OwnedJournal, history, prefix,
+};
 use crate::replica_journal::{
     InstallationConfig, InstalledChunk, InstalledJournal,
     authority::{position, successor},
 };
 use ozzy_journal::operation::{CanonicalOperation, canonical_body_digest};
 use ozzy_journal_segment::{
-    SegmentReference, SuffixInstaller, SuffixReplacement, SuffixStreamLimits,
+    SegmentReference, SuffixInstaller, SuffixReplacement, SuffixRequest, SuffixStreamLimits,
 };
 use ozzy_replication::{InstallTicket, PreparedOperation, driver::ActivationTicket};
 
@@ -37,10 +39,19 @@ pub(super) async fn stage_chunks(
     Ok(())
 }
 
+/// How an installation holds the journal until it finishes.
+#[derive(Debug)]
+enum Staging {
+    /// The selection follows staged segments.
+    Segments(Box<SuffixInstaller>),
+    /// The copy keeps its whole log and nothing follows: its segments stay.
+    Kept(Box<(GroupJournal, SuffixRequest)>),
+}
+
 #[derive(Debug)]
 pub(super) struct PendingInstallation {
     pub(super) ticket: InstallTicket,
-    staging: SuffixInstaller,
+    staging: Staging,
     limits: SuffixStreamLimits,
     /// The old selection, to forget summaries of segments it replaces.
     selected: Vec<SegmentReference>,
@@ -89,16 +100,20 @@ impl OwnedJournal {
             segment_capacity: config.segment_capacity,
             body_encoding: config.body_encoding,
         };
+        let request = SuffixRequest {
+            replacement,
+            accepted: position(ticket.accepted()),
+            limits,
+        };
+        let kept = journal.keeps_suffix(&request)?;
         let journal = self.journal.take_ready()?;
-        // A staged segment may take the spare's file.
-        self.spare.changed();
-        let staging = journal
-            .begin_suffix_replacement(ozzy_journal_segment::SuffixRequest {
-                replacement,
-                accepted: position(ticket.accepted()),
-                limits,
-            })
-            .await?;
+        let staging = if kept {
+            Staging::Kept(Box::new((journal, request)))
+        } else {
+            // A staged segment may take the spare's file.
+            self.spare.changed();
+            Staging::Segments(Box::new(journal.begin_suffix_replacement(request).await?))
+        };
         self.journal = JournalOwner::Installing(Box::new(PendingInstallation {
             ticket,
             staging,
@@ -137,7 +152,11 @@ impl OwnedJournal {
         }) {
             return Err(JournalError::InstallationMismatch);
         }
-        stage_chunks(&mut installing.staging, installing.limits, &operations).await?;
+        // A kept log has nothing to stage.
+        let Staging::Segments(staging) = &mut installing.staging else {
+            return Err(JournalError::InstallationMismatch);
+        };
+        stage_chunks(staging, installing.limits, &operations).await?;
         for operation in &operations {
             prepared.push(PreparedOperation::from_verified(
                 operation,
@@ -170,7 +189,11 @@ impl OwnedJournal {
             return Err(JournalError::InstallationMismatch);
         }
         let pending = self.journal.take_installing()?;
-        self.journal = JournalOwner::Ready(Box::new(pending.staging.abort().await?));
+        let journal = match pending.staging {
+            Staging::Segments(staging) => staging.abort().await?,
+            Staging::Kept(kept) => kept.0,
+        };
+        self.journal = JournalOwner::Ready(Box::new(journal));
         self.faulted = false;
         Ok(ticket)
     }
@@ -187,7 +210,10 @@ impl OwnedJournal {
             return Err(JournalError::InstallationMismatch);
         }
         let pending = self.journal.take_installing()?;
-        let mut journal = Box::pin(pending.staging.finish()).await?;
+        let mut journal = match pending.staging {
+            Staging::Segments(staging) => Box::pin(staging.finish()).await?,
+            Staging::Kept(kept) => Box::pin(kept.0.keep_suffix(kept.1)).await?,
+        };
         // Staging may have packed kept segments into new files under their
         // IDs, so cached summaries hold only for unchanged references.
         let segments = &journal.manifest().segments;
