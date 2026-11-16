@@ -2313,6 +2313,7 @@ dependencies = [
 name = "ozzy-config"
 version = "0.11.1"
 dependencies = [
+ "blake3",
  "ozzy-proto",
  "serde",
  "thiserror 2.0.21",

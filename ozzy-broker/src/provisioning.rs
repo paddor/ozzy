@@ -200,6 +200,16 @@ pub fn check_config(
 ) -> Result<CheckedConfig, StartupError> {
     let maximum = identity_byte_limit(&deployment)?;
     let identity = DeploymentIdentity::decode(&read_bounded(identity_path, maximum)?)?;
+    checked(deployment, identity, broker, host)
+}
+
+/// Validate selected placement against an identity already in hand.
+pub(crate) fn checked(
+    deployment: ValidatedDeployment,
+    identity: DeploymentIdentity,
+    broker: &str,
+    host: &HostResources,
+) -> Result<CheckedConfig, StartupError> {
     deployment.check_identity(&identity)?;
     let plan = deployment.broker_plan(broker, host)?;
     crate::check_partition_limits(&deployment, &plan)?;

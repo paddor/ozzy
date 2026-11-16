@@ -19,6 +19,7 @@ use uuid::Uuid;
 const SINGLE: &str = include_str!("fixtures/single.toml");
 
 mod broker_identity;
+mod derived;
 mod network_limits;
 
 fn single() -> Deployment {

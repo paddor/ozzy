@@ -33,6 +33,87 @@ pub fn initialize_volumes(
     Ok(())
 }
 
+/// Bind the device roots of a broker that has never served, creating the
+/// missing ones. A root this identity already marked keeps its marker and
+/// loses the partition stores an interrupted formatting left on it. A root
+/// with another marker is refused.
+pub(crate) fn prepare_volumes(
+    checked: &CheckedConfig,
+    identity: &BrokerIdentity,
+) -> Result<(), StartupError> {
+    for device in checked.local_broker()?.devices.values() {
+        create_durable(&device.root)?;
+    }
+    let broker = checked.local_broker()?;
+    for (root, expected) in roots(checked, identity)? {
+        let marker = root.join(MARKER);
+        match fs::symlink_metadata(&marker) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                provisioning::publish_identity(&marker, &expected.encode()?)?;
+                continue;
+            }
+            Err(error) => return Err(io_error(marker, error)),
+            Ok(_) => {}
+        }
+        let actual = VolumeIdentity::decode(&provisioning::read_bounded(&marker, 4096)?)?;
+        if actual != expected {
+            return Err(io_error(
+                marker,
+                io::Error::new(io::ErrorKind::InvalidData, "volume identity mismatch"),
+            ));
+        }
+        for placement in &checked.plan.partitions {
+            if broker
+                .devices
+                .get(&placement.device)
+                .map(|device| &device.root)
+                != Some(&root)
+            {
+                continue;
+            }
+            match fs::remove_dir_all(&placement.directory) {
+                Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                    return Err(io_error(&placement.directory, error));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Create `directory` and its missing ancestors, each synced into its
+/// parent, so a power cut cannot take back a directory that holds stores.
+pub(crate) fn create_durable(directory: &std::path::Path) -> Result<(), StartupError> {
+    let mut missing = Vec::new();
+    let mut current = directory;
+    while !current.as_os_str().is_empty()
+        && !current.try_exists().map_err(|e| io_error(current, e))?
+    {
+        missing.push(current);
+        match current.parent() {
+            Some(parent) => current = parent,
+            None => break,
+        }
+    }
+    for path in missing.into_iter().rev() {
+        match fs::create_dir(path) {
+            Err(error) if error.kind() != io::ErrorKind::AlreadyExists => {
+                return Err(io_error(path, error));
+            }
+            _ => {}
+        }
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        fs::File::open(parent)
+            .and_then(|parent| parent.sync_all())
+            .map_err(|error| io_error(parent, error))?;
+    }
+    Ok(())
+}
+
 /// Verify every configured volume before opening any partition journals.
 /// This performs no writes and never treats absence as initialization.
 pub fn check_volumes(

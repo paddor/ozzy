@@ -45,6 +45,16 @@
 
 ### Added
 
+- `ozzy_broker::provision` makes an embedded broker ready to serve in one
+  call: it derives the shared identity, creates and binds the device
+  roots, formats the configured topics and publishes the local identity
+  last. An interrupted call is finished by the next one; a broker that
+  has its local identity is only checked.
+- `ValidatedDeployment::derive_identity` computes the shared identity from
+  `cluster.id`, the broker names and the topics, so brokers agree on it
+  without copying a file.
+- `ozzy_config::Topic` implements `Default`, and `Device::new` builds a
+  device with the default workers, for deployments built in code.
 - `Broker::log(topic, partition)` returns a `Log` handle for an embedder
   that is a partition's only writer. `Log::append` adds a batch at the
   offset the writer expects, in the view it leads. A batch at any other

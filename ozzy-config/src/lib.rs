@@ -19,6 +19,7 @@
 )]
 
 mod broker_identity;
+mod derived;
 mod identity;
 mod log_record;
 mod lookup;

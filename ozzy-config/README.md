@@ -18,11 +18,12 @@ confirmation policies. It opens no files and starts no brokers.
 | `Deployment::parse(text)?.validate()?` | Parse and check a deployment |
 | `ValidatedDeployment::broker_plan` | Resolve one broker's placement on its host |
 | `initialize` / `check_identity` | Create or verify the shared `DeploymentIdentity` |
+| `derive_identity` | The shared identity that follows from `cluster.id`, equal on every broker |
 | `initialize_broker_identity` / `check_broker_identity` | Create or verify one broker's `BrokerIdentity` |
 | `encode` / `decode` on both identities | Checksummed TOML identity records |
 
 Generate identities once, keep them with the data, and give every broker the
-same shared identity. `ozzy --config FILE validate --broker NAME` runs the
+same shared identity, or set `cluster.id` and let each broker derive it. `ozzy --config FILE validate --broker NAME` runs the
 checks from the shell.
 
 ## Examples

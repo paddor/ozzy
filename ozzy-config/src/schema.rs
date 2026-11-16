@@ -182,6 +182,23 @@ pub struct TopicDeduplication {
     pub max_bytes: u64,
 }
 
+impl Default for Topic {
+    /// The topic an empty `[topics.<name>]` table configures.
+    fn default() -> Self {
+        Self {
+            id: None,
+            partitions: default_partitions(),
+            partitioner_seed: 0,
+            segment_bytes: default_segment_bytes(),
+            max_append_bytes: default_append_bytes(),
+            retention: TopicRetention::default(),
+            deduplication: None,
+            delay: None,
+            producer_idle_secs: default_producer_idle(),
+        }
+    }
+}
+
 impl Topic {
     /// The fixed maximum delay in milliseconds, when delay is enabled.
     pub fn delay_max_millis(&self) -> Option<std::num::NonZeroU64> {
@@ -400,6 +417,17 @@ pub struct Device {
     #[serde(default)]
     /// Controller-wide execution and retention bounds.
     pub workers: StorageWorkers,
+}
+
+impl Device {
+    /// A device at `root` on `controller` with the default workers.
+    pub fn new(root: impl Into<PathBuf>, controller: impl Into<String>) -> Self {
+        Self {
+            root: root.into(),
+            controller: controller.into(),
+            workers: StorageWorkers::default(),
+        }
+    }
 }
 
 /// Pool sharing is by controller within one broker, not by partition.

@@ -58,6 +58,38 @@ pub struct PartitionIdentity {
     pub members: Vec<Uuid>,
 }
 
+/// What one generated ID of a deployment identity names.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Purpose<'a> {
+    /// The broker of this configured name.
+    Broker(&'a str),
+    /// One half of the named broker's principal binding.
+    Principal(&'a str, u32),
+    /// The topic of this configured name.
+    Topic(&'a str),
+    /// The replication group of a topic's partition.
+    Group(&'a str, u32),
+    /// The record namespace of a topic's partition.
+    Incarnation(&'a str, u32),
+}
+
+fn topic_identity(
+    topic: &crate::Topic,
+    id: Uuid,
+    partitions: Vec<PartitionIdentity>,
+) -> TopicIdentity {
+    TopicIdentity {
+        id,
+        partitioner: "xxh3-64".to_owned(),
+        partitioner_seed: topic.partitioner_seed,
+        dedup_window_millis: topic
+            .deduplication
+            .and_then(|policy| std::num::NonZeroU64::new(policy.window_millis)),
+        delay_max_millis: topic.delay_max_millis(),
+        partitions,
+    }
+}
+
 impl DeploymentIdentity {
     /// Encode a checksummed TOML record. Integrity detects corruption, not hostile edits.
     pub fn encode(&self) -> Result<String, ConfigError> {
@@ -78,51 +110,52 @@ impl ValidatedDeployment {
         &self,
         mut next_id: impl FnMut() -> Uuid,
     ) -> Result<DeploymentIdentity, ConfigError> {
+        let cluster = self.deployment.cluster.id.unwrap_or_else(&mut next_id);
+        self.identify(cluster, &mut |_| next_id())
+    }
+
+    /// The identity of `cluster` with every ID `id` gives for its purpose,
+    /// unless the configuration fixes it.
+    pub(crate) fn identify(
+        &self,
+        cluster: Uuid,
+        id: &mut dyn FnMut(Purpose<'_>) -> Uuid,
+    ) -> Result<DeploymentIdentity, ConfigError> {
         let config = &self.deployment;
-        let cluster = config.cluster.id.unwrap_or_else(&mut next_id);
         let brokers: BTreeMap<_, _> = config
             .brokers
             .iter()
-            .map(|(name, broker)| (name.clone(), broker.id.unwrap_or_else(&mut next_id)))
+            .map(|(name, broker)| {
+                let broker = broker.id.unwrap_or_else(|| id(Purpose::Broker(name)));
+                (name.clone(), broker)
+            })
             .collect();
         let members: Vec<_> = brokers.values().copied().collect();
         let mut topics = BTreeMap::new();
         let mut ordinal = 0;
         for (name, topic) in &config.topics {
-            let id = topic.id.unwrap_or_else(&mut next_id);
+            let topic_id = topic.id.unwrap_or_else(|| id(Purpose::Topic(name)));
             let mut partitions = Vec::with_capacity(topic.partitions as usize);
             for partition in 0..topic.partitions {
                 let mut ordered = members.clone();
                 ordered.rotate_left(ordinal % members.len());
                 partitions.push(PartitionIdentity {
                     partition,
-                    group: next_id(),
+                    group: id(Purpose::Group(name, partition)),
                     config_epoch: 1,
-                    incarnation: next_id(),
+                    incarnation: id(Purpose::Incarnation(name, partition)),
                     members: ordered,
                 });
                 ordinal += 1;
             }
-            topics.insert(
-                name.clone(),
-                TopicIdentity {
-                    id,
-                    partitioner: "xxh3-64".to_owned(),
-                    partitioner_seed: topic.partitioner_seed,
-                    dedup_window_millis: topic
-                        .deduplication
-                        .and_then(|policy| std::num::NonZeroU64::new(policy.window_millis)),
-                    delay_max_millis: topic.delay_max_millis(),
-                    partitions,
-                },
-            );
+            topics.insert(name.clone(), topic_identity(topic, topic_id, partitions));
         }
         let principals = brokers
             .keys()
             .map(|name| {
                 let mut binding = [0; 32];
-                binding[..16].copy_from_slice(next_id().as_bytes());
-                binding[16..].copy_from_slice(next_id().as_bytes());
+                binding[..16].copy_from_slice(id(Purpose::Principal(name, 0)).as_bytes());
+                binding[16..].copy_from_slice(id(Purpose::Principal(name, 1)).as_bytes());
                 (name.clone(), binding)
             })
             .collect();

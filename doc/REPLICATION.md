@@ -219,6 +219,9 @@ stateDiagram-v2
 ```
 
 - `format` creates a group. `serve` never creates missing identity or history.
+- `provision` formats for a broker without a local identity, which it
+  publishes last. A broker of three that lost that identity and its stores
+  looks new: recover it as a nonvoting copy, never provision it again.
 - An intact reopen validates configuration, history, promises, and installed
   lineage, and takes a fresh writer incarnation.
 - A leader may have sent operations it never stored, so a restarted

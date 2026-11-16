@@ -19,6 +19,7 @@ mod live;
 mod perf;
 mod pressure;
 mod progress;
+mod provision;
 mod recovery;
 mod roll;
 mod sessions;
