@@ -34,6 +34,8 @@ struct Peer {
 pub struct Sessions {
     local: NodeId,
     instance: u128,
+    /// What every HELLO and WELCOME names as the origin of local stores.
+    origin: Option<u128>,
     next_nonce: u64,
     parameters: Parameters,
     receive_profiles: HashMap<NodeId, DataLimits>,
@@ -98,6 +100,7 @@ impl Sessions {
         Ok(Self {
             local,
             instance: ids.next()?,
+            origin: None,
             next_nonce: 1,
             parameters,
             receive_profiles: HashMap::new(),
@@ -106,6 +109,12 @@ impl Sessions {
             ids,
             peers: HashMap::new(),
         })
+    }
+
+    /// Name `origin` in every later HELLO and WELCOME. An attempt already
+    /// begun keeps what it said.
+    pub fn set_origin(&mut self, origin: u128) {
+        self.origin = Some(origin);
     }
 
     /// Fixed, independently authorized peer profiles. Overrides change receive
@@ -154,6 +163,7 @@ impl Sessions {
                     superseded_hello: None,
                     instance_id: self.instance,
                     hello_nonce: u128::from(nonce),
+                    origin: self.origin,
                     parameters,
                 },
             ))
@@ -258,6 +268,7 @@ impl Sessions {
                         superseded_hello: superseded,
                         instance_id: self.instance,
                         hello_nonce: h.hello_nonce,
+                        origin: self.origin,
                         parameters: selected,
                     },
                     h.parameters.receive,

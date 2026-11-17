@@ -70,6 +70,9 @@ the whole device and removes them before it opens a log. See
 
 - Each device root holds a checksummed `OZZY_VOLUME` marker binding cluster,
   broker, and volume IDs. Startup checks it before opening any journal.
+- A broker with peers keeps `OZZY_PEERS` on its first device: the store
+  origin of each peer, recorded before the first link to it and never
+  replaced. See [replication](REPLICATION.md).
 - A missing or mismatched marker fails closed. Initialization never creates
   roots or replaces a marker, even a damaged one.
 - `group.lock` cannot fence copies elsewhere; persisted placement selects the

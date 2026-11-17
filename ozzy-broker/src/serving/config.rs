@@ -73,6 +73,8 @@ pub(super) struct Config {
     /// Beats between this broker and its peers, which let idle replicated
     /// groups rest. A single broker has none.
     pub beats: Option<frontend::Beats>,
+    /// The record of the stores behind each broker peer, when one is kept.
+    pub origins: Option<crate::origins::PeerOrigins>,
     /// Broker routes of replicated runtime logs, shared with every shard.
     pub runtime_routes: frontend::RuntimeRoutes,
     /// Every runtime log of this broker and its state.
@@ -140,6 +142,7 @@ impl Config {
     ) -> Result<Self, StartupError> {
         #[cfg(feature = "simulation")]
         let cut = context.cut.clone();
+        let origins = context.origins.clone();
         let super::ServingContext { omq, time, .. } = context;
         crate::frontend::configure_network(&omq, &checked.plan)?;
         let deployment = checked.deployment.deployment();
@@ -161,12 +164,11 @@ impl Config {
         let transport = transport_limits(body, 2 * senders)?;
         let storage = receive_storage(checked, body, transport.message_bytes)?;
         let buffers = ReceiveBuffers::new(envelope, storage).map_err(failure)?;
-        let budgets = shard_budgets(checked);
-        let catalog = catalog(checked)?;
         let clock_timer = time.start();
         Ok(Self {
             clock: clock_trust(&brokers, deployment.cluster.max_clock_offset_millis),
             beats: super::beats::beats(checked, &brokers, time.timestamp(), &clock_timer),
+            origins,
             time,
             omq,
             local,
@@ -183,8 +185,8 @@ impl Config {
                 control: brokers,
                 followers,
             },
-            budgets,
-            catalog,
+            budgets: shard_budgets(checked),
+            catalog: catalog(checked)?,
             maximum_partitions: checked.plan.partitions.len(),
             admin: None,
             receipt_handles: ozzy_runtime::replica_actor::ReceiptHandles::default(),

@@ -4,6 +4,12 @@
 
 ### Breaking
 
+- `ozzy_proto::handshake::Handshake` has a new `origin` field, sent as
+  the optional `store-origin` property, and
+  `ozzy_runtime::frontend::ReceiveError` a new `Origin` variant. A broker
+  with peers names the origin of its stores in HELLO and WELCOME and
+  refuses a broker peer that names none, so every broker of a cluster
+  must run this release.
 - `ozzy_core::state::StateError` has a new `OwnerAppendDisabled` variant,
   and `ozzy_runtime::replica_journal::JournalError` a new `OwnerAppend`
   variant.
@@ -45,6 +51,13 @@
 
 ### Added
 
+- Peers refuse a broker that comes back on new stores. Each broker
+  records the store origin of its peers in `OZZY_PEERS` on its first
+  device, before the first link, and gives no link to a peer under
+  another origin. A broker whose local identity and stores were emptied
+  can therefore not vote or acknowledge with empty logs.
+  `BrokerIdentity::origin`, `ozzy_config::PeerRecord` and
+  `Service::install_origins` carry it.
 - `ozzy_broker::provision` makes an embedded broker ready to serve in one
   call: it derives the shared identity, creates and binds the device
   roots, formats the configured topics and publishes the local identity

@@ -214,3 +214,86 @@ async fn a_deployment_without_a_cluster_id_is_not_provisioned() {
     assert!(provisioned(&deployment, root.path(), 0).await.is_err());
     assert!(!root.path().join("broker-0").exists());
 }
+
+fn role(broker: &Broker) -> LogRole {
+    broker.log(TOPIC, 0).unwrap().status().borrow().role
+}
+
+async fn joined(broker: &Broker) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !matches!(role(broker), LogRole::Leader | LogRole::Follower) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the copy joins a view");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn peers_refuse_a_broker_that_comes_back_on_new_stores() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = WriterRuntime::new().unwrap();
+    let deployment = built(root.path(), DeploymentMode::Three, 7);
+    let start = async |index: usize| {
+        let (checked, local) = provisioned(&deployment, root.path(), index).await.unwrap();
+        let origin = local.origin();
+        let context = runtime.context().clone();
+        let broker = Broker::start_trusted_with_context(checked, local, context)
+            .await
+            .unwrap();
+        (broker, origin)
+    };
+    let mut brokers = Vec::new();
+    for index in 0..3 {
+        brokers.push(start(index).await);
+    }
+    for (broker, _) in &brokers {
+        joined(broker).await;
+    }
+    let record = |index: usize| {
+        let path = root.path().join(format!("broker-{index}/data/OZZY_PEERS"));
+        ozzy_config::PeerRecord::decode(&std::fs::read_to_string(path).unwrap()).unwrap()
+    };
+    let id = |name: &str| deployment.derive_identity().unwrap().brokers[name];
+    for index in 0..2 {
+        assert_eq!(record(index).origins[&id("broker-2")], brokers[2].1);
+    }
+
+    // An intact restart keeps the origin and joins again.
+    let (stopped, first) = brokers.pop().unwrap();
+    stopped.shutdown().await.unwrap();
+    let (restarted, origin) = start(2).await;
+    assert_eq!(origin, first);
+    joined(&restarted).await;
+    restarted.shutdown().await.unwrap();
+
+    // Its directory is emptied: it provisions as if new.
+    std::fs::remove_dir_all(root.path().join("broker-2")).unwrap();
+    let (wiped, origin) = start(2).await;
+    assert_ne!(origin, first);
+    for index in 0..2 {
+        assert_eq!(record(index).origins[&id("broker-2")], first);
+    }
+
+    // With the other intact copy gone, the leader has no follower left:
+    // what the emptied copy would acknowledge counts for nothing.
+    let (follower, _) = brokers.pop().unwrap();
+    follower.shutdown().await.unwrap();
+    let (leader, _) = brokers.pop().unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while role(&leader) == LogRole::Leader {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the leader notices it is alone");
+    for _ in 0..300 {
+        assert_ne!(role(&leader), LogRole::Leader);
+        assert_ne!(role(&wiped), LogRole::Leader);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // The intact copy returns and the two serve again.
+    let (follower, _) = start(1).await;
+    led(&[leader, follower, wiped]).await;
+}

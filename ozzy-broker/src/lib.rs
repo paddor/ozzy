@@ -26,6 +26,7 @@ mod frontend;
 mod host;
 mod journals;
 mod logs;
+mod origins;
 mod placement;
 mod provision;
 mod provisioning;

@@ -26,7 +26,7 @@ pub const OWNER: u32 = 4;
 // Capability 14 is unassigned. Required use must fail, never imply delivery.
 const KNOWN_CAPABILITIES: u16 = 0x1fff;
 const MAX_PROPERTIES: usize = 32;
-const NAMES: [&[u8]; 10] = [
+const NAMES: [&[u8]; 11] = [
     b"versions",
     b"capabilities",
     b"required-capabilities",
@@ -37,6 +37,7 @@ const NAMES: [&[u8]; 10] = [
     b"roles",
     b"max-record-bytes",
     b"superseded-hello",
+    b"store-origin",
 ];
 
 /// One endpoint's advertised receive limits and supported capability set.
@@ -152,6 +153,9 @@ pub struct Handshake {
     pub instance_id: u128,
     /// Fresh nonzero HELLO attempt identity, echoed unchanged by WELCOME.
     pub hello_nonce: u128,
+    /// Nonzero identity of the stores a broker serves, the same in every
+    /// run on them and new once they were made anew. Clients send none.
+    pub origin: Option<u128>,
     /// Sender's receive bounds and capability advertisement/selection.
     pub parameters: Parameters,
 }
@@ -195,10 +199,15 @@ pub fn encode(
         ),
     ];
     let superseded = handshake.superseded_hello.map(u128::to_be_bytes);
-    let properties = properties.into_iter().chain(
-        superseded
-            .as_ref()
-            .map(|nonce| (&b"superseded-hello"[..], &nonce[..])),
+    let origin = handshake.origin.map(u128::to_be_bytes);
+    let optional = [
+        (&b"superseded-hello"[..], superseded.as_ref()),
+        (&b"store-origin"[..], origin.as_ref()),
+    ];
+    let properties = (properties.into_iter()).chain(
+        optional
+            .into_iter()
+            .filter_map(|(name, value)| Some((name, &value?[..]))),
     );
     // Identity, then one length-prefixed name and value per property.
     let size = properties
@@ -253,16 +262,20 @@ pub fn decode(packet: Packet<'_>, limits: EnvelopeLimits) -> Result<Handshake, H
     }
     check_versions(v[0], packet.envelope.opcode)?;
     let parameters = decode_parameters(&v)?;
-    let handshake = Handshake {
-        superseded_hello: values[9]
+    let wide = |value: Option<&[u8]>| {
+        value
             .map(|v| {
                 v.try_into()
                     .map(u128::from_be_bytes)
                     .map_err(|_| HandshakeError::Length)
             })
-            .transpose()?,
+            .transpose()
+    };
+    let handshake = Handshake {
+        superseded_hello: wide(values[9])?,
         instance_id,
         hello_nonce,
+        origin: wide(values[10])?,
         parameters,
     };
     validate_command(packet.envelope, handshake)?;
@@ -340,6 +353,7 @@ fn validate_command(envelope: Envelope, handshake: Handshake) -> Result<(), Hand
         || handshake.instance_id == 0
         || handshake.hello_nonce == 0
         || handshake.superseded_hello == Some(0)
+        || handshake.origin == Some(0)
         || (envelope.opcode == Opcode::Hello && handshake.superseded_hello.is_some())
     {
         return Err(HandshakeError::Command);

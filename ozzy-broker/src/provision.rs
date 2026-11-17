@@ -32,8 +32,10 @@ use crate::{
 /// its own name and paths.
 ///
 /// A broker of three whose local identity and stores were emptied looks like
-/// one that never served. It must not come back through this call: it would
-/// vote with empty logs. Recover it as a nonvoting copy instead.
+/// one that never served, and this call provisions it again. Its peers then
+/// see another store origin than the one they recorded and give it no link,
+/// so it cannot vote with its empty logs. It returns only with its old local
+/// identity, as a nonvoting copy.
 ///
 /// # Errors
 ///

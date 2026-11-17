@@ -220,8 +220,16 @@ stateDiagram-v2
 
 - `format` creates a group. `serve` never creates missing identity or history.
 - `provision` formats for a broker without a local identity, which it
-  publishes last. A broker of three that lost that identity and its stores
-  looks new: recover it as a nonvoting copy, never provision it again.
+  publishes last.
+- A broker names its store origin in HELLO and WELCOME: a hash of its
+  volume IDs, the same in every run on those stores. Each peer records
+  the first origin it sees, durably and before the link, and gives no
+  link to another one. A broker that lost its local identity and stores
+  provisions like a new one, but under a new origin: it cannot vote,
+  acknowledge, or count toward a quorum, and the other two keep serving.
+  It returns only with its old local identity, as a nonvoting copy.
+- The record starts at the first link. A broker emptied before a peer
+  ever linked to it is not told apart by that peer.
 - An intact reopen validates configuration, history, promises, and installed
   lineage, and takes a fresh writer incarnation.
 - A leader may have sent operations it never stored, so a restarted

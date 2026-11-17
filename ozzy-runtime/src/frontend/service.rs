@@ -19,6 +19,7 @@ mod beats;
 mod clock;
 mod directory;
 mod links;
+mod origins;
 pub use beats::{BeatTiming, Beats};
 pub use clock::{ClockNow, ClockSampling, ClockStatus, ClockTrust};
 use links::LinkState;
@@ -87,6 +88,8 @@ pub struct Service {
     clock: Option<ClockSampling>,
     /// Beats to and from broker peers, when resting groups rely on them.
     beats: Option<beats::BeatSchedule>,
+    /// The stores each broker peer must still serve, when that is checked.
+    origins: Option<origins::Origins>,
 }
 
 impl Service {
@@ -161,6 +164,7 @@ impl Service {
             publication_next: 0,
             clock: None,
             beats: None,
+            origins: None,
         })
     }
 
@@ -392,6 +396,9 @@ pub enum ReceiveError {
     /// Fatal failure installing newly negotiated routing state.
     #[error(transparent)]
     Setup(#[from] SetupError),
+    /// A broker named no origin of its stores, or not the one it had.
+    #[error("broker peer does not serve the stores it had")]
+    Origin,
     /// Routing or bounded shard admission refused the packet.
     #[error(transparent)]
     Dispatch(super::Rejection),

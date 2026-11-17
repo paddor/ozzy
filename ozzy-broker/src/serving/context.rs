@@ -16,6 +16,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub struct ServingContext {
     pub(super) omq: Context,
     pub(super) time: Time,
+    /// The record of the stores behind each broker peer, when one is kept.
+    pub(super) origins: Option<crate::origins::PeerOrigins>,
     /// Held-record memory bounds replacing the defaults: sealed rows loaded
     /// and active-segment rows.
     #[cfg(feature = "simulation")]
@@ -30,6 +32,7 @@ impl From<Context> for ServingContext {
         Self {
             omq,
             time: Time::default(),
+            origins: None,
             #[cfg(feature = "simulation")]
             held: None,
             #[cfg(feature = "simulation")]
@@ -53,6 +56,7 @@ impl ServingContext {
                 clock,
                 epoch_millis: Arc::new(AtomicU64::new(epoch_millis)),
             },
+            origins: None,
             held: None,
             cut: CutPeers::default(),
         }

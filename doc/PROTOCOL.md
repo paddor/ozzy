@@ -95,6 +95,7 @@ required.
 | `max-payload-parts` | `u32` |
 | `roles` | `u32` bit set, bits 0..4: producer, consumer, owner, replica, directory |
 | `superseded-hello` | `u128`, WELCOME only |
+| `store-origin` | `u128`, nonzero, optional; a broker names the stores it serves |
 
 - Receive bounds are nonzero and directional; each side advertises its own.
 - Roles are nonzero and advertise behavior, not authorization.

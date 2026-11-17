@@ -139,7 +139,9 @@ impl Broker {
         crate::frontend::configure_network(&omq, &checked.plan)?;
         let (owner, lanes) = DevicePools::start(&checked.plan)?;
         let storage = ShardStorage { lanes, owner };
-        Self::start_on_storage(checked, journals, omq.into(), storage).await
+        let mut context = ServingContext::from(omq);
+        context.origins = crate::origins::PeerOrigins::load(&checked, &local)?;
+        Self::start_on_storage(checked, journals, context, storage).await
     }
 
     /// Serve using an externally owned file backend. The caller must provision
@@ -345,6 +347,9 @@ async fn start_frontend(
         serving_config.handoff(&mut service, handoffs)?;
         frontend.sample_clock(serving_config.install_clock(&mut service));
         serving_config.install_beats(&mut service);
+        if let Some(origins) = &serving_config.origins {
+            origins.install(&mut service);
+        }
         #[cfg(feature = "simulation")]
         frontend.cut_peers(serving_config.cut.clone());
         frontend
