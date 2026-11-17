@@ -195,6 +195,7 @@ fn bounded_handshake_encoding_covers_every_known_capability() {
         instance_id: 2,
         hello_nonce: 3,
         origin: None,
+        replacement: false,
         parameters,
     };
     let envelope = Envelope {

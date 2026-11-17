@@ -11,7 +11,17 @@ use std::path::PathBuf;
 const TOPIC: &str = "meta";
 
 /// One device per broker below `root`, one small topic, no TOML.
-fn built(root: &Path, mode: DeploymentMode, cluster: u128) -> ValidatedDeployment {
+pub(super) fn built(root: &Path, mode: DeploymentMode, cluster: u128) -> ValidatedDeployment {
+    built_with(root, mode, cluster, None)
+}
+
+/// As [`built`], with a class of runtime logs.
+pub(super) fn built_with(
+    root: &Path,
+    mode: DeploymentMode,
+    cluster: u128,
+    logs: Option<ozzy_config::LogClass>,
+) -> ValidatedDeployment {
     let count = if mode == DeploymentMode::Single { 1 } else { 3 };
     let brokers = (0..count)
         .map(|index| {
@@ -49,13 +59,13 @@ fn built(root: &Path, mode: DeploymentMode, cluster: u128) -> ValidatedDeploymen
         limits: ResourceLimits::default(),
         brokers,
         topics: BTreeMap::from([(TOPIC.to_owned(), topic)]),
-        logs: None,
+        logs,
     }
     .validate()
     .unwrap()
 }
 
-fn local_identity(root: &Path, index: usize) -> PathBuf {
+pub(super) fn local_identity(root: &Path, index: usize) -> PathBuf {
     root.join(format!("broker-{index}/local.identity"))
 }
 
@@ -67,7 +77,7 @@ fn store(root: &Path) -> PathBuf {
     root.join(format!("broker-0/data/topics/{TOPIC}/partitions/0"))
 }
 
-async fn provisioned(
+pub(super) async fn provisioned(
     deployment: &ValidatedDeployment,
     root: &Path,
     index: usize,
@@ -219,7 +229,7 @@ fn role(broker: &Broker) -> LogRole {
     broker.log(TOPIC, 0).unwrap().status().borrow().role
 }
 
-async fn joined(broker: &Broker) {
+pub(super) async fn joined(broker: &Broker) {
     tokio::time::timeout(Duration::from_secs(30), async {
         while !matches!(role(broker), LogRole::Leader | LogRole::Follower) {
             tokio::time::sleep(Duration::from_millis(5)).await;

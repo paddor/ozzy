@@ -96,6 +96,7 @@ required.
 | `roles` | `u32` bit set, bits 0..4: producer, consumer, owner, replica, directory |
 | `superseded-hello` | `u128`, WELCOME only |
 | `store-origin` | `u128`, nonzero, optional; a broker names the stores it serves |
+| `store-replacement` | `u8` 1, optional, only with `store-origin`; the origin replaces a lost one |
 
 - Receive bounds are nonzero and directional; each side advertises its own.
 - Roles are nonzero and advertise behavior, not authorization.

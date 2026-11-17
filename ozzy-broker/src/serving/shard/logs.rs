@@ -1,18 +1,16 @@
 //! Runtime logs of one shard: create and delete commands from the broker
 //! handle, their storage jobs, and the logs opened again at start.
 
-use super::{Binding, Bootstrap, State, failure};
+use super::install::{self, Reopened};
+use super::{Binding, State, failure};
+use crate::StartupError;
 use crate::logs::{Command, CreateError, DeleteError, LogSetup, LogTable, registry, stops::Stops};
-use crate::{JournalConfig, OpenedPartition, StartupError};
 use futures::{StreamExt, stream::FuturesUnordered};
 use ozzy_config::{LogRecord, LogState};
 use ozzy_io::Local;
 use ozzy_proto::GroupId;
 use ozzy_replication::{JournalGeneration, driver::CleanStop};
-use ozzy_runtime::{
-    frontend::RuntimeRoutes,
-    replica_actor::{ActorIds, LogLane, PartitionActor},
-};
+use ozzy_runtime::{frontend::RuntimeRoutes, replica_actor::PartitionActor};
 use std::{
     collections::BTreeMap,
     future::Future,
@@ -36,7 +34,7 @@ enum Done {
     /// A ready log opened again at start.
     Opened {
         record: LogRecord,
-        opened: Result<OpenedPartition, StartupError>,
+        opened: Result<Reopened, StartupError>,
     },
     /// What a creation left behind at a crash is gone.
     Discarded {
@@ -45,7 +43,7 @@ enum Done {
     },
     Created {
         record: LogRecord,
-        opened: Result<OpenedPartition, StartupError>,
+        opened: Result<Reopened, StartupError>,
         reply: oneshot::Sender<Result<(), CreateError>>,
     },
     Deleted {
@@ -57,20 +55,20 @@ enum Done {
 }
 
 /// The guarded lane, the records, and the clean stops of the last run.
-type Loaded = (Local, Vec<LogRecord>, Arc<Stops>);
+type Loaded = (Local, Arc<[LogRecord]>, Arc<Stops>);
 
 pub(super) struct RuntimeLogs {
-    setup: Arc<LogSetup>,
+    pub(super) setup: Arc<LogSetup>,
     /// Where this shard's device keeps log records and stores.
     directory: PathBuf,
     /// The lane for log stores. From the load on, the lock of the device's
     /// log directory guards them as a whole.
     io: Local,
     commands: mpsc::Receiver<Command>,
-    table: LogTable,
-    routes: RuntimeRoutes,
+    pub(super) table: LogTable,
+    pub(super) routes: RuntimeRoutes,
     /// Every log of this shard, tombstones included.
-    records: BTreeMap<GroupId, LogRecord>,
+    pub(super) records: BTreeMap<GroupId, LogRecord>,
     jobs: FuturesUnordered<Pin<Box<dyn Future<Output = Done>>>>,
     /// Ready logs found at start that wait for their turn to open.
     unopened: Vec<LogRecord>,
@@ -139,16 +137,16 @@ async fn load(io: &Local, setup: &LogSetup, directory: &Path) -> Result<Loaded, 
     crate::format::initialize_directory(io, directory).await?;
     let guarded = setup.guarded(io, directory).await?;
     let stops = setup.stops(&guarded, directory).await?;
-    let records = registry::load(io, directory).await?;
+    let records = setup.records(io, directory).await?;
     Ok((guarded, records, stops))
 }
 
-fn group(record: &LogRecord) -> GroupId {
+pub(super) fn group(record: &LogRecord) -> GroupId {
     GroupId::from_bytes(*record.log.as_bytes())
 }
 
 /// The store directory of a log, and where it waits for removal.
-fn stores(directory: &Path, record: &LogRecord) -> (PathBuf, PathBuf) {
+pub(super) fn stores(directory: &Path, record: &LogRecord) -> (PathBuf, PathBuf) {
     let label = record.log.simple().to_string();
     (
         directory.join(&label),
@@ -156,20 +154,24 @@ fn stores(directory: &Path, record: &LogRecord) -> (PathBuf, PathBuf) {
     )
 }
 
-/// Record, format, and mark ready. The journal comes back open.
+/// Record, format, and mark ready. The journal comes back open. A broker
+/// that replaces a lost one makes a replicated log's store as a nonvoting
+/// copy instead: it cannot know that it never voted in the log.
 async fn create(
     io: &Local,
     setup: &LogSetup,
     directory: &Path,
     record: &LogRecord,
-) -> Result<OpenedPartition, StartupError> {
+) -> Result<Reopened, StartupError> {
     crate::format::initialize_directory(io, directory).await?;
     registry::publish(io, directory, record).await?;
-    let generation = JournalGeneration(uuid::Uuid::now_v7().as_u128());
-    let opened = setup
-        .journal(record)?
-        .format(io.clone(), generation)
-        .await?;
+    let opened = if setup.replacing() && record.members.len() == 3 {
+        install::replace(io, setup, record).await?
+    } else {
+        let generation = JournalGeneration(uuid::Uuid::now_v7().as_u128());
+        let journal = setup.journal(record)?;
+        Reopened::Serving(Box::new(journal.format(io.clone(), generation).await?))
+    };
     let ready = LogRecord {
         state: LogState::Ready,
         ..record.clone()
@@ -221,13 +223,14 @@ impl State {
     fn recorded(
         &mut self,
         runtime: &mut RuntimeLogs,
-        records: Vec<LogRecord>,
+        records: &[LogRecord],
     ) -> Result<(), StartupError> {
         for record in records {
-            let id = group(&record);
+            let id = group(record);
             if runtime.setup.shard(id)? != self.shard {
                 continue;
             }
+            let record = record.clone();
             runtime.setup.check(&record)?;
             runtime.table.set(id, record.state, None);
             let (io, directory) = (runtime.io.clone(), runtime.directory.clone());
@@ -274,16 +277,18 @@ impl State {
             && let Some(record) = runtime.unopened.pop()
         {
             let (io, setup) = (runtime.io.clone(), runtime.setup.clone());
+            let directory = runtime.directory.clone();
             let stop = runtime.stops.get(&group(&record)).copied();
             runtime.starting += 1;
             runtime.jobs.push(Box::pin(async move {
-                let generation = JournalGeneration(uuid::Uuid::now_v7().as_u128());
-                let opened = match setup.journal(&record) {
-                    Ok(journal) => journal.open(io, generation).await,
-                    Err(error) => Err(error),
-                };
+                let opened = install::reopen(&io, &setup, &directory, &record).await;
                 // The evidence left the disk before this log opened.
-                let opened = opened.map(|opened| opened.stopped_cleanly(stop));
+                let opened = opened.map(|opened| match opened {
+                    Reopened::Serving(opened) => {
+                        Reopened::Serving(Box::new(opened.stopped_cleanly(stop)))
+                    }
+                    recovering @ Reopened::Recovering(_) => recovering,
+                });
                 Done::Opened { record, opened }
             }));
         }
@@ -461,11 +466,11 @@ impl State {
                 runtime.starting -= 1;
                 let (io, records, stops) = loaded?;
                 (runtime.io, runtime.stops) = (io, stops);
-                self.recorded(runtime, records)?;
+                self.recorded(runtime, &records)?;
             }
             Done::Opened { record, opened } => {
                 runtime.starting -= 1;
-                self.install_log(runtime, &record, opened?, Some((binding, now)))?;
+                self.install(runtime, &record, opened?, (binding, now))?;
                 runtime.settling.opened(group(&record), now);
             }
             Done::Discarded { id, discarded } => {
@@ -479,9 +484,8 @@ impl State {
                 opened,
                 reply,
             } => {
-                let installed = opened.and_then(|opened| {
-                    self.install_log(runtime, &record, opened, Some((binding, now)))
-                });
+                let installed = opened
+                    .and_then(|opened| self.install(runtime, &record, opened, (binding, now)));
                 // A failed log stays recorded as creating until a restart
                 // removes it, so its ID is not formatted twice while it runs.
                 let _ =
@@ -507,89 +511,5 @@ impl State {
             }
         }
         Ok(())
-    }
-
-    /// Start the actor of an open log on this shard with its log service
-    /// and bootstrap, and publish its broker route and handle.
-    fn install_log(
-        &mut self,
-        runtime: &mut RuntimeLogs,
-        record: &LogRecord,
-        opened: OpenedPartition,
-        live: Option<(&Binding, Duration)>,
-    ) -> Result<(), StartupError> {
-        let id = group(record);
-        let plan = runtime.setup.journal(record)?;
-        let route = runtime.setup.route(record)?;
-        let body_bytes = match &plan.config {
-            JournalConfig::Local(config) => config.append_limits.max_body_bytes,
-            JournalConfig::Replicated(config) => config.append_limits.max_body_bytes,
-        };
-        let limits = super::super::config::log_limits(body_bytes);
-        let (log, port) = ozzy_runtime::log::log_channel(plan.incarnation, limits)
-            .ok_or_else(|| failure(format!("invalid log limits for log {id}")))?;
-        let mut started = opened.into_actor(
-            &self.data_memory,
-            &BTreeMap::new(),
-            ActorIds::random(self.config.receipt_handles.clone()),
-            self.config.journal_clock(),
-        )?;
-        started
-            .actor
-            .bind_receive_owner(&self.replica_memory)
-            .map_err(failure)?;
-        started.actor.enable_publication();
-        started.prepare_partition()?;
-        // Most logs idle: each keeps only what it uses.
-        started.actor.trim();
-        started.buffer.trim();
-        let lane = LogLane::new(&mut started.actor, limits).map_err(failure)?;
-        self.actors
-            .insert(started.actor)
-            .map_err(|refused| failure(refused.error))?;
-        self.actors
-            .install_log(id, port, Some(lane))
-            .map_err(failure)?;
-        self.indices.insert(id, self.identities.len());
-        self.identities.push((id, plan.incarnation));
-        self.bootstrap.push(Some(Bootstrap {
-            group: id,
-            submitter: started.proposal,
-            buffer: Some(started.buffer),
-            pending: None,
-            done: false,
-        }));
-        if let Some(route) = route {
-            self.recoveries.insert(id, plan);
-            if !runtime.routes.insert(route) {
-                return Err(failure(format!("log {id} already has a route")));
-            }
-            if let Some((binding, now)) = live {
-                self.sync_group(id, binding, now)?;
-            }
-        }
-        runtime.table.set(id, LogState::Ready, Some(log));
-        if let Some(known) = runtime.records.get_mut(&id) {
-            known.state = LogState::Ready;
-        }
-        Ok(())
-    }
-
-    /// Take a log's actor and every index entry out of the shard.
-    fn remove_log(&mut self, id: GroupId) -> Result<PartitionActor, StartupError> {
-        let actor = self.actors.remove(id).map_err(failure)?;
-        if let Some(index) = self.indices.remove(&id) {
-            self.identities.remove(index);
-            self.bootstrap.remove(index);
-            for later in self.indices.values_mut() {
-                if *later > index {
-                    *later -= 1;
-                }
-            }
-        }
-        self.recoveries.remove(&id);
-        self.sessions.retain(|(group, _), _| *group != id);
-        self.unsynced = self.unsynced.min(self.identities.len());
-        Ok(actor)
     }
 }

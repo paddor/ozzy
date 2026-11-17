@@ -12,7 +12,10 @@ use ozzy_runtime::frontend::{Placement, RuntimeRoute};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use tokio::sync::OnceCell;
 use uuid::Uuid;
@@ -31,10 +34,18 @@ pub(crate) struct LogSetup {
     /// The clean stops found on each device, taken off it by the first
     /// shard that starts there.
     stops: Arc<Mutex<BTreeMap<PathBuf, Taken>>>,
+    /// The records found on each device, read by the first shard that
+    /// starts there.
+    records: Arc<Mutex<BTreeMap<PathBuf, Found>>>,
+    /// Whether this broker replaces one that lost its stores.
+    replacing: Arc<AtomicBool>,
 }
 
 /// The clean stops of one device, once a shard took them.
 type Taken = Arc<OnceCell<Arc<Stops>>>;
+
+/// The log records of one device, once a shard read them.
+type Found = Arc<OnceCell<Arc<[LogRecord]>>>;
 
 /// The file whose lock keeps other processes off a device's log stores.
 const VOLUME_LOCK: &str = "volume.lock";
@@ -58,7 +69,22 @@ impl LogSetup {
             principals: principals.clone(),
             locks: Arc::default(),
             stops: Arc::default(),
+            records: Arc::default(),
+            replacing: Arc::default(),
         })
+    }
+
+    /// Whether this broker replaces one that lost its stores. It then
+    /// makes every replicated log as a nonvoting copy.
+    pub(crate) fn replacing(&self) -> bool {
+        // A create that misses the end of the replacement only makes one
+        // more nonvoting copy.
+        self.replacing.load(Ordering::Relaxed)
+    }
+
+    /// The switch behind [`Self::replacing`], shared with the broker.
+    pub(crate) fn replacement(&self) -> Arc<AtomicBool> {
+        self.replacing.clone()
     }
 
     /// The lane of `io` for the log stores below `directory`, which one
@@ -99,6 +125,25 @@ impl LogSetup {
             })
             .await?;
         Ok(taken.clone())
+    }
+
+    /// The log records the last run left below `directory`, read once for
+    /// all its shards, with what interrupted record writes left removed.
+    /// A shard takes commands only after this, so the one reading never
+    /// meets a record or a staged file another shard is writing.
+    pub(crate) async fn records(
+        &self,
+        io: &ozzy_io::Local,
+        directory: &Path,
+    ) -> Result<Arc<[LogRecord]>, StartupError> {
+        let cell = {
+            let mut records = ozzy_io::lock_unpoisoned(&self.records);
+            records.entry(directory.to_path_buf()).or_default().clone()
+        };
+        let found = cell
+            .get_or_try_init(|| async { super::registry::load(io, directory).await.map(Arc::from) })
+            .await?;
+        Ok(found.clone())
     }
 
     /// The shard of this broker that owns log `id`.

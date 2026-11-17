@@ -88,7 +88,7 @@ pub use directory::{
     DirectoryError, GROUP_CONFIGURATION_MAX_BYTES, JournalGroupEncoder, JournalGroupEncoding,
     MaintenanceBudget, OrphanCleanupStep, PreencodedJournalGroup, RecoveryPublication,
     RecoveryPublicationError, RepairRange, RepairSource, ReplayError, ReplayedOperation,
-    SealedRepairLimits, SharedJournalOperation,
+    SealedRepairLimits, SharedJournalOperation, recovery_unfinished,
 };
 pub use history::asynchronous::{
     History as JournalHistory, Metadata as JournalHistoryMetadata, Validation as StorageValidation,

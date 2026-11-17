@@ -47,6 +47,32 @@ pub enum RecoveryPublicationError {
     Io(#[from] io::Error),
 }
 
+/// Whether the store at `root` was left in the middle of a nonvoting
+/// recovery: its `CONFIGURATION` holds the marker in place of the group's
+/// configuration. Reads the file directly, for a start that has not yet
+/// opened a file backend.
+///
+/// # Errors
+///
+/// Fails when the file cannot be read. A missing file is no marker.
+pub fn recovery_unfinished(root: &std::path::Path) -> io::Result<bool> {
+    use io::Read;
+    let mut head = [0; MAGIC.len()];
+    let mut file = match std::fs::File::open(root.join(super::CONFIGURATION_FILE)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let mut read = 0;
+    while read < head.len() {
+        match file.read(&mut head[read..])? {
+            0 => return Ok(false),
+            bytes => read += bytes,
+        }
+    }
+    Ok(&head == MAGIC)
+}
+
 pub(crate) fn recovery_marker(configuration: &[u8]) -> Result<[u8; MARKER_BYTES], DirectoryError> {
     validate_configuration_length(configuration.len())?;
     // Reserve this namespace so a marker cannot itself be the intended config.

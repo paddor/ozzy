@@ -15,8 +15,9 @@ use std::{
 use ozzy_config::{BrokerIdentity, HostResources, ValidatedDeployment};
 
 use crate::{
-    CheckedConfig, StartupError, check_volumes, format_partition_journals,
-    initialize_broker_identity, io_error, load_broker_identity, provisioning, volumes,
+    CheckedConfig, StartupError, check_volumes, format::format_journals,
+    initialize_broker_identity, io_error, load_broker_identity, provisioning,
+    replacement::Replacement, volumes,
 };
 
 /// Check a deployment built in code and make `broker` ready to serve it.
@@ -34,8 +35,8 @@ use crate::{
 /// A broker of three whose local identity and stores were emptied looks like
 /// one that never served, and this call provisions it again. Its peers then
 /// see another store origin than the one they recorded and give it no link,
-/// so it cannot vote with its empty logs. It returns only with its old local
-/// identity, as a nonvoting copy.
+/// so it cannot vote with its empty logs. It returns with its old local
+/// identity, or emptied once more and through [`provision_replacement`].
 ///
 /// # Errors
 ///
@@ -46,6 +47,43 @@ pub async fn provision(
     broker: &str,
     local_identity: &Path,
     host: &HostResources,
+) -> Result<(CheckedConfig, BrokerIdentity), StartupError> {
+    run(deployment, broker, local_identity, host, false).await
+}
+
+/// Make `broker` ready to serve in place of one that lost its local
+/// identity and stores, as [`provision`] does a new one.
+///
+/// The broker it replaces may have voted in any replicated log, so this
+/// one formats none. It starts each as a nonvoting copy, and so every
+/// replicated log it is told to create, and a copy votes once it holds the
+/// log of the other two. Its peers take its new store origin because it
+/// says that it is a replacement. This lasts across restarts until
+/// [`crate::Broker::end_replacement`]. Partitions no other broker holds
+/// are formatted empty: their records are lost.
+///
+/// A call that was interrupted is finished by the next one. Once the
+/// replacement ended, a call only checks, as [`provision`] does.
+///
+/// # Errors
+///
+/// Fails as [`provision`] does, and on a device that already holds the
+/// store of a replicated partition.
+pub async fn provision_replacement(
+    deployment: ValidatedDeployment,
+    broker: &str,
+    local_identity: &Path,
+    host: &HostResources,
+) -> Result<(CheckedConfig, BrokerIdentity), StartupError> {
+    run(deployment, broker, local_identity, host, true).await
+}
+
+async fn run(
+    deployment: ValidatedDeployment,
+    broker: &str,
+    local_identity: &Path,
+    host: &HostResources,
+    replacement: bool,
 ) -> Result<(CheckedConfig, BrokerIdentity), StartupError> {
     let identity = deployment.derive_identity()?;
     let checked = provisioning::checked(deployment, identity, broker, host)?;
@@ -64,7 +102,13 @@ pub async fn provision(
         initialize_broker_identity(&checked, &staged, uuid::Uuid::now_v7)?
     };
     volumes::prepare_volumes(&checked, &local)?;
-    format_partition_journals(&checked, &local).await?;
+    // An interrupted replacement stays one, whoever finishes it.
+    let replacement = replacement || Replacement::load(&checked)?.on();
+    if replacement {
+        // Before any store: a start without it would format voting copies.
+        Replacement::begin(&checked)?;
+    }
+    format_journals(&checked, &local, replacement).await?;
     publish(&staged, local_identity)?;
     Ok((checked, local))
 }

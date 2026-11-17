@@ -26,6 +26,8 @@ const MAX_RECORD_BYTES: u64 = 64 * 1024;
 #[derive(Clone, Debug)]
 pub(crate) struct PeerOrigins {
     local: u128,
+    /// Whether the local origin replaces a lost one.
+    replacement: bool,
     path: PathBuf,
     record: Arc<Mutex<PeerRecord>>,
 }
@@ -66,9 +68,16 @@ impl PeerOrigins {
         };
         Ok(Some(Self {
             local: local.origin().as_u128(),
+            replacement: false,
             path,
             record: Arc::new(Mutex::new(record)),
         }))
+    }
+
+    /// Say beside the local origin that it replaces a lost one.
+    pub(crate) const fn replacing(mut self, replacement: bool) -> Self {
+        self.replacement = replacement;
+        self
     }
 
     /// Name the local origin on `service` and check every broker peer's.
@@ -82,6 +91,9 @@ impl PeerOrigins {
         service.install_origins(self.local, known, move |peer, origin| {
             origins.keep(peer, origin).is_ok()
         });
+        if self.replacement {
+            service.announce_replacement();
+        }
     }
 
     /// Add `peer` to the record on disk. Blocks the caller, once per peer

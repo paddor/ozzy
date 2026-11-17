@@ -18,6 +18,8 @@ mod config;
 pub use config::{Shape, deployment_with_resources};
 mod cluster;
 pub use cluster::Cluster;
+mod lost;
+pub use lost::lose;
 pub mod network;
 
 /// Backend owner joining admitted memory-file work during broker shutdown.

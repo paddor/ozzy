@@ -36,6 +36,8 @@ pub struct Sessions {
     instance: u128,
     /// What every HELLO and WELCOME names as the origin of local stores.
     origin: Option<u128>,
+    /// Whether every HELLO and WELCOME says the origin replaces a lost one.
+    replacement: bool,
     next_nonce: u64,
     parameters: Parameters,
     receive_profiles: HashMap<NodeId, DataLimits>,
@@ -101,6 +103,7 @@ impl Sessions {
             local,
             instance: ids.next()?,
             origin: None,
+            replacement: false,
             next_nonce: 1,
             parameters,
             receive_profiles: HashMap::new(),
@@ -115,6 +118,12 @@ impl Sessions {
     /// begun keeps what it said.
     pub fn set_origin(&mut self, origin: u128) {
         self.origin = Some(origin);
+    }
+
+    /// Say in every later HELLO and WELCOME that the named origin replaces
+    /// one that was lost.
+    pub const fn set_replacement(&mut self) {
+        self.replacement = true;
     }
 
     /// Fixed, independently authorized peer profiles. Overrides change receive
@@ -164,6 +173,7 @@ impl Sessions {
                     instance_id: self.instance,
                     hello_nonce: u128::from(nonce),
                     origin: self.origin,
+                    replacement: self.replacement && self.origin.is_some(),
                     parameters,
                 },
             ))
@@ -269,6 +279,7 @@ impl Sessions {
                         instance_id: self.instance,
                         hello_nonce: h.hello_nonce,
                         origin: self.origin,
+                        replacement: self.replacement && self.origin.is_some(),
                         parameters: selected,
                     },
                     h.parameters.receive,

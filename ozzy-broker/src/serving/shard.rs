@@ -1,4 +1,5 @@
 mod build;
+mod install;
 mod logs;
 mod scheduler;
 mod waves;

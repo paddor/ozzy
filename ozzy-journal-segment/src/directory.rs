@@ -25,6 +25,7 @@ pub use owned_write::{
 };
 pub use recovery::{
     RecoveryPublication, RecoveryPublicationError, RepairRange, RepairSource, SealedRepairLimits,
+    recovery_unfinished,
 };
 pub(crate) use sealed_source::sealed_source;
 pub use validate::GROUP_CONFIGURATION_MAX_BYTES;

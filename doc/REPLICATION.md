@@ -227,7 +227,8 @@ stateDiagram-v2
   link to another one. A broker that lost its local identity and stores
   provisions like a new one, but under a new origin: it cannot vote,
   acknowledge, or count toward a quorum, and the other two keep serving.
-  It returns only with its old local identity, as a nonvoting copy.
+  It returns with its old local identity, or as a
+  [replacement](#replacing-a-broker).
 - The record starts at the first link. A broker emptied before a peer
   ever linked to it is not told apart by that peer.
 - An intact reopen validates configuration, history, promises, and installed
@@ -260,6 +261,10 @@ stateDiagram-v2
   contact. A copy that never installed the view installs that log, which
   may hold operations of the view itself. Fresh appends wait until a
   follower acknowledges the whole log.
+- A resumed leader holds its log on disk only. What a follower that lacks
+  the end of it acknowledges falls inside that log and counts for nothing.
+  With no other follower the view commits nothing, and the two elect the
+  next one.
 - A view that an election installed starts with its whole log applied on
   every follower, and a leader replays nothing at or below it. A resumed
   leader replays from wherever a follower's receipt stands.
@@ -302,6 +307,33 @@ Sealed-file repair:
   keeps original manifest boundaries and full private replay.
 - Active-segment damage, a disagreeing donor, or a stall falls back to full
   transfer with fresh authority.
+
+## Replacing a broker
+
+A broker that lost its local identity and stores may have voted in any
+replicated log, and its new stores do not say in which. `provision_replacement`
+makes it ready in place of `provision`.
+
+- It formats no replicated store. At start, every replicated partition
+  without a store begins as `--replace` does, and one that a stop left in
+  the middle of its recovery resumes.
+- Every replicated runtime log it is told to create begins the same way:
+  a nonvoting copy that takes the log of the other two, then asks for the
+  next view.
+- It says in HELLO and WELCOME that its store origin replaces a lost one.
+  Its peers keep the new origin in place of the old and link it.
+- A marker on its first device keeps all of this up across restarts. The
+  embedder ends it with `Broker::end_replacement` once the broker was told
+  to create every log that existed when it started. Later logs are
+  created as voting copies. Copies still in recovery finish it.
+- Recovery needs both other brokers in normal operation. While one of
+  them is down the replacement votes in nothing, so it cannot help elect
+  a leader that lacks what the lost stores had acknowledged.
+- Partitions no other broker holds are formatted empty.
+
+A replicated runtime log whose own store is gone at start, while its
+record is there, comes back the same way without any of this. A lost
+single log fails the start.
 
 ## Retained history
 

@@ -422,7 +422,11 @@ partition with one writer, reached only through its `Log` handle from
 - At start a shard opens its recorded logs again, eight at a time, finishes
   interrupted deletions, and discards creations that never finished.
   `Broker::ready` waits for them. A recorded log that cannot open stops
-  the shard.
+  the shard, with one exception: a replicated log whose store is gone, or
+  was left in the middle of a recovery, comes back as a nonvoting copy.
+- A broker that [replaces a lost one](REPLICATION.md#replacing-a-broker)
+  creates every replicated log as a nonvoting copy until the embedder
+  calls `Broker::end_replacement`.
 - The `[logs]` class sets the append bound, the number of logs per broker,
   and the segment size of a log whose spec names none. A spec may name its
   own: small segments for many idle logs, large ones for a busy or large

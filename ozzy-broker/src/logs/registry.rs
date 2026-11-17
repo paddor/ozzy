@@ -85,6 +85,24 @@ pub(super) async fn sync_directory(io: &Local, directory: &Path) -> Result<(), S
     synced.map(|_| ())
 }
 
+/// Whether a directory is at `path`.
+pub(crate) async fn holds_directory(io: &Local, path: &Path) -> Result<bool, StartupError> {
+    let operation = Operation::OpenDirectory { path: path.into() };
+    let opened = match io.execute(Class::Progress, operation).await {
+        Ok(opened) => opened,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(io_error(path, error)),
+    };
+    let Outcome::Opened(handle) = &*opened else {
+        return Err(io_error(path, io::ErrorKind::InvalidData.into()));
+    };
+    let handle = handle.clone();
+    // A lane may run as few as two jobs at once.
+    drop(opened);
+    run(io, path, Operation::Close { handle }).await?;
+    Ok(true)
+}
+
 /// Remove `path` if it exists.
 pub(super) async fn remove_file(io: &Local, path: &Path) -> Result<(), StartupError> {
     let operation = Operation::RemoveFile { path: path.into() };

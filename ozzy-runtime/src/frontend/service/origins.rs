@@ -7,6 +7,11 @@
 //! votes nor counts toward a quorum. The first origin a peer names is kept
 //! before its link exists, so a later run of this broker refuses a changed
 //! one too.
+//!
+//! A broker that replaces a lost one says so beside its new origin. It
+//! holds every replicated log as a nonvoting copy until the copy has the
+//! log of the other two, so it gets its link, and its new origin is kept
+//! in place of the lost one.
 
 use super::{Kind, NodeId, ReceiveError, Service};
 use std::collections::BTreeMap;
@@ -51,21 +56,29 @@ impl Service {
         });
     }
 
+    /// Say in every HELLO and WELCOME that the local origin replaces one
+    /// that was lost. Only a broker that holds every replicated log as a
+    /// nonvoting copy until it has the log of the other two may say so.
+    pub const fn announce_replacement(&mut self) {
+        self.sessions.set_replacement();
+    }
+
     /// Refuse the handshake of a broker whose stores are not the ones it
     /// had, or cannot be told to be.
     pub(super) fn check_origin(
         &mut self,
         peer: NodeId,
         kind: Kind,
-        named: Option<u128>,
+        (named, replacement): (Option<u128>, bool),
     ) -> Result<(), ReceiveError> {
         let Some(origins) = self.origins.as_mut().filter(|_| kind == Kind::Broker) else {
             return Ok(());
         };
         let known = origins.known.get(&peer).copied();
         let admitted = match (known, named) {
-            (Some(known), Some(named)) => known == named,
-            (None, Some(named)) => {
+            (Some(known), Some(named)) if known == named => true,
+            (Some(_), Some(_)) if !replacement => false,
+            (_, Some(named)) => {
                 let kept = (origins.keep)(peer, named);
                 if kept {
                     origins.known.insert(peer, named);
@@ -81,8 +94,10 @@ impl Service {
         if origins.refused.insert(peer, named) != Some(named) {
             let reason = match (known, named) {
                 (_, None) => "names no store origin",
-                (Some(_), _) => "serves other stores than before; recover it as a nonvoting copy",
-                (None, _) => "has a store origin that could not be kept",
+                (Some(_), _) if !replacement => {
+                    "serves other stores than before; start it as a replacement"
+                }
+                _ => "has a store origin that could not be kept",
             };
             crate::profiling::log(
                 crate::profiling::Level::Warn,
@@ -185,5 +200,38 @@ mod tests {
         let message = broker(&service, Some(70));
         service.receive(message, 4096).unwrap();
         assert!(service.links.get(peer).is_some());
+    }
+
+    #[test]
+    fn a_replacement_links_under_its_new_origin_which_is_kept() {
+        let (mut service, _lanes, _) = setup();
+        let peer = NodeId::from_bytes(BROKER);
+        let kept = Arc::new(Mutex::new(Vec::new()));
+        let sink = kept.clone();
+        service.install_origins(5, [(peer, 70)], move |peer, origin| {
+            sink.lock().unwrap().push((peer, origin));
+            true
+        });
+        let mut sessions = remote(8, handshake::OWNER | 8);
+        sessions.set_origin(71);
+        sessions.set_replacement();
+        let message = Message::with_prefix(
+            Bytes::copy_from_slice(&BROKER),
+            Message::multipart(sessions.start(service.dispatcher.local).unwrap()),
+        );
+        service.receive(message, 4096).unwrap();
+        assert!(service.links.get(peer).is_some());
+        assert_eq!(*kept.lock().unwrap(), [(peer, 71)]);
+
+        // Later runs on the new stores need not say it again, and the lost
+        // stores do not come back.
+        let message = broker(&service, Some(71));
+        service.receive(message, 4096).unwrap();
+        let message = broker(&service, Some(70));
+        assert!(matches!(
+            service.receive(message, 4096),
+            Err(ReceiveError::Origin)
+        ));
+        assert_eq!(kept.lock().unwrap().len(), 1);
     }
 }
