@@ -117,7 +117,11 @@ impl RecoveryDirectory {
         self.require_selected(configuration).await?;
         let marker = recovery_marker(configuration)?;
         self.directory
-            .replace(CONFIGURATION_FILE, ".CONFIGURATION.quarantine.tmp", &marker)
+            .replace(
+                CONFIGURATION_FILE,
+                ".CONFIGURATION.quarantine.tmp",
+                &marker.to_vec().into(),
+            )
             .await?;
         self.configuration = marker.to_vec();
         Ok(self)
@@ -179,6 +183,7 @@ impl RecoveryDirectory {
             limits: self.limits,
             interrupted: false,
             cleaning: std::rc::Rc::default(),
+            discard: false,
             pins: std::rc::Rc::default(),
             validated_indexes: std::rc::Rc::default(),
             pack_layouts: std::cell::RefCell::default(),
@@ -302,6 +307,7 @@ impl Journal {
         let candidate = self.recover_canonical_candidate(limits).await?;
         let temporary = format!(".CONFIGURATION.recovered.{}.tmp", publication.generation.0);
         self.interrupted = true;
+        self.directory.configuration_replaced();
         self.directory
             .install_immutable(&temporary, configuration)
             .await?;

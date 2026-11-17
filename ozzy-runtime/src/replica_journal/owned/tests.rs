@@ -95,6 +95,7 @@ fn config(root: &str, id: u8) -> OwnedConfig {
             concurrent_reads: 2,
         },
         producer_idle: None,
+        lazy_spare: false,
     }
 }
 

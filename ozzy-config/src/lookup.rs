@@ -22,6 +22,16 @@ impl Deployment {
             .get(name)
             .ok_or_else(|| invalid(name, "unknown topic"))
     }
+
+    /// The largest append body of any topic or runtime log.
+    pub fn max_append_bytes(&self) -> u64 {
+        self.topics
+            .values()
+            .map(|topic| topic.max_append_bytes)
+            .chain(self.logs.map(|logs| logs.max_append_bytes))
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 impl Broker {

@@ -154,6 +154,9 @@ pub struct ViewChange {
     starts: VoterSet,
     reports: Voters<Option<DoViewChange>>,
     pub(crate) selected: Option<SelectedView>,
+    /// An intact restarted backup may still rejoin the view this promise
+    /// names, the last it installed, until it moves toward a later one.
+    pub(crate) rejoin: Option<PromiseTicket>,
 }
 
 /// Highest view whose durable promise this core has observed.
@@ -229,7 +232,18 @@ impl ViewChange {
             starts: VoterSet::EMPTY,
             reports: Voters::splat(None),
             selected: None,
+            rejoin: None,
         })
+    }
+
+    /// Whether this restarted backup may still rejoin its installed view.
+    pub const fn rejoinable(&self) -> bool {
+        self.rejoin.is_some()
+    }
+
+    /// Give up rejoining: the ordinary election of the requested view runs.
+    pub const fn decline_rejoin(&mut self) {
+        self.rejoin = None;
     }
 
     /// Read-only old-role journal/application evidence for storage scheduling.
@@ -261,6 +275,7 @@ impl ViewChange {
             return Err(ViewChangeError::ViewNotHigher);
         }
         self.view = view;
+        self.rejoin = None;
         self.starts = VoterSet::EMPTY;
         self.reports = Voters::splat(None);
         self.selected = None;
@@ -313,6 +328,7 @@ impl ViewChange {
             },
         };
         self.pending = Some(ticket);
+        self.rejoin = None;
         Ok(ticket)
     }
 

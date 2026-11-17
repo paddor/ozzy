@@ -19,8 +19,11 @@
 )]
 
 mod broker_identity;
+mod derived;
 mod identity;
+mod log_record;
 mod lookup;
+mod peer_record;
 mod placement;
 mod record;
 mod schema;
@@ -28,10 +31,12 @@ mod validate;
 
 pub use broker_identity::{BrokerIdentity, PartitionStore, VolumeIdentity};
 pub use identity::{DeploymentIdentity, PartitionIdentity, TopicIdentity};
+pub use log_record::{LogRecord, LogState};
+pub use peer_record::PeerRecord;
 pub use placement::{BrokerPlan, ControllerPlan, HostResources, PartitionPlacement, ShardPlan};
 pub use schema::{
     Affinity, Broker, ByteRateLimit, Cluster, Deployment, DeploymentMode, Device, Endpoints,
-    IoBackend, MAX_APPEND_BYTES, MAX_CLIENTS, MAX_DELAY_ENTRIES, MAX_PARTITION_SEGMENTS,
+    IoBackend, LogClass, MAX_APPEND_BYTES, MAX_CLIENTS, MAX_DELAY_ENTRIES, MAX_PARTITION_SEGMENTS,
     MemoryPool, Omq, PartitionOverride, QueueBudget, ResourceLimits, Shard, StorageWorkers, Topic,
     TopicDeduplication, TopicDelay, TopicRetention, Topology,
 };

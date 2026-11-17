@@ -394,7 +394,14 @@ fn impossible_frozen_histories_are_rejected_before_counting_a_vote() {
         };
         let mut invalid = metadata;
         invalid[24..32].fill(0);
-        assert_eq!(rejected(&invalid), Err(WireError::History));
+        // Only an installed view may be view zero: a primary that resumed
+        // it after a clean stop announces it again.
+        let view_zero = if matches!(message, Control::StartView(_)) {
+            Ok(())
+        } else {
+            Err(WireError::History)
+        };
+        assert_eq!(rejected(&invalid), view_zero);
         if size == 80 {
             continue;
         }

@@ -14,6 +14,7 @@ categories = ["config"]
 include = ["/src/**/*.rs", "/README.md", "/LICENSE", "/examples/*.toml"]
 
 [dependencies]
+blake3.workspace = true
 ozzy-proto.workspace = true
 serde.workspace = true
 thiserror.workspace = true
@@ -35,3 +36,7 @@ path = "tests/dedup.rs"
 [[test]]
 name = "ozzy_delay_config"
 path = "tests/delay.rs"
+
+[[test]]
+name = "ozzy_logs_config"
+path = "tests/logs.rs"

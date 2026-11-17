@@ -15,6 +15,13 @@ pub(super) struct Room {
     awaiting_spare: bool,
 }
 
+impl Room {
+    /// A write waits for the spare before it rolls.
+    pub(super) const fn awaiting_spare(&self) -> bool {
+        self.awaiting_spare
+    }
+}
+
 /// Segments kept free at least for records and for control requests.
 /// Followers group the same operations on their own timing; one can need
 /// its active segment and sealed ones not yet packed beyond its leader's.

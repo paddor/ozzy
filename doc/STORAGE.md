@@ -46,14 +46,41 @@ Metadata temporaries are `.MANIFEST.<generation>.tmp`,
 - Partitions keep independent histories and recovery. A shared device is still
   a shared failure and bandwidth domain.
 
+A runtime log's store has the same layout in `<device-root>/logs/<id>/`,
+named by its log ID in hex. Beside it, `<id>.record` is the broker's
+record of the log: IDs, members, store, class sizes, and state.
+
+| State | Meaning at start |
+| --- | --- |
+| `creating` | The store may be partial. It never served: store and record are removed |
+| `ready` | The store is opened |
+| `deleting` | The store, or `<id>.trash/` after its rename, is removed |
+| `deleted` | Tombstone. The ID is never formatted here again |
+
+A record is replaced through `<id>.staged`: written, synced, renamed, and
+the directory synced.
+
+`<device-root>/logs/stops/<shard>` holds the clean stops of a shard's
+replicated logs: for each log this broker led with everything durable when
+it stopped, the view and the end of the log. A start takes the files of
+the whole device and removes them before it opens a log. See
+[restart](REPLICATION.md#restart).
+
 ## Volumes and exclusive ownership
 
 - Each device root holds a checksummed `OZZY_VOLUME` marker binding cluster,
   broker, and volume IDs. Startup checks it before opening any journal.
+- A broker with peers keeps `OZZY_PEERS` on its first device: the store
+  origin of each peer, recorded before the first link to it and never
+  replaced. See [replication](REPLICATION.md).
 - A missing or mismatched marker fails closed. Initialization never creates
   roots or replaces a marker, even a damaged one.
 - `group.lock` cannot fence copies elsewhere; persisted placement selects the
   writable store. Opening an existing store cannot create even a missing lock.
+- Runtime log stores live in `<device-root>/logs/<log-id>/` and have no
+  `group.lock`. One `<device-root>/logs/volume.lock`, held while the broker
+  runs, guards all log stores of the device, so an idle log holds no
+  descriptor.
 - Metadata is written to a temporary, synchronized, then published. An
   interrupted temporary selects nothing; a retry recreates it. Existing final
   names must match exactly.
@@ -171,6 +198,10 @@ part. General descriptors use:
 - Stored outcomes consume offsets; every attempt consumes a producer sequence.
   An all-duplicate batch has record count zero and no descriptors or payload.
   Ordinary APPEND batches must be nonempty.
+- An owner batch is an APPEND (kind 3) batch with zero producer fields,
+  written by a partition's one embedded writer. It starts at the next offset
+  and keeps no producer state. A partition with delay or deduplication
+  refuses it.
 - `DedupWatermark` (kind 11): partition incarnation, owner epoch `u64`, logical
   milliseconds `u64`.
 - `GroupPlan` (kind 12): format `u8` (1), coordinator and group incarnations,
@@ -351,6 +382,9 @@ With the `aio` backend (the Linux default), segment data writes use a separate
 - A job beside writes allocates the spare at full capacity: at open and
   after each roll, installation, and cleanup. A roll waits for it, so it
   needs no new space.
+- A runtime log allocates its spare only once the active segment is a
+  quarter full, or when a write waits for it. Until then every append fits
+  the active segment beside the reserve a missing spare calls for.
 - `format` writes up to 128 MiB of zeros once where a new store's first
   appends land: the first segment of a local store, or a spare in a
   replicated store, whose first election installs its log into a new segment.
@@ -417,6 +451,10 @@ generation.
 - Replacements are staged, validated, synchronized, and selected atomically.
   The old selection stays authoritative until then. Shutdown aborts unpublished
   work without lowering a durable promise.
+- A request whose selected log ends at the copy's own durable end, digest
+  included, stages no segment when the segment size stays. One manifest
+  publication installs it, and the active segment continues under the new
+  writer generation.
 - Quarantine replaces `CONFIGURATION` with the `OZYRECOV` marker, removing
   voting eligibility. Old files stay for inspection until normal cleanup.
 - A copy that withdraws because it fell behind removes them when full
@@ -557,10 +595,16 @@ Topics set `retention.max_age_secs` and `retention.max_bytes`; see
   and changes no record or retry floor. A background job removes only objects
   older than its captured selection, and only while `CURRENT` names that
   generation or a newer one. A failed cleanup job fences the owner.
+- A pass runs in a retention turn. A partition without a retention limit
+  takes a turn at start and after each view change it activates, and repeats
+  it until a pass leaves nothing.
+- A copy's last election source stays pinned until its next election or
+  retirement, so the segment a view change replaced can outlive cleanup.
 - Cleanup renames one unselected segment file to `segments/spare.log` instead
   of unlinking it, unless a spare with written bytes exists. It replaces a
   preallocated spare, which has none. So a byte-limited partition can use one
-  segment more than `max_bytes` on disk.
+  segment more than `max_bytes` on disk. A runtime log whose active segment
+  is under a quarter full wants no spare and unlinks instead.
 - Opening a store removes recognized `staging/` leftovers.
 
 ### Full partitions

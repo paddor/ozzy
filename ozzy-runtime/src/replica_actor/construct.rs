@@ -12,6 +12,20 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 impl ReplicaActor {
+    /// Give reserved but unused capacity back: queues, ledgers and arena
+    /// descriptors sized for a full pipeline. All of it grows again with
+    /// use, so the first writes allocate. For a replica that expects to
+    /// stay idle, where many of them share a process.
+    pub fn trim(&mut self) {
+        self.driver.trim();
+        self.work.trim();
+        self.ingress.trim();
+        self.pending_persistence.shrink_to_fit();
+        for buffer in [&mut self.buffer, &mut self.spare].into_iter().flatten() {
+            buffer.trim();
+        }
+    }
+
     /// Consume storage-validated startup and reserve actor buffers before serving.
     /// The journal must have two available append-buffer leases at these bounds:
     /// one for journal/transfer work and one for contiguous backup receive staging.
@@ -66,6 +80,7 @@ impl ReplicaActor {
             outbox: ReplicaOutbox::new(configuration, local, config.control, config.data)?,
             bindings: peer_bindings(configuration, local, config, Some(work.receive_epoch()))?,
             startup_probe: startup_probe(config, source, &driver, &mut ids)?,
+            timed: false,
             maintenance: maintenance::Turns::new(config.retention_interval),
             releases: super::release_turns::Releases::default(),
             recovery_required: false,
@@ -74,17 +89,14 @@ impl ReplicaActor {
             configuration,
             local,
             config: *config,
-            status: Rc::new(Cell::new(ActorStatus {
-                normal: driver.normal().map(NormalReplica::snapshot),
-                ..ActorStatus::initial(driver.scope())
-            })),
+            status: initial_status(&driver),
             wanted_pin: Some((driver.scope(), source)),
             driver,
             ids,
             journal,
             wire_limits,
             metadata: vec![0; wire_limits.envelope.max_metadata_bytes],
-            payload: vec![0; config.transfer.max_body_bytes],
+            payload: Vec::new(),
             history_allocator: buffer.allocator(),
             buffer: Some(buffer),
             history_receive_allocator: None,
@@ -108,6 +120,7 @@ impl ReplicaActor {
             ingress,
             submitters,
             work,
+            rest: super::rest::Rest::default(),
         })
     }
 }
@@ -160,6 +173,14 @@ pub(super) fn checked_arena(
     Ok(buffer)
 }
 
+/// The status of an actor that has not run yet.
+fn initial_status(driver: &ReplicaDriver) -> super::SharedStatus {
+    Rc::new(Cell::new(ActorStatus {
+        normal: driver.normal().map(NormalReplica::snapshot),
+        ..ActorStatus::initial(driver.scope())
+    }))
+}
+
 /// Start the protocol driver and its normal work. A backup stages received
 /// PREPAREs in a second leased arena.
 fn start_protocol(
@@ -171,7 +192,13 @@ fn start_protocol(
 ) -> Result<(ReplicaDriver, normal::Work), ActorError> {
     let configuration = startup.configuration();
     let local = startup.local();
-    let driver = startup.into_driver(Duration::ZERO, config.timing, config.pipeline)?;
+    let mut driver = startup.into_driver(Duration::ZERO, config.timing, config.pipeline)?;
+    // A restarted backup rejoins the view it last installed. Beginning here
+    // keeps the next view from ever showing. A refusal leaves the ordinary
+    // election of that next view.
+    if driver.rejoin_pending() {
+        let _ = driver.begin_rejoin_install(ids.generation()?);
+    }
     let receive_buffer = journal.lease_append_buffer()?;
     let peers = normal::remote_transmitters(configuration, local, driver.scope(), config, ids)?;
     let flow = normal::Flow::new(peers, activated, config)?;

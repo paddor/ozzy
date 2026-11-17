@@ -303,9 +303,12 @@ On the SDK:
   send was refused.
 - A partition whose leader suspects stalled storage wakes when the shard's
   storage lane completes any job, also one of another partition.
-- A periodic safety sweep visits every partition. Work that only the sweep
-  finds counts as `partition_sweep_progress`; a nonzero value means a missed
-  wakeup.
+- The shard finds marked partitions in a bit set and due timers in an
+  ordered set, so a turn costs what it visits, not what the shard holds.
+- A periodic safety sweep visits the next sixteen partitions, so a shard
+  with more takes several intervals to see each once. Work that only the
+  sweep finds counts as `partition_sweep_progress`; a nonzero value means a
+  missed wakeup.
 - A partition with held scheduled records wakes when the earliest
   committed one is due, by the journal clock. While the
   [clock guard](REPLICATION.md#clock-guard) pauses, it checks once per second.
@@ -368,18 +371,66 @@ Only the leader releases, one step at a time.
 - Only completions that match the current journal generation advance journal
   state.
 - Segment write handles stay open until roll or shutdown.
+- A handle holds a descriptor only while its shard's share of
+  `open_handles` has room. When the share is spent, the handles used
+  longest ago give their descriptors up and open their paths again at the
+  next use. The backend follows its own renames and removals. A file whose
+  name is gone and a locked file keep their descriptors. Another file at a
+  parked handle's path fails the next use.
 - Reader and follower replay buffers take bounded shares of the shard's
   `budget.resident_bytes`.
 
 ## Local ring exceptions
 
 Cross-thread work uses OMQ inproc sockets, including dispatcher-shard lanes
-and SDK reader inboxes. Two places use typed local queues instead:
+and SDK reader inboxes. Three places use typed local queues instead:
 
 - SDK caller lanes. Application handles pass owned Rust values (records,
   commands, receipts) to the SDK owner over bounded typed queues.
 - Storage jobs. Shards submit jobs to a backend and receive completions over
   bounded rings. The backend's fixed workers share its file table.
+- Embedder logs. A `Log` handle from `Broker::log` sends owned requests
+  (record batches, reads, trims, step-downs) over one bounded queue per
+  partition. The shard polls it under the partition's waker and answers
+  on one-shot channels; the partition's role goes out on a watch channel.
+  A partition without a retention policy keeps every segment until its
+  writer trims. Each copy then schedules a retention turn when it sees the
+  floor move and retires the sealed segments wholly below it.
+
+## Runtime logs
+
+An embedder creates and deletes logs while the broker runs, with
+`Broker::create_log` and `Broker::delete_log`. A runtime log is one
+partition with one writer, reached only through its `Log` handle from
+`Broker::runtime_log`: it has no client intake, readers, or consumer groups.
+
+- The embedder orders creation and deletion across brokers and gives every
+  member the same spec: log ID, incarnation, and one or three members. Ozzy
+  keeps no cluster-wide catalog.
+- One member makes a single durable log on that broker alone. Three members
+  make a replicated group, which elects once two copies exist. A log never
+  changes between the two.
+- The log's shard on each broker follows from its ID and that broker's shard
+  list, so every broker knows where each copy lives without asking.
+- A command goes to the owning shard over a bounded queue. The shard records
+  the log, formats its store, starts its actor, and publishes its broker
+  route and handle. Storage steps run as shard jobs beside the partitions.
+- Deletion withdraws the route, takes the actor out of the shard, drains
+  it, and removes the store. Open requests end; the handle reports
+  `Stopped`. The record stays as a tombstone: an ID is formatted at most
+  once per broker.
+- At start a shard opens its recorded logs again, eight at a time, finishes
+  interrupted deletions, and discards creations that never finished.
+  `Broker::ready` waits for them. A recorded log that cannot open stops
+  the shard.
+- The `[logs]` class sets the append bound, the number of logs per broker,
+  and the segment size of a log whose spec names none. A spec may name its
+  own: small segments for many idle logs, large ones for a busy or large
+  log. A log keeps the sizes it was created with.
+- An empty log holds one segment. Its spare is allocated once the active
+  segment is a quarter full.
+- The dispatcher routes only broker traffic to a runtime log and holds no
+  leader observation of it. Followers check the view of every PREPARE.
 
 ## Shutdown and failure
 
@@ -470,7 +521,7 @@ the broker plan. Startup rejects conflicting active contexts.
 | `max_inflight` | Ordinary physical jobs in execution |
 | `queued_jobs`, `queued_bytes` | Retained ordinary jobs and bytes |
 | `progress_jobs`, `progress_bytes` | Reserved progress jobs and bytes |
-| `open_handles` | Open file and directory handles |
+| `open_handles` | Open file and directory descriptors; idle handles give theirs up |
 
 [Storage](STORAGE.md#operator-tuning) covers the tradeoffs.
 

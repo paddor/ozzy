@@ -1,5 +1,6 @@
 //! Writer assignment uses pure shared policy; cold retry reads are file futures.
 
+mod owner;
 mod retry;
 mod schedule;
 
@@ -212,6 +213,9 @@ impl OwnedJournal {
                 .await?
         {
             return Ok(Prepared::Retry(through));
+        }
+        if buffer.is_owner() {
+            self.owner_proposal(buffer, clock)?;
         }
         if buffer.scheduled().is_some() {
             self.schedule_proposal(buffer, clock)?;

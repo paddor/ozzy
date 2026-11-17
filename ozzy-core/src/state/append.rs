@@ -191,6 +191,9 @@ impl CanonicalState {
         if batch.owner_epoch != partition.owner_epoch {
             return Err(StateError::OwnerEpochMismatch);
         }
+        if is_owner_batch(&batch) {
+            return owner_coordinates(partition, batch);
+        }
         let producer = partition
             .producer(batch.producer_id)
             .ok_or(StateError::ProducerMismatch)?;
@@ -273,4 +276,47 @@ impl CanonicalState {
         }
         Ok(excess)
     }
+}
+
+/// An owner batch names no producer. Its one writer is fenced by view and
+/// offset instead of a producer session.
+pub(super) fn is_owner_batch(batch: &AppendBatchSummary) -> bool {
+    batch.producer_id.as_bytes() == &[0; 16]
+        && batch.producer_epoch.get() == 0
+        && batch.first_sequence == ProducerSequence::ZERO
+}
+
+/// An owner batch starts at the next offset of a partition without delay or
+/// deduplication. It keeps no producer state and no retry span.
+fn owner_coordinates(
+    partition: &super::CanonicalPartition,
+    batch: AppendBatchSummary,
+) -> Result<AppendCursor, StateError> {
+    if partition.delay.is_some() || partition.dedup_window_millis.is_some() {
+        return Err(StateError::OwnerAppendDisabled);
+    }
+    if batch.first_offset != partition.next_offset {
+        return Err(StateError::OffsetMismatch);
+    }
+    if !batch.nonzero_message_ids {
+        return Err(StateError::ZeroValue("message"));
+    }
+    let count = u64::try_from(batch.record_count).map_err(|_| StateError::PositionExhausted)?;
+    let next_offset = batch
+        .first_offset
+        .get()
+        .checked_add(count)
+        .map(Offset::new)
+        .ok_or(StateError::PositionExhausted)?;
+    Ok(AppendCursor {
+        partition: batch.partition,
+        producer: batch.producer_id,
+        first_sequence: batch.first_sequence,
+        first_offset: batch.first_offset,
+        records: count,
+        new_span: false,
+        evict: false,
+        next_sequence: batch.first_sequence,
+        next_offset,
+    })
 }

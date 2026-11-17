@@ -62,8 +62,9 @@ pub(super) fn read_report(
     Ok(message)
 }
 
+/// A primary that resumed its view after a clean stop announces it again,
+/// view zero included.
 pub(super) fn validate_start(message: StartView) -> Result<(), WireError> {
-    validate_election_view(message.scope)?;
     validate_history(message.generation, message.accepted, message.committed)
 }
 

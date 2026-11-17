@@ -324,7 +324,7 @@ impl RecoveringJournal {
                 journal.shutdown().await?;
                 return Err(JournalError::CompletionMismatch);
             }
-            Ok((journal, startup))
+            Ok((journal, startup.rebuilt()))
         })
     }
 
@@ -428,6 +428,7 @@ impl OwnedJournal {
             write_group_bytes: self.writeback.group_bytes,
             reads: self.read_limits,
             producer_idle: self.retention.idle.expiry(),
+            lazy_spare: self.spare.lazy(),
         };
         Ok((config, journal.backend(), self.append_memory.clone()))
     }

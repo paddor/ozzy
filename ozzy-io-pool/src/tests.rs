@@ -10,6 +10,7 @@ use std::sync::{Condvar, Mutex};
 use std::task::Wake;
 
 mod direct_driver;
+mod parking;
 mod queues;
 mod startup;
 

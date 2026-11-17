@@ -1,4 +1,6 @@
+mod logs;
 mod routes;
+pub(super) use logs::LogLane;
 
 use super::{Binding, Registration, failure};
 use crate::{CheckedConfig, StartupError, TransportLimits};
@@ -20,11 +22,25 @@ pub(super) const WRITERS: usize = 32;
 pub(super) const WRITER_WINDOW: usize = 3;
 /// Coordinator plan proposals one partition may have in flight.
 pub(super) const COORDINATOR_PLANS: usize = 2;
-/// Proposal arenas of one partition's native services: per writer, one open
-/// slot and its APPEND slots, client rejection and consumer control slots,
-/// plus the coordinator's plan arenas.
+/// Owner appends one partition's log may have in flight.
+pub(super) const LOG_APPENDS: usize = 4;
+/// Proposal arenas of one partition's services: per writer, one open slot
+/// and its APPEND slots, client rejection and consumer control slots, the
+/// coordinator's plan arenas, and the log's append and read arenas.
 pub(crate) const fn native_arenas(clients: usize) -> usize {
-    WRITERS * (WRITER_WINDOW + 1) + 2 * clients + COORDINATOR_PLANS
+    WRITERS * (WRITER_WINDOW + 1) + 2 * clients + COORDINATOR_PLANS + LOG_APPENDS + 1
+}
+
+/// Bounds of a partition's log, from its journal's append bound.
+pub(super) fn log_limits(append_bytes: usize) -> ozzy_runtime::log::LogLimits {
+    ozzy_runtime::log::LogLimits {
+        queued: 64,
+        queued_bytes: append_bytes.saturating_mul(2),
+        appends: LOG_APPENDS,
+        append_bytes,
+        read_records: 1024,
+        read_bytes: append_bytes.min(1 << 20),
+    }
 }
 type Handoffs = Vec<(u32, tokio::sync::oneshot::Sender<super::Binding>)>;
 
@@ -54,6 +70,18 @@ pub(super) struct Config {
     pub clock: frontend::ClockTrust,
     /// The monotonic origin of the clock guard's readings.
     pub clock_timer: super::context::Timer,
+    /// Beats between this broker and its peers, which let idle replicated
+    /// groups rest. A single broker has none.
+    pub beats: Option<frontend::Beats>,
+    /// The record of the stores behind each broker peer, when one is kept.
+    pub origins: Option<crate::origins::PeerOrigins>,
+    /// Broker routes of replicated runtime logs, shared with every shard.
+    pub runtime_routes: frontend::RuntimeRoutes,
+    /// Every runtime log of this broker and its state.
+    pub log_table: crate::logs::LogTable,
+    /// Each shard's log command lane: the broker handle's sender, and the
+    /// receiver until its shard takes it.
+    pub log_lanes: BTreeMap<u32, LogLane>,
     /// Broker peers whose traffic this simulated broker drops.
     #[cfg(feature = "simulation")]
     pub cut: super::context::CutPeers,
@@ -114,36 +142,33 @@ impl Config {
     ) -> Result<Self, StartupError> {
         #[cfg(feature = "simulation")]
         let cut = context.cut.clone();
+        let origins = context.origins.clone();
         let super::ServingContext { omq, time, .. } = context;
         crate::frontend::configure_network(&omq, &checked.plan)?;
         let deployment = checked.deployment.deployment();
         let local = NodeId::from_bytes(*checked.identity.broker_id(&checked.plan.name)?.as_bytes());
         let clients = deployment.limits.max_clients;
         let limits = native_limits(checked)?;
-        let body = deployment
-            .topics
-            .values()
-            .map(|topic| topic.max_append_bytes as usize)
-            .max()
-            .ok_or_else(|| failure("no topics"))?;
+        let body = deployment.max_append_bytes() as usize;
         let envelope = ozzy_proto::EnvelopeLimits {
             max_metadata_bytes: 64 * 1024,
             max_payload_bytes: body,
         };
         require_follower_pub_endpoints(checked)?;
         let brokers = peer_endpoints(checked, local)?;
-        let followers = follower_routes(checked, local, &brokers)?;
+        let runtime_routes = frontend::RuntimeRoutes::default();
+        let followers = follower_routes(checked, local, &brokers, &runtime_routes)?;
         // SDK links, broker links, and repair links from each remote shard,
         // each with room for a replaced connection that still drains.
         let senders = clients + brokers.len() + followers.incoming.len();
         let transport = transport_limits(body, 2 * senders)?;
         let storage = receive_storage(checked, body, transport.message_bytes)?;
         let buffers = ReceiveBuffers::new(envelope, storage).map_err(failure)?;
-        let budgets = shard_budgets(checked);
-        let catalog = catalog(checked)?;
-        let clock = clock_trust(&brokers, deployment.cluster.max_clock_offset_millis);
         let clock_timer = time.start();
         Ok(Self {
+            clock: clock_trust(&brokers, deployment.cluster.max_clock_offset_millis),
+            beats: super::beats::beats(checked, &brokers, time.timestamp(), &clock_timer),
+            origins,
             time,
             omq,
             local,
@@ -160,13 +185,20 @@ impl Config {
                 control: brokers,
                 followers,
             },
-            budgets,
-            catalog,
+            budgets: shard_budgets(checked),
+            catalog: catalog(checked)?,
             maximum_partitions: checked.plan.partitions.len(),
             admin: None,
             receipt_handles: ozzy_runtime::replica_actor::ReceiptHandles::default(),
-            clock,
             clock_timer,
+            runtime_routes,
+            log_table: crate::logs::LogTable::default(),
+            log_lanes: checked
+                .plan
+                .shards
+                .iter()
+                .map(|shard| (shard.id, LogLane::new()))
+                .collect(),
             #[cfg(feature = "simulation")]
             cut,
         })
@@ -296,6 +328,7 @@ impl Config {
             .collect::<Vec<_>>();
         let ids = shards.iter().map(|shard| shard.id).collect::<Vec<_>>();
         frontend::RoutingTable::new(&ids, &placements, self.maximum_partitions, self.envelope)
+            .map(|table| table.with_runtime(self.runtime_routes.clone()))
             .map_err(failure)
     }
 

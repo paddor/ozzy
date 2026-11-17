@@ -60,6 +60,8 @@ pub struct RoutingTable {
     pub(super) partitions: BTreeMap<GroupId, Placement>,
     pub(super) shards: BTreeSet<u32>,
     pub(super) limits: EnvelopeLimits,
+    /// Routes of logs created at run time, for broker traffic only.
+    pub(super) runtime: Option<super::RuntimeRoutes>,
 }
 
 /// Destination decoded from one packet before placement lookup.
@@ -116,7 +118,36 @@ impl RoutingTable {
             partitions: table,
             shards: shard_set,
             limits,
+            runtime: None,
         })
+    }
+
+    /// Also route broker traffic to the logs `runtime` names on this
+    /// table's shards.
+    #[must_use]
+    pub fn with_runtime(mut self, runtime: super::RuntimeRoutes) -> Self {
+        self.runtime = Some(runtime);
+        self
+    }
+
+    /// Whether broker traffic for `group` has a destination here.
+    pub(super) fn serves_brokers(&self, group: GroupId) -> bool {
+        self.placement(group, Kind::Broker).is_ok()
+    }
+
+    /// The placement of `group`: a configured partition, or for a broker a
+    /// runtime log on one of this table's shards.
+    fn placement(&self, group: GroupId, kind: Kind) -> Result<Placement, RoutingError> {
+        if let Some(placement) = self.partitions.get(&group) {
+            return Ok(*placement);
+        }
+        self.runtime
+            .as_ref()
+            .filter(|_| kind == Kind::Broker)
+            .and_then(|runtime| runtime.get(group))
+            .map(|route| route.placement)
+            .filter(|placement| self.shards.contains(&placement.shard))
+            .ok_or(RoutingError::Partition)
     }
 
     /// Inspect the ordinary PEER routing frame and three native frames without
@@ -151,7 +182,7 @@ impl RoutingTable {
             Kind::Broker => self.broker_target(packet)?,
             Kind::Client => self.client_target(packet)?,
         };
-        let placement = *self.partitions.get(&group).ok_or(RoutingError::Partition)?;
+        let placement = self.placement(group, binding.kind)?;
         if partition.is_some_and(|id| id != placement.partition) {
             return Err(RoutingError::Partition);
         }
@@ -246,7 +277,7 @@ impl RoutingTable {
                     .ok_or(RoutingError::Partition)?,
             );
             wire::CompactState::decode(message.part_slice(2).unwrap_or_default())?;
-            let placement = *self.partitions.get(&group).ok_or(RoutingError::Partition)?;
+            let placement = self.placement(group, Kind::Broker)?;
             return Ok(Some(Routed {
                 placement,
                 class: Class::Control,

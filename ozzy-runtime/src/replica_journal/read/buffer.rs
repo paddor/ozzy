@@ -68,6 +68,17 @@ impl PartitionReadBuffer {
         Ok(Self(Rc::new(RefCell::new(Lent::new(arena, wake)))))
     }
 
+    /// Like `new`, but the descriptors are reserved by the first read.
+    pub(crate) fn lazy(
+        buffer: AppendBuffer,
+        limits: PartitionReadLimits,
+        wake: Arc<AtomicWaker>,
+    ) -> Self {
+        let mut arena = Arena::new(buffer);
+        arena.bounds = Some((limits.max_records, limits.max_parts));
+        Self(Rc::new(RefCell::new(Lent::new(arena, wake))))
+    }
+
     /// Take the existing arena when no disk command or delivery still owns it.
     /// The lease reserves its return slot now, so dropping it cannot fail.
     pub(crate) fn try_lease(&self) -> Option<PartitionReadLease> {
@@ -137,24 +148,17 @@ impl PartitionReadLease {
     pub(in crate::replica_journal) fn push_view(
         &mut self,
         record: &ozzy_journal_segment::RecordView<'_>,
-    ) -> Result<(), JournalError> {
-        self.push_record(record.message_id(), record.encoding(), record.parts())
-    }
-
-    pub(in crate::replica_journal) fn push_record<'a>(
-        &mut self,
-        id: ozzy_proto::MessageId,
-        encoding: ozzy_proto::data::Encoding,
-        parts: impl Iterator<Item = &'a [u8]>,
+        time_millis: u64,
     ) -> Result<(), JournalError> {
         let arena = &mut *self.0;
         let first = arena.parts.len();
-        for part in parts {
+        for part in record.parts() {
             arena.parts.push(arena.buffer.push_read_part(part)?);
         }
         arena.records.push(ReadRecord {
-            encoding,
-            id,
+            encoding: record.encoding(),
+            id: record.message_id(),
+            time_millis,
             parts: first..arena.parts.len(),
         });
         Ok(())

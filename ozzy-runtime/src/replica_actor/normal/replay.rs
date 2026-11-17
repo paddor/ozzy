@@ -141,10 +141,7 @@ impl ReplicaActor {
         }
         let normal = require_normal(&self.driver)?;
         let snapshot = normal.snapshot();
-        let floor = normal
-            .start_view()
-            .map_err(DriverError::from)?
-            .map_or(Prefix::GENESIS, |start| start.accepted);
+        let floor = normal.replay_floor().map_err(DriverError::from)?;
         for delta in 0..3 {
             let index = (self.work.replay_peer + delta) % 3;
             let Some(plan) = self.replay_plan(index, now) else {

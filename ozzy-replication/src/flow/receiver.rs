@@ -18,6 +18,12 @@ pub struct Receiver {
 }
 
 impl Receiver {
+    /// Give the unused part of the reserved window back. It grows again as
+    /// operations arrive. For a replica that expects to stay idle.
+    pub fn trim(&mut self) {
+        self.retained.shrink_to_fit();
+    }
+
     /// Start at an exact applied prefix with a bounded local metadata window.
     pub fn new(channel: Channel, base: Prefix, limits: PipelineLimits) -> Result<Self, FlowError> {
         capacities(limits)?;

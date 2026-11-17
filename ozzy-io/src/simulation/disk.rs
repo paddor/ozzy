@@ -501,6 +501,37 @@ impl Image {
             .collect()
     }
 
+    /// The entries right after `after` by name that fit `(entries, bytes)`.
+    pub(super) fn page(
+        &self,
+        path: &Path,
+        after: Option<&std::ffi::OsStr>,
+        (max_entries, max_bytes): (usize, usize),
+    ) -> io::Result<Vec<Entry>> {
+        use std::ops::Bound;
+        if max_entries == 0 {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let entries = self.directory(self.resolve(path, false)?, false)?;
+        let first = after.map_or(Bound::Unbounded, Bound::Excluded);
+        let mut page = Vec::new();
+        let mut bytes = 0_usize;
+        for (name, inode) in entries.range::<std::ffi::OsStr, _>((first, Bound::Unbounded)) {
+            bytes = bytes.saturating_add(name.len());
+            if page.len() == max_entries || bytes > max_bytes {
+                break;
+            }
+            page.push(Entry {
+                name: name.clone(),
+                kind: self.kind(*inode)?,
+            });
+        }
+        if page.is_empty() && bytes > max_bytes {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        Ok(page)
+    }
+
     pub(super) fn link(
         &mut self,
         source: &Path,

@@ -293,6 +293,12 @@ events! {
         ShardTurn => "shard_turn",
         /// A safety-sweep visit found work no wakeup or timer announced.
         PartitionSweepProgress => "partition_sweep_progress",
+        /// A voter agreed with a peer to rest: beats replace their traffic.
+        ReplicaRest => "replica_rest",
+        /// A voter ended a rest agreement with a peer.
+        ReplicaRestEnd => "replica_rest_end",
+        /// A shard changed its beat epoch, ending every rest agreed under it.
+        ShardEpochChange => "shard_epoch_change",
         /// Follower PUB socket was full; the frame waits for space.
         ReplicaPublicationSendWait => "replica_publication_send_wait",
         /// Reader PUB socket was full; the frame waits for space.

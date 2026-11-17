@@ -38,7 +38,8 @@ impl NormalReplica {
         for operation in operations {
             if operation.group_id != ticket.scope().group_id
                 || operation.configuration_epoch != ticket.scope().configuration_epoch
-                || operation.original_view >= ticket.scope().view
+                || operation.original_view > ticket.scope().view
+                || (operation.original_view == ticket.scope().view && !ticket.admits_view_tail())
             {
                 return Err(ReplicationError::ScopeMismatch);
             }
@@ -84,6 +85,7 @@ impl NormalReplica {
         self.acknowledged = Voters::splat(OpNumber(0));
         self.activation_tail = ticket.accepted().op;
         self.installed_view = Some(start);
+        self.rejoined = ticket.rejoins();
         self.journal_tail = None;
         self
     }

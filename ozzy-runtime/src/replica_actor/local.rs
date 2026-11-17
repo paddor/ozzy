@@ -533,6 +533,8 @@ fn has_room(
 impl LocalActor {
     pub(super) fn observe_time(&mut self, now: std::time::Duration) {
         self.now = now;
+        self.retention
+            .observe_floor(self.journal.owner_floor(), now);
     }
 
     /// The next retention turn, release, or durable evidence publication.

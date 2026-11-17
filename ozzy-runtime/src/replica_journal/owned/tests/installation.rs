@@ -90,6 +90,8 @@ fn voter(controller: &mut Controller, io: Local, index: u8, count: u8) -> Voter 
     let mut driver = startup
         .into_driver(Duration::ZERO, timing(), config.append_limits)
         .unwrap();
+    // These voters take part in an election, not a rejoin.
+    driver.decline_rejoin();
     let Some(Action::PersistPromise(ticket)) = driver.poll(Duration::ZERO).unwrap() else {
         panic!("restart requires promise")
     };
@@ -106,8 +108,13 @@ fn voter(controller: &mut Controller, io: Local, index: u8, count: u8) -> Voter 
 }
 
 fn selected(controller: &mut Controller, io: Local) -> (Voter, Voter) {
-    let mut primary = voter(controller, io.clone(), 1, 3);
-    let mut backup = voter(controller, io, 2, 2);
+    selected_from(controller, io, (3, 2))
+}
+
+/// An election the first voter wins, with `counts` stored operations each.
+fn selected_from(controller: &mut Controller, io: Local, counts: (u8, u8)) -> (Voter, Voter) {
+    let mut primary = voter(controller, io.clone(), 1, counts.0);
+    let mut backup = voter(controller, io, 2, counts.1);
     let Some(Action::Broadcast(left)) = primary.driver.poll(Duration::ZERO).unwrap() else {
         panic!("start")
     };
@@ -180,15 +187,19 @@ fn request(ticket: &InstallTicket) -> FetchOps {
 }
 
 fn stage_local(controller: &mut Controller, voter: &mut Voter) -> InstallTicket {
+    stage_local_with(controller, voter, policy())
+}
+
+fn stage_local_with(
+    controller: &mut Controller,
+    voter: &mut Voter,
+    config: InstallationConfig,
+) -> InstallTicket {
     let ticket = voter
         .driver
         .begin_primary_install(JournalGeneration(101))
         .unwrap();
-    drive(
-        controller,
-        voter.journal.begin_installation(ticket, policy()),
-    )
-    .unwrap();
+    drive(controller, voter.journal.begin_installation(ticket, config)).unwrap();
     let mut fetch = request(&ticket);
     let mut buffer = voter.journal.lease_append_buffer().unwrap();
     while fetch.predecessor != ticket.accepted() {
@@ -216,6 +227,14 @@ fn finish(controller: &mut Controller, voter: &mut Voter, ticket: &InstallTicket
     let installed = drive(controller, voter.journal.finish_installation(*ticket)).unwrap();
     assert_eq!(installed.applied(), ticket.committed());
     assert!(voter.journal.images().is_err());
+    // The commit point is recorded under the installed view only.
+    let view = ticket.scope().view;
+    let ends = voter.journal.installed_ends.as_ref().unwrap();
+    assert_eq!(ends.0, view);
+    for &(partition, end) in &ends.1 {
+        assert_eq!(voter.journal.installed_end(view, partition), Some(end));
+        assert_eq!(voter.journal.installed_end(view + 1, partition), None);
+    }
     voter
         .driver
         .complete_installation(installed.ticket(), installed.applied(), Duration::ZERO)
@@ -662,4 +681,98 @@ fn owned_canceled_activation_does_not_grant_readiness_after_late_io() {
     assert!(journal.images().is_err());
     drive(&mut controller, journal.shutdown()).unwrap();
     drive(&mut controller, backup.journal.shutdown()).unwrap();
+}
+
+/// A primary whose whole log is confirmed, and its installation in a store
+/// that keeps the segment size.
+fn begin_kept(controller: &mut Controller, io: Local) -> (Voter, InstallTicket) {
+    let (mut primary, _) = selected_from(controller, io, (1, 1));
+    let ticket = primary
+        .driver
+        .begin_primary_install(JournalGeneration(101))
+        .unwrap();
+    assert_eq!(ticket.retained(), ticket.accepted());
+    let config = InstallationConfig {
+        segment_capacity: 32768,
+        ..policy()
+    };
+    drive(
+        controller,
+        primary.journal.begin_installation(ticket, config),
+    )
+    .unwrap();
+    (primary, ticket)
+}
+
+fn segment_ids(voter: &Voter) -> Vec<u64> {
+    let journal = voter.journal.journal.readable().unwrap();
+    let segments = &journal.manifest().segments;
+    segments.iter().map(|segment| segment.segment_id).collect()
+}
+
+#[test]
+fn owned_installation_that_keeps_the_whole_log_keeps_its_segment() {
+    let (mut controller, io) = setup();
+    let (mut primary, ticket) = begin_kept(&mut controller, io);
+    finish(&mut controller, &mut primary, &ticket);
+    assert_eq!(segment_ids(&primary), [1]);
+    let journal = primary.journal.journal.ready().unwrap();
+    assert_eq!(journal.manifest().last_normal_view, ticket.scope().view);
+    assert_eq!(
+        journal.writer().durable_position().generation(),
+        JournalGeneration(101)
+    );
+    assert_eq!(
+        journal.accepted_position().unwrap(),
+        crate::replica_journal::authority::position(ticket.accepted())
+    );
+}
+
+#[test]
+fn owned_aborted_kept_installation_leaves_the_old_writer() {
+    let (mut controller, io) = setup();
+    let (mut primary, ticket) = begin_kept(&mut controller, io);
+    let buffer = primary.journal.lease_append_buffer().unwrap();
+    // An empty chunk is refused, kept log or not.
+    assert!(
+        drive(
+            &mut controller,
+            primary.journal.install_chunk(ticket, buffer)
+        )
+        .is_err()
+    );
+    let (mut controller, io) = setup();
+    let (mut primary, ticket) = begin_kept(&mut controller, io);
+    drive(&mut controller, primary.journal.abort_installation(ticket)).unwrap();
+    assert_eq!(segment_ids(&primary), [1]);
+    let journal = primary.journal.journal.ready().unwrap();
+    assert_eq!(
+        journal.writer().durable_position().generation(),
+        primary.source.generation
+    );
+}
+
+#[test]
+fn owned_installation_that_ends_at_the_own_log_keeps_an_unconfirmed_tail() {
+    let (mut controller, io) = setup();
+    let (mut primary, _) = selected_from(&mut controller, io, (3, 1));
+    let config = InstallationConfig {
+        segment_capacity: 32768,
+        ..policy()
+    };
+    // The tail after the retained prefix passes through the driver, and
+    // the journal stages none of it.
+    let ticket = stage_local_with(&mut controller, &mut primary, config);
+    assert_ne!(ticket.retained(), ticket.accepted());
+    finish(&mut controller, &mut primary, &ticket);
+    assert_eq!(segment_ids(&primary), [1]);
+    let journal = primary.journal.journal.ready().unwrap();
+    assert_eq!(
+        journal.accepted_position().unwrap(),
+        crate::replica_journal::authority::position(ticket.accepted())
+    );
+    assert_eq!(
+        journal.committed_position().unwrap(),
+        crate::replica_journal::authority::position(ticket.committed())
+    );
 }

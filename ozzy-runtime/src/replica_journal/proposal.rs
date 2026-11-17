@@ -5,7 +5,7 @@ pub(super) use partition::partition_retry;
 
 use ozzy_journal::operation::{AppendRecord, CanonicalOperation, Digest, OperationKind};
 use ozzy_proto::{
-    GroupId, OwnerEpoch, PartitionIncarnation, ProducerEpoch, ProducerId, ProducerSequence,
+    GroupId, Offset, OwnerEpoch, PartitionIncarnation, ProducerEpoch, ProducerId, ProducerSequence,
 };
 use ozzy_replication::PipelineLimits;
 
@@ -83,6 +83,24 @@ pub enum AppendAdmissionError {
     CompressedSchedule,
 }
 
+/// An owner append rejected without admitting a new operation. Each one
+/// ends the writer's term: later appends it has in flight fail too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum OwnerAppendError {
+    /// The batch does not start at the partition's next offset.
+    #[error("owner append does not start at the next offset {next:?}")]
+    Offset {
+        /// The partition's next offset, after every accepted operation.
+        next: Offset,
+    },
+    /// No partition with this incarnation exists.
+    #[error("unknown owner append partition")]
+    UnknownPartition,
+    /// A partition with delay or deduplication takes producer appends only.
+    #[error("partition with delay or deduplication refuses owner appends")]
+    Disabled,
+}
+
 /// Reusable bounded canonical bodies without caller-selected consensus coordinates.
 ///
 /// This is a service API, not the producer SDK. `push` accepts already assigned
@@ -98,6 +116,11 @@ pub enum AppendAdmissionError {
 pub struct ProposalBuffer(pub(crate) AppendBuffer);
 
 impl ProposalBuffer {
+    /// Give the unused descriptor capacity back. It grows again with use.
+    pub fn trim(&mut self) {
+        self.0.trim();
+    }
+
     /// Bind an empty startup arena to a shard-owned bounded memory pool.
     /// Direct producer backpressure controls admission before allocation.
     pub fn bind_owner(&mut self, owner: &crate::memory::Owner) -> Result<(), JournalError> {
@@ -137,6 +160,44 @@ impl ProposalBuffer {
         self.0.producer_stream = true;
         self.0.proposal_authority = Some(authority);
         Ok(())
+    }
+
+    /// Freeze one owner batch of `records` at `first_offset` into an empty
+    /// arena. A partition's one writer names the offset it expects and the
+    /// view it leads; validation admits the batch only at exactly that
+    /// offset in exactly that view. The batch names no producer. Records
+    /// keep nonzero IDs and at least one part each.
+    pub fn prepare_owner_append(
+        &mut self,
+        authority: ozzy_proto::append::Authority,
+        partition: PartitionIncarnation,
+        first_offset: Offset,
+        records: Vec<AppendRecord<'_>>,
+    ) -> Result<(), JournalError> {
+        self.0
+            .prepare_owner_batch(partition, first_offset, records)?;
+        self.0.proposal_authority = Some(authority);
+        Ok(())
+    }
+
+    /// Freeze the one `trim` of a partition's only writer into an empty
+    /// arena. Validation admits it only in the view `authority` names.
+    pub(crate) fn prepare_owner_trim(
+        &mut self,
+        authority: ozzy_proto::append::Authority,
+        trim: ozzy_journal::operation::Trim,
+        limits: ozzy_journal::operation::OperationLimits,
+    ) -> Result<(), JournalError> {
+        let body = ozzy_journal::operation::OperationBody::Trim(trim);
+        let bytes = ozzy_journal::operation::encode_operation_body(&body, limits)?;
+        self.push(body.kind(), &bytes)?;
+        self.0.proposal_authority = Some(authority);
+        Ok(())
+    }
+
+    /// The leader's timestamp on the one owner batch, once validated.
+    pub(crate) fn owner_timestamp(&self) -> Option<u64> {
+        self.0.owner_timestamp()
     }
 
     pub(crate) fn prepare_stream_wire_append(
@@ -237,6 +298,7 @@ impl ProposalBuffer {
     /// Bodies are private until worker validation establishes their canonical form.
     pub fn push(&mut self, kind: OperationKind, body: &[u8]) -> Result<(), JournalError> {
         if self.0.is_producer()
+            || self.0.is_owner()
             || self.0.is_partition_creation()
             || self.0.producer_session.is_some()
             || self.0.group_progress.is_some()

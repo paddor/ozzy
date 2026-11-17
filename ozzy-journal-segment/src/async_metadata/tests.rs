@@ -202,7 +202,7 @@ async fn establish(directory: &mut Directory) {
     directory.select_current(current(&manifest)).await.unwrap();
     let evidence = crate::directory::evidence::image(&manifest, LogPosition::GENESIS).unwrap();
     directory
-        .replace("DURABLE", ".DURABLE.tmp", &evidence)
+        .replace("DURABLE", ".DURABLE.tmp", &evidence.into())
         .await
         .unwrap();
 }
@@ -396,8 +396,9 @@ fn canceled_publication_fences_owner_and_keeps_group_locked_until_physical_work_
         Directory::open("/".into(), io.clone(), limits()),
     )
     .unwrap();
+    let state = bytes::Bytes::from_static(b"state");
     let pending = {
-        let mut future = std::pin::pin!(directory.replace("STATE", ".STATE.tmp", b"state"));
+        let mut future = std::pin::pin!(directory.replace("STATE", ".STATE.tmp", &state));
         assert!(poll(future.as_mut()).is_pending());
         controller.jobs()[0].0
     };
@@ -581,6 +582,43 @@ fn existing_store_open_never_creates_a_missing_lock() {
 }
 
 #[test]
+fn a_guarded_lane_brings_its_lock_and_the_store_locks_no_file() {
+    let (mut controller, io) = setup(Image::default());
+    let execute = |operation| io.execute(Class::Progress, operation);
+    let lock = drive(&mut controller, async {
+        let opened = execute(Operation::Open {
+            path: "/volume.lock".into(),
+            mode: ozzy_io::OpenMode::CreateNew,
+            direct: false,
+            data_sync: false,
+        })
+        .await?;
+        let Outcome::Opened(handle) = &*opened else {
+            panic!("open response")
+        };
+        let handle = handle.clone();
+        execute(Operation::LockExclusive {
+            handle: handle.clone(),
+        })
+        .await?;
+        io::Result::Ok(handle)
+    })
+    .unwrap();
+    // No lock file of its own exists, and none is needed or made.
+    let guarded = io.guarded_by(lock.clone());
+    let directory = drive(
+        &mut controller,
+        Directory::open_existing("/".into(), guarded, limits()),
+    )
+    .unwrap();
+    assert!(!controller.image().exists(Path::new("/group.lock"), false));
+    drive(&mut controller, directory.close()).unwrap();
+    // The volume's lock outlives the store.
+    let metadata = Operation::Metadata { handle: lock };
+    assert!(drive(&mut controller, execute(metadata)).is_ok());
+}
+
+#[test]
 fn selected_metadata_checks_identity_configuration_evidence_and_exact_generation() {
     let (mut controller, io) = setup(established());
     let mut directory = drive(
@@ -657,7 +695,7 @@ fn evidence_descriptor_is_reused_but_invalidated_when_its_inode_is_replaced() {
     let replacement = crate::directory::evidence::image(&metadata, LogPosition::GENESIS).unwrap();
     drive(
         &mut controller,
-        directory.replace(NAME, ".DURABLE.tmp", &replacement),
+        directory.replace(NAME, ".DURABLE.tmp", &replacement.clone().into()),
     )
     .unwrap();
     let newer = LogPosition {

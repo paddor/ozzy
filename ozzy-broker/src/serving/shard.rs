@@ -1,5 +1,7 @@
 mod build;
+mod logs;
 mod scheduler;
+mod waves;
 use build::build;
 
 use super::{
@@ -44,9 +46,17 @@ struct Bootstrap {
     done: bool,
 }
 
+/// One partition's log until the frontend binding installs it.
+struct LogInstall {
+    group: GroupId,
+    port: ozzy_runtime::log::LogPort,
+    lane: Option<ozzy_runtime::replica_actor::LogLane>,
+}
+
 struct State {
     actors: PartitionActors,
     natives: Vec<NativeIntake>,
+    logs: Vec<LogInstall>,
     coordinators: Vec<GroupCoordinator>,
     identities: Vec<(GroupId, ozzy_proto::PartitionIncarnation)>,
     bootstrap: Vec<Option<Bootstrap>>,
@@ -74,6 +84,15 @@ struct State {
     admin: Option<crate::admin::ShardLane>,
     /// This shard's reader grants, which the reader PUB admits by.
     grants: Option<ozzy_runtime::frontend::ShardGrants>,
+    /// Log handles by topic and partition number, until registration.
+    handles: Vec<(String, u32, ozzy_runtime::log::Log)>,
+    /// This shard's ID.
+    shard: u32,
+    /// Configured partitions: the first entries of `identities`. Runtime
+    /// logs follow them.
+    fixed: usize,
+    /// Runtime logs, when the deployment has a log class.
+    runtime: Option<logs::RuntimeLogs>,
 }
 
 pub(super) async fn run(
@@ -93,6 +112,7 @@ pub(super) async fn run(
     let (senders, incoming) = open_lanes(shard.plan.id, &config)?;
     let mut state = Box::pin(build(&shard, &journals, config, incoming)).await?;
     let routes = state.route_states()?;
+    let logs = std::mem::take(&mut state.handles);
     let (serving, observed) = tokio::sync::watch::channel(false);
     let result = async {
         let (handoff, binding) = oneshot::channel();
@@ -104,6 +124,7 @@ pub(super) async fn run(
             data: senders.data,
             replica: senders.replica,
             routes,
+            logs,
             handoff,
         };
         tokio::select! {
@@ -120,10 +141,18 @@ pub(super) async fn run(
     }
     .await;
     drop(state.natives);
+    drop(state.logs);
     drop(state.coordinators);
     drop(state.bootstrap);
     drop(state.outbound);
-    let drained = state.actors.shutdown().await.map_err(failure);
+    let runtime = state.runtime.take();
+    let drained = match (state.actors.stop().await, runtime) {
+        // A primary that stopped with everything durable resumes its view
+        // at the next start.
+        (Ok(stops), Some(runtime)) => runtime.keep_stops(shard.plan.id, stops).await,
+        (Ok(_), None) => Ok(()),
+        (Err(error), _) => Err(failure(error)),
+    };
     result.and(drained)
 }
 
@@ -174,9 +203,10 @@ fn open_lanes(id: u32, config: &Config) -> Result<(LaneSenders, [DataReceiver; 4
 }
 
 impl State {
-    /// Each partition's route state, in partition order, for the frontend.
+    /// Each configured partition's route state, in partition order, for
+    /// the frontend.
     fn route_states(&self) -> Result<Vec<ozzy_proto::directory::RouteState>, StartupError> {
-        self.identities
+        self.identities[..self.fixed]
             .iter()
             .map(|&(group, partition)| {
                 self.actors
@@ -186,12 +216,17 @@ impl State {
             .collect()
     }
 
-    /// Install the native intakes, coordinators, readers, and route publisher
-    /// on the frontend links of `binding`.
+    /// Install the native intakes, logs, coordinators, readers, and route
+    /// publisher on the frontend links of `binding`.
     fn install_services(&mut self, binding: &Binding) -> Result<(), StartupError> {
         for native in self.natives.drain(..) {
             self.actors
                 .install_native(native, binding.links.clone())
+                .map_err(failure)?;
+        }
+        for log in self.logs.drain(..) {
+            self.actors
+                .install_log(log.group, log.port, log.lane)
                 .map_err(failure)?;
         }
         for coordinator in self.coordinators.drain(..) {
@@ -199,7 +234,7 @@ impl State {
                 .install_coordinator(coordinator, binding.links.clone())
                 .map_err(failure)?;
         }
-        for (index, &(group, partition)) in self.identities.iter().enumerate() {
+        for (index, &(group, partition)) in self.identities[..self.fixed].iter().enumerate() {
             if self.bootstrap[index].is_none() {
                 continue;
             }
@@ -216,8 +251,10 @@ impl State {
                 )
                 .map_err(failure)?;
         }
-        self.publisher =
-            Some(RoutePublisher::new(&self.actors, &self.identities, 16).map_err(failure)?);
+        self.publisher = Some(
+            RoutePublisher::new(&self.actors, &self.identities[..self.fixed], 16)
+                .map_err(failure)?,
+        );
         Ok(())
     }
 
@@ -236,8 +273,7 @@ impl State {
         let Some(admin) = &self.admin else {
             return;
         };
-        let rows = self
-            .identities
+        let rows = self.identities[..self.fixed]
             .iter()
             .filter_map(|&(group, partition)| {
                 let status = self.actors.status(group)?;
@@ -312,6 +348,15 @@ impl Waits {
     }
 }
 
+/// Ready once a broker peer fell silent or changed what its beats say.
+/// Without beats, never.
+async fn beats_changed_after(beats: Option<&frontend::Beats>) {
+    match beats {
+        Some(beats) => beats.changed_after(beats.generation()).await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn serve(
     shard: &ShardContext,
     state: &mut State,
@@ -327,6 +372,8 @@ async fn serve(
     let mut links_changed = Box::pin(links.changed_after(links.generation()));
     let clock = state.config.clock.clone();
     let mut clock_changed = Box::pin(clock.changed_after(clock.generation()));
+    let beats = state.config.beats.clone();
+    let mut beats_changed = Box::pin(beats_changed_after(beats.as_ref()));
     let mut waits = Waits::default();
     loop {
         let port_generation = binding.port.generation();
@@ -361,6 +408,9 @@ async fn serve(
             },
             () = &mut clock_changed => {
                 clock_changed = Box::pin(clock.changed_after(clock.generation()));
+            },
+            () = &mut beats_changed => {
+                beats_changed = Box::pin(beats_changed_after(beats.as_ref()));
             },
         }
     }

@@ -96,3 +96,44 @@ fn reopening_after_lost_data_reuses_the_send_ledger() {
         assert_eq!(sender.pending.capacity(), capacity);
     }
 }
+
+#[test]
+fn trimmed_ledgers_hold_nothing_and_fill_their_window_again() {
+    let limits = PipelineLimits {
+        max_operations: 4,
+        max_body_bytes: 100,
+    };
+    let channel = Channel {
+        scope: Scope {
+            group_id: GroupId::from_bytes([1; 16]),
+            configuration_epoch: 1,
+            configuration_digest: Digest::from_bytes([2; 32]),
+            view: 0,
+        },
+        epoch: ReceiveEpoch::new(1).unwrap(),
+    };
+    let mut receiver = Receiver::new(channel, Prefix::GENESIS, limits).unwrap();
+    let mut sender = Sender::open(receiver.report(), limits, Prefix::GENESIS).unwrap();
+    receiver.trim();
+    sender.trim();
+    assert_eq!(sender.pending.capacity(), 0);
+    let mut previous = sender.sent();
+    let operations: [_; 4] = std::array::from_fn(|_| {
+        let operation = Operation {
+            prefix: Prefix {
+                op: OpNumber(previous.op.0 + 1),
+                digest: Digest::from_bytes([1; 32]),
+            },
+            previous_digest: previous.digest,
+            body_bytes: 1,
+        };
+        previous = operation.prefix;
+        operation
+    });
+    sender.record_send(channel, &operations).unwrap();
+    assert_eq!(sender.available().max_operations, 0);
+    receiver.retain(channel, &operations).unwrap();
+    receiver.release(operations[3].prefix).unwrap();
+    sender.observe(receiver.report()).unwrap();
+    assert!(sender.pending.is_empty());
+}

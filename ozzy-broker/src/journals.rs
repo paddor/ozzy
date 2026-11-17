@@ -1,6 +1,6 @@
 //! Native partition journal construction from persisted deployment bindings.
 
-mod limits;
+pub(crate) mod limits;
 mod recovery;
 pub use limits::check_partition_limits;
 pub use recovery::{RecoveryIntent, RecoverySelection};
@@ -22,6 +22,8 @@ pub struct JournalPlan {
     /// Broker-local partitions in the validated construction plan.
     pub partitions: Vec<PartitionJournal>,
     pub(crate) recovery: BTreeMap<GroupId, RecoveryIntent>,
+    /// How to build runtime logs, when the deployment has a log class.
+    pub(crate) logs: Option<std::sync::Arc<crate::logs::LogSetup>>,
 }
 
 /// One broker-local journal, independent of its actor's leadership role.
@@ -116,6 +118,7 @@ impl JournalPlan {
         Ok(Self {
             partitions,
             recovery: BTreeMap::new(),
+            logs: crate::logs::LogSetup::new(checked, local, principals).map(std::sync::Arc::new),
         })
     }
 }
@@ -173,7 +176,8 @@ impl PartitionSetup<'_> {
             store_id: StoreId::from_bytes(*store.store.as_bytes()),
             store_generation: store.generation,
         };
-        let settings = limits::Settings::new(&checked.deployment, &checked.plan, placement)?;
+        let shape = limits::Shape::topic(&checked.deployment, &checked.plan, placement)?;
+        let settings = limits::Settings::new(&checked.deployment, &checked.plan, placement, shape)?;
         let config = match checked.identity.mode {
             DeploymentMode::Single => {
                 let configuration = local::Configuration::new(
@@ -192,7 +196,7 @@ impl PartitionSetup<'_> {
         };
         Ok(PartitionJournal {
             cluster: checked.identity.cluster,
-            actors: ActorSettings::new(checked, placement, &config)?,
+            actors: ActorSettings::new(checked, placement, &config, shape.sharers)?,
             placement: placement.clone(),
             incarnation: PartitionIncarnation::from_bytes(*partition.incarnation.as_bytes()),
             config,

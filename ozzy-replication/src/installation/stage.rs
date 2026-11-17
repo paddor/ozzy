@@ -194,8 +194,12 @@ impl ViewChange {
         } else {
             start.committed
         };
+        let ticket = InstallTicket {
+            view_tail: true,
+            ..self.install_ticket(generation, source, committed, local_commit)?
+        };
         Ok(Admitted {
-            ticket: self.install_ticket(generation, source, committed, local_commit)?,
+            ticket,
             start,
             promise,
             body_bytes: 0,
@@ -237,6 +241,55 @@ impl ViewChange {
                 previous.committed
             },
             committed,
+            rejoin: false,
+            view_tail: false,
+        })
+    }
+
+    /// Stage a restarted backup's return to the view it last installed,
+    /// from its own log: the committed prefix stays and the tail after it
+    /// is restaged. Everything it acknowledged before the restart is in
+    /// that log, so the view's primary may go on counting those votes.
+    ///
+    /// One attempt: a rejection returns the role without the right to
+    /// rejoin, and the ordinary election of the next view follows.
+    #[expect(
+        clippy::result_large_err,
+        reason = "rejection returns owned fenced role"
+    )]
+    pub fn begin_rejoin_install(
+        mut self,
+        generation: JournalGeneration,
+    ) -> Result<InstallingView, RejectedInstallation> {
+        let admitted = self.admit_rejoin(generation);
+        self.rejoin = None;
+        self.stage(&admitted, Suffix::Streamed)
+    }
+
+    fn admit_rejoin(&self, generation: JournalGeneration) -> Result<Admitted, ViewChangeError> {
+        let promise = self.rejoin.ok_or(ViewChangeError::PromiseRequired)?;
+        let local = self.normal.snapshot();
+        let source = LogSource {
+            voter: self.configuration.voter(self.local),
+            generation: local.journal.generation,
+            accepted: local.accepted,
+        };
+        let ticket = InstallTicket {
+            scope: promise.scope(),
+            rejoin: true,
+            view_tail: true,
+            ..self.install_ticket(generation, source, local.committed, local.committed)?
+        };
+        Ok(Admitted {
+            ticket,
+            start: StartView {
+                scope: promise.scope(),
+                generation,
+                accepted: local.accepted,
+                committed: local.committed,
+            },
+            promise,
+            body_bytes: 0,
         })
     }
 

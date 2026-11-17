@@ -1,7 +1,7 @@
 //! Local storage completions and failures: promise publication, writes,
 //! barriers, application, and uncertain I/O.
 
-use super::{DriverError, ReplicaDriver, Role};
+use super::{DriverError, ReplicaDriver, Role, VoterIndex};
 use crate::{
     JournalGeneration, Prefix, PromiseTicket, ReplicationError, SyncTicket, ViewChangeError,
     WriteTicket,
@@ -27,6 +27,27 @@ impl ReplicaDriver {
     /// role suspects it. The next completed job changes what `poll` does.
     pub fn storage_stalled(&self) -> bool {
         matches!(self.role, Role::Normal(_)) && self.storage_timed_out()
+    }
+
+    /// A ready primary heard no backup of its view for the primary timeout,
+    /// and the adapter covers none.
+    /// Nothing it admits can commit until one answers, so an embedder that
+    /// is the only writer stops handing it work. This is not suspicion: the
+    /// view ends only when two voters ask for it.
+    pub fn primary_doubt(&self) -> bool {
+        let Role::Normal(normal) = &self.role else {
+            return false;
+        };
+        let snapshot = normal.snapshot();
+        snapshot.ready_for_appends
+            && VoterIndex::primary(snapshot.scope.view) == self.local
+            && self.covered.is_empty()
+            && self.now >= self.doubt_at()
+    }
+
+    pub(super) fn doubt_at(&self) -> Duration {
+        self.backup_heard_at
+            .saturating_add(self.timing.primary_timeout)
     }
 
     pub(super) fn storage_timed_out(&self) -> bool {

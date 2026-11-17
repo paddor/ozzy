@@ -136,6 +136,7 @@ impl PartitionReadCursor {
 pub(super) struct ReadRecord {
     pub(super) encoding: ozzy_proto::data::Encoding,
     pub(super) id: MessageId,
+    pub(super) time_millis: u64,
     pub(super) parts: Range<usize>,
 }
 
@@ -177,6 +178,14 @@ impl ReadPartition {
                     .map(|range| &self.buffer.read_bytes()[range.clone()]),
             )
         })
+    }
+    /// Append time of each returned record's batch, in Unix milliseconds, in
+    /// record order.
+    pub fn times(&self) -> impl ExactSizeIterator<Item = u64> + '_ {
+        self.buffer
+            .records()
+            .iter()
+            .map(|record| record.time_millis)
     }
     /// Clear the delivery and recover its original arena and admission lease.
     pub fn into_buffer(mut self) -> PartitionReadLease {
@@ -223,6 +232,16 @@ impl ReplicaJournal {
                 owner.open_reader(ticket, partition, from).map(Some)
             }
             super::execution::Execution::Recovery(_) => Err(PartitionReadError::Unavailable.into()),
+        }
+    }
+
+    /// The next offset of `partition` at the commit point `view` was
+    /// installed with. `None` for a view this journal did not install, or
+    /// while a command holds the owner.
+    pub fn installed_end(&self, view: u64, partition: PartitionIncarnation) -> Option<Offset> {
+        match &self.execution {
+            super::execution::Execution::Normal(owner) => owner.installed_end(view, partition),
+            super::execution::Execution::Recovery(_) => None,
         }
     }
 

@@ -28,6 +28,9 @@ pub(crate) struct Limits {
 pub(crate) struct Directory {
     files: files::Files,
     faulted: bool,
+    /// The configuration and its name were synchronized by this owner and
+    /// not replaced since, so later checks only compare its bytes.
+    configuration_durable: bool,
 }
 
 impl Directory {
@@ -41,6 +44,7 @@ impl Directory {
         Ok(Self {
             files: self.files.clone(),
             faulted: false,
+            configuration_durable: self.configuration_durable,
         })
     }
 
@@ -97,6 +101,7 @@ impl Directory {
         Ok(Self {
             files: files::Files::open(root, io, limits, true).await?,
             faulted: false,
+            configuration_durable: false,
         })
     }
 
@@ -109,7 +114,14 @@ impl Directory {
         Ok(Self {
             files: files::Files::open(root, io, limits, false).await?,
             faulted: false,
+            configuration_durable: false,
         })
+    }
+
+    /// The configuration file is about to change outside this object, so
+    /// the next check synchronizes it again.
+    pub(crate) const fn configuration_replaced(&mut self) {
+        self.configuration_durable = false;
     }
 
     pub(crate) const fn is_faulted(&self) -> bool {
@@ -192,7 +204,7 @@ impl Directory {
         &mut self,
         target: &str,
         temporary: &str,
-        bytes: &[u8],
+        bytes: &bytes::Bytes,
     ) -> Result<(), DirectoryError> {
         self.files.check(target, bytes.len())?;
         self.files.check(temporary, bytes.len())?;
@@ -203,6 +215,9 @@ impl Directory {
             return Err(
                 io::Error::new(io::ErrorKind::InvalidInput, "invalid metadata temporary").into(),
             );
+        }
+        if target == crate::directory::CONFIGURATION_FILE {
+            self.configuration_durable = false;
         }
         self.begin()?;
         let result = publication::replace_reusable(&mut self.files, target, temporary, bytes).await;

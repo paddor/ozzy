@@ -284,6 +284,29 @@ pub(super) fn close(controller: &mut Controller, actor: Scheduled) {
     panic!("scheduled actor shutdown did not drain");
 }
 
+/// Drain `actors` together, as a shard does: jobs that wait for the lane
+/// they share are polled when woken.
+pub(super) fn close_all(controller: &mut Controller, actors: impl IntoIterator<Item = Scheduled>) {
+    let mut closing: Vec<_> = (actors.into_iter())
+        .map(|actor| Some(Box::pin(actor.shutdown())))
+        .collect();
+    for _ in 0..10000 {
+        for slot in &mut closing {
+            if let Some(drain) = slot
+                && let Poll::Ready(result) = poll(drain.as_mut())
+            {
+                result.unwrap();
+                *slot = None;
+            }
+        }
+        if closing.iter().all(Option::is_none) {
+            return;
+        }
+        settle(controller, &[]);
+    }
+    panic!("scheduled actors did not drain");
+}
+
 #[test]
 fn shared_scheduler_preserves_other_groups_under_stalled_storage_and_full_transport() {
     let (mut controller, io) = setup();
@@ -345,9 +368,10 @@ fn shared_scheduler_preserves_other_groups_under_stalled_storage_and_full_transp
         }
     }
     assert!(confirmed);
-    for actor in blocked.into_iter().chain(middle).chain(last) {
-        close(&mut controller, actor);
-    }
+    close_all(
+        &mut controller,
+        blocked.into_iter().chain(middle).chain(last),
+    );
 }
 
 #[test]

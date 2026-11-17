@@ -38,6 +38,9 @@ mod liveness;
 #[path = "support/driver_deadline.rs"]
 mod deadline;
 
+#[path = "support/driver_resume.rs"]
+mod resume;
+
 fn wire_control(from: u8, control: Control) -> Control {
     let session = LinkSessionId::from_bytes([11; 16]);
     let mut metadata = [0; 184];
@@ -542,7 +545,9 @@ fn a_recovering_election_primary_ends_its_view_before_the_deadline() {
     )
     .unwrap();
     let mut replica = ReplicaDriver::from_view_change(changing, Duration::ZERO, timing()).unwrap();
-    let now = Duration::ZERO;
+    // A restarted backup first waits to rejoin its view; nobody lets it.
+    assert_eq!(replica.poll(Duration::ZERO).unwrap(), None);
+    let now = timing().election_timeout;
     persist(&mut replica, now);
     assert_eq!(replica.scope().view, 3, "voter 0 leads this view");
     start(&mut replica, now);
@@ -694,4 +699,78 @@ fn normal_driver_releases_committed_work_but_io_failure_fences_future_actions() 
             )
             .is_err()
     );
+}
+
+/// A ready primary that hears no backup for the primary timeout is in
+/// doubt, without suspecting its view. A backup's acknowledgment ends it.
+#[test]
+fn a_primary_that_hears_no_backup_doubts_until_one_acknowledges() {
+    let mut primary = driver(normal(0));
+    let mut backup = driver(normal(1));
+    let at = Duration::from_millis;
+    let exits =
+        |action: Option<Action>| matches!(action, Some(Action::Broadcast(Control::ExitView(_))));
+    assert!(!primary.primary_doubt());
+    assert!(!exits(primary.poll(at(99)).unwrap()));
+    assert!(!primary.primary_doubt());
+    assert!(!exits(primary.poll(at(100)).unwrap()));
+    assert!(primary.primary_doubt());
+    // Backups never doubt: their own contact timeout covers a lost primary.
+    backup.poll(at(100)).unwrap();
+    assert!(!backup.primary_doubt());
+    let ack = backup.normal().unwrap().acknowledgment().unwrap();
+    primary
+        .receive(node(1), Control::PrepareOk { ack }, at(150))
+        .unwrap();
+    assert!(!primary.primary_doubt());
+    while primary.poll(at(150)).unwrap().is_some() {}
+    assert_eq!(primary.next_deadline(), Some(at(160)));
+    primary.poll(at(249)).unwrap();
+    assert!(!primary.primary_doubt());
+    primary.poll(at(250)).unwrap();
+    assert!(primary.primary_doubt());
+    assert!(primary.normal().is_some());
+}
+
+/// A ready primary with nothing uncommitted leaves for the first later view
+/// its target leads and promises it like any election. Anything else
+/// refuses, and an uncommitted operation makes it wait.
+#[test]
+fn a_ready_primary_steps_down_to_the_view_its_target_leads() {
+    let now = Duration::from_millis(5);
+    let wrong = |result: Result<Option<u64>, DriverError>| {
+        matches!(
+            result,
+            Err(DriverError::Replication(ReplicationError::WrongRole))
+        )
+    };
+    let mut backup = driver(normal(1));
+    assert!(wrong(backup.step_down(node(2), now)));
+    let mut primary = driver(normal(0));
+    assert!(wrong(primary.step_down(node(0), now)));
+    assert!(matches!(
+        primary.step_down(node(9), now),
+        Err(DriverError::Replication(ReplicationError::UnknownVoter))
+    ));
+    let Admission::Write { .. } = primary
+        .prepare(node(0), configuration().scope(), &[operation()], now)
+        .unwrap()
+    else {
+        panic!("new operation");
+    };
+    assert_eq!(primary.step_down(node(2), now).unwrap(), None);
+    assert!(primary.normal().is_some());
+
+    for (target, view) in [(1, 1), (2, 2)] {
+        let mut primary = driver(normal(0));
+        assert_eq!(primary.step_down(node(target), now).unwrap(), Some(view));
+        assert!(primary.normal().is_none());
+        assert_eq!(primary.scope().view, view);
+        persist(&mut primary, now);
+        let Control::StartViewChange(start) = start(&mut primary, now) else {
+            panic!("first-phase message");
+        };
+        assert_eq!(start.scope.view, view);
+        assert!(wrong(primary.step_down(node(target), now)));
+    }
 }

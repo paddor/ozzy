@@ -27,6 +27,10 @@ impl Service {
         // These bits constrain the authorized profile. They do not authorize
         // a routing identity or establish replication membership.
         validate_roles(kind, hello.parameters.roles)?;
+        if packet.envelope.sender != peer {
+            return Err(ReceiveError::Peer);
+        }
+        self.check_origin(peer, kind, hello.origin)?;
         let handled = self.sessions.receive(peer, packet)?;
         let link = match handled.replaced {
             Some(established) => {

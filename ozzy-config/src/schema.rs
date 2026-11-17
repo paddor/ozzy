@@ -17,6 +17,34 @@ pub struct Deployment {
     pub brokers: BTreeMap<String, Broker>,
     /// Named topic policies and partition counts.
     pub topics: BTreeMap<String, Topic>,
+    /// The class of logs an embedder creates while the broker runs. Omitted
+    /// refuses every such log.
+    pub logs: Option<LogClass>,
+}
+
+/// One class for every log created at run time. Such a log has one
+/// partition, one writer, and no retention policy, deduplication or delay
+/// of its own. The class is fixed while any of its logs exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogClass {
+    /// Physical bytes per segment file of a log that names no size of its
+    /// own.
+    #[serde(default = "default_log_segment_bytes")]
+    pub segment_bytes: u64,
+    /// Maximum canonical append body.
+    #[serde(default = "default_log_append_bytes")]
+    pub max_append_bytes: u64,
+    /// Logs one broker may hold at once.
+    pub max_logs: usize,
+}
+
+impl LogClass {
+    /// Whether a log of this class may have segments of `bytes`: at least
+    /// 1 MiB, aligned to 4 KiB, and twice the class's append bound.
+    pub const fn segment_fits(&self, bytes: u64) -> bool {
+        bytes >= 1024 * 1024 && bytes.is_multiple_of(4096) && self.max_append_bytes <= bytes / 2
+    }
 }
 
 /// Deployment authority, independent of local topology.
@@ -163,6 +191,23 @@ pub struct TopicDeduplication {
     pub max_bytes: u64,
 }
 
+impl Default for Topic {
+    /// The topic an empty `[topics.<name>]` table configures.
+    fn default() -> Self {
+        Self {
+            id: None,
+            partitions: default_partitions(),
+            partitioner_seed: 0,
+            segment_bytes: default_segment_bytes(),
+            max_append_bytes: default_append_bytes(),
+            retention: TopicRetention::default(),
+            deduplication: None,
+            delay: None,
+            producer_idle_secs: default_producer_idle(),
+        }
+    }
+}
+
 impl Topic {
     /// The fixed maximum delay in milliseconds, when delay is enabled.
     pub fn delay_max_millis(&self) -> Option<std::num::NonZeroU64> {
@@ -203,7 +248,7 @@ const fn default_dedup_window() -> u64 {
     300_000
 }
 
-const fn default_producer_idle() -> u64 {
+pub(crate) const fn default_producer_idle() -> u64 {
     7 * 24 * 60 * 60
 }
 
@@ -238,6 +283,14 @@ const fn default_segment_bytes() -> u64 {
 
 const fn default_append_bytes() -> u64 {
     MAX_APPEND_BYTES
+}
+
+const fn default_log_segment_bytes() -> u64 {
+    2 * 1024 * 1024
+}
+
+const fn default_log_append_bytes() -> u64 {
+    1024 * 1024
 }
 
 /// Ozzy-owned CPU affinity. OS identifiers, not hwloc logical indexes.
@@ -373,6 +426,17 @@ pub struct Device {
     #[serde(default)]
     /// Controller-wide execution and retention bounds.
     pub workers: StorageWorkers,
+}
+
+impl Device {
+    /// A device at `root` on `controller` with the default workers.
+    pub fn new(root: impl Into<PathBuf>, controller: impl Into<String>) -> Self {
+        Self {
+            root: root.into(),
+            controller: controller.into(),
+            workers: StorageWorkers::default(),
+        }
+    }
 }
 
 /// Pool sharing is by controller within one broker, not by partition.

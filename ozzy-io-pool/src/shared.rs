@@ -6,8 +6,8 @@ use crate::parking::{DATA, PROGRESS, Parking};
 use ozzy_io::signal::CloseSignal;
 use ozzy_io::{Admission, HandleOwner, Limits, lock_unpoisoned};
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::task::Wake;
 
 #[derive(Debug)]
@@ -24,6 +24,13 @@ pub(super) struct Shared {
     pub(super) handles: HandleOwner,
     pub(super) files: Mutex<files::Files>,
     pub(super) reclamation: Mutex<()>,
+    /// Keys of handles nobody holds any more, for the next reclamation.
+    pub(super) lapsed: Mutex<Vec<u64>>,
+    /// Held shared while a parked handle opens its path again, and
+    /// exclusively while a rename or removal changes paths.
+    pub(super) paths: RwLock<()>,
+    /// Counts handle uses, to order them.
+    uses: AtomicU64,
     pub(super) direct: Option<Arc<direct::Shared>>,
     pub(super) max_inflight: usize,
     #[cfg(test)]
@@ -60,6 +67,9 @@ impl Shared {
             handles: handles.clone(),
             files: Mutex::new(files::Files::new(config.handles, limits.shards, handles)),
             reclamation: Mutex::new(()),
+            lapsed: Mutex::new(Vec::new()),
+            paths: RwLock::new(()),
+            uses: AtomicU64::new(0),
             direct,
             max_inflight: config.max_inflight,
             #[cfg(test)]
@@ -137,6 +147,13 @@ impl Shared {
         self.fail();
         self.worker_finished();
     }
+    /// The number of the handle use that starts now. Later uses get
+    /// larger numbers.
+    pub(super) fn now(&self) -> u64 {
+        // Relaxed: the numbers only rank handles for parking.
+        self.uses.fetch_add(1, Ordering::Relaxed)
+    }
+
     pub(super) fn files(&self) -> MutexGuard<'_, files::Files> {
         lock_unpoisoned(&self.files)
     }
@@ -153,7 +170,8 @@ impl Shared {
         // Another worker must not reserve between registry removal and physical
         // close. This lock belongs only to storage workers, never shard handles.
         let _reclamation = lock_unpoisoned(&self.reclamation);
-        let retired = self.files().reclaim();
+        let lapsed = std::mem::take(&mut *lock_unpoisoned(&self.lapsed));
+        let retired = self.files().reclaim(&lapsed);
         // Closing a descriptor may block. Never hold the lookup lock for it.
         drop(retired);
         action(&mut self.files())

@@ -166,6 +166,12 @@ async fn small_appends_and_expiry_fit_a_small_owner_with_a_large_identity_capaci
             ),
         )
         .unwrap();
+        // The shard runs the cleanup a turn captured, then the spare job.
+        if let Some(work) = journal.take_cleanup_work() {
+            let done = drive(&mut controller, Box::pin(work.run()));
+            journal.complete_cleanup(done);
+        }
+        ready_spare(&mut controller, &mut journal);
         if let Some(buffer) = turn.proposal {
             let validated = ready(drive(
                 &mut controller,

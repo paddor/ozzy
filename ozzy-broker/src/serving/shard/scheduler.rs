@@ -39,6 +39,7 @@ impl State {
         // Send what the visits queued in this turn, not at the next wakeup.
         self.outbound.poll(cx, &mut binding.port, now)?;
         self.install_recovered(binding)?;
+        self.poll_logs(cx, binding, now)?;
         self.poll_bootstrap(cx)?;
         // Installed once the frontend binding exists; startup turns have none.
         if let Some(publisher) = &mut self.publisher {
@@ -91,7 +92,7 @@ impl State {
         (0..count.min(16)).map(move |offset| (first + offset) % count)
     }
 
-    fn sync_group(
+    pub(super) fn sync_group(
         &mut self,
         group: GroupId,
         binding: &Binding,
@@ -204,7 +205,19 @@ impl State {
                 .bind_receive_owner(&self.replica_memory)
                 .map_err(failure)?;
             actor.enable_publication();
-            let (bootstrap, native, coordinator) = super::build::recovered_services(
+            if index >= self.fixed {
+                // A runtime log has a log service only.
+                let (bootstrap, lane) = super::build::recovered_log(actor, plan)?;
+                self.actors.attach_log_lane(group, lane).map_err(failure)?;
+                self.bootstrap[index] = Some(bootstrap);
+                continue;
+            }
+            let super::build::RecoveredServices {
+                bootstrap,
+                native,
+                coordinator,
+                lane,
+            } = super::build::recovered_services(
                 actor,
                 plan,
                 &self.config,
@@ -217,6 +230,7 @@ impl State {
             self.actors
                 .install_coordinator(coordinator, binding.links.clone())
                 .map_err(failure)?;
+            self.actors.attach_log_lane(group, lane).map_err(failure)?;
             self.actors
                 .install_readers(
                     group,
@@ -241,14 +255,29 @@ impl State {
             .next_deadline()
             .into_iter()
             .chain(self.outbound.next_retry(now))
+            .chain(
+                self.runtime
+                    .as_ref()
+                    .and_then(|logs| logs.settling.next_deadline()),
+            )
             .min()
     }
 
     /// Every local partition accepts client work here or knows its remote leader.
     pub(super) fn serving(&self) -> bool {
-        self.identities
-            .iter()
-            .all(|&(group, partition)| self.client_ready(group, partition))
+        self.logs_settled()
+            && self
+                .identities
+                .iter()
+                .all(|&(group, partition)| self.client_ready(group, partition))
+    }
+
+    /// Whether a runtime log knows its leader. A log that left the shard
+    /// waits for none.
+    pub(super) fn log_ready(&self, log: GroupId) -> bool {
+        self.indices
+            .get(&log)
+            .is_none_or(|&index| self.client_ready(log, self.identities[index].1))
     }
 
     /// The partition finished its bootstrap here, or a remote leader serves it.

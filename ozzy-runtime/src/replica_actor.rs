@@ -39,6 +39,7 @@ pub use native::{
 mod reader_cursor;
 mod release_turns;
 mod response;
+mod rest;
 mod retention_turns;
 mod shared_readers;
 pub use shared_readers::SharedReaderConfig;
@@ -47,9 +48,12 @@ mod scheduled;
 mod startup;
 mod status;
 pub use scheduled::{ScheduleError, ScheduledReplica};
+mod log_service;
+pub use log_service::LogLane;
 mod partitions;
 pub use partitions::{
     PartitionActor, PartitionActors, PartitionError, PartitionStatus, SessionReplacement,
+    Uninserted,
 };
 mod routes;
 pub use routes::{RoutePublicationError, RoutePublisher};
@@ -74,7 +78,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use omq_tokio::Message;
 use ozzy_proto::{LinkSessionId, NodeId};
-use ozzy_replication::driver::{Action, DriverError, ReplicaDriver, Timing};
+use ozzy_replication::driver::{Action, CleanStop, DriverError, ReplicaDriver, Timing};
 use ozzy_replication::wire::{self, Control, PeerBinding, ReplicaMessage, WireLimits};
 use ozzy_replication::{
     Configuration, JournalGeneration, LogSource, NormalReplica, PipelineLimits, Prefix,
@@ -92,6 +96,8 @@ pub struct ReplicaActor {
     maintenance: maintenance::Turns,
     releases: release_turns::Releases,
     startup_probe: Option<startup::Probe>,
+    /// Whether the driver's timeouts began, at the first turn.
+    timed: bool,
     recovery_required: bool,
     donors: Option<Box<donors::Donors>>,
     configuration: Configuration,
@@ -142,6 +148,7 @@ pub struct ReplicaActor {
     ingress: ingress::Ingress,
     submitters: Vec<ProposalSubmitter>,
     work: normal::Work,
+    rest: rest::Rest,
 }
 
 impl ReplicaActor {
@@ -187,20 +194,37 @@ impl ReplicaActor {
     }
 
     async fn shutdown(&mut self) -> Result<(), ActorError> {
+        self.stop().await.map(drop)
+    }
+
+    /// Shut down, and say whether this was a primary whose whole log was
+    /// durable. Nothing is admitted or sent from here on, so that evidence
+    /// holds once the journal has drained.
+    async fn stop(&mut self) -> Result<Option<CleanStop>, ActorError> {
+        let stop = self.driver.clean_stop();
         self.publish_status(false);
         self.ingress.close();
-        self.journal.shutdown().await.map_err(ActorError::Journal)
+        self.journal.shutdown().await.map_err(ActorError::Journal)?;
+        Ok(stop)
     }
 
     fn advance(&mut self, now: Duration) -> Result<(), ActorError> {
         // Work marked during this turn stays for the next observation.
         self.more_work = false;
         self.ingress.begin_round();
+        if !std::mem::replace(&mut self.timed, true) {
+            // The shard may reach a new actor long after it was built.
+            self.driver.begin_timing(now)?;
+        }
         if self.startup_round(now)? {
             self.publish_status(true);
             return Ok(());
         }
         self.observe_storage(now)?;
+        self.rest_round(now);
+        self.maintenance
+            .retention
+            .observe_floor(self.journal.owner_floor(), now);
         // At most four fixed controls (eight destinations), one history chunk,
         // and one disk submission per iteration. Each chunk has byte/count bounds.
         for _ in 0..4 {
@@ -255,13 +279,14 @@ impl ReplicaActor {
             Action::Broadcast(Control::Commit(commit)) => {
                 for voter in 0..3 {
                     if self.configuration.voters()[voter] != self.local {
-                        self.announce(voter, commit, true)?;
+                        self.heartbeat(voter, commit)?;
                     }
                 }
             }
             Action::Broadcast(control) => {
-                for to in *self.configuration.voters() {
-                    if to != self.local {
+                let installed = matches!(control, Control::StartView(_));
+                for (voter, to) in (*self.configuration.voters()).into_iter().enumerate() {
+                    if to != self.local && !(installed && self.rests(voter)) {
                         self.control(to, control)?;
                     }
                 }
@@ -362,6 +387,7 @@ impl ReplicaActor {
                 if matches!(control, Control::StartView(_)) {
                     self.ack_at = now;
                 }
+                self.receive_rest(index, control, now)?;
             }
             ReplicaMessage::FetchOps(request) => self.serve(from, request)?,
             ReplicaMessage::Ops(batch) => self.receive_ops(&batch, now)?,
@@ -376,15 +402,17 @@ impl ReplicaActor {
     }
 
     fn ack(&mut self, now: Duration) -> Result<(), ActorError> {
-        if now < self.ack_at {
+        // A resting backup's vote is covered by its broker's beats.
+        if now < self.ack_at || self.resting_backup() {
             return Ok(());
         }
-        let retransmit = self.config.timing.retransmit;
-        self.ack_at = now.saturating_add(retransmit);
+        // A primary has no vote to repeat, so it keeps no timer for one.
         let primary = self.configuration.primary(self.driver.scope().view);
         if primary == self.local {
             return Ok(());
         }
+        let retransmit = self.config.timing.retransmit;
+        self.ack_at = now.saturating_add(retransmit);
         let Some(normal) = self.driver.normal() else {
             return Ok(());
         };

@@ -187,7 +187,15 @@ impl OwnedJournal {
             held.aim(carry.filter(|_| leader));
         }
         let Some((partition, plan)) = planned else {
-            return Ok(RetentionTurn::idle(false));
+            // Unlimited retention still frees what a view change replaced.
+            // Turns repeat until a pass leaves nothing, then stop until the
+            // selection changes again.
+            self.clean_unselected(ticket).await?;
+            let owed = self.cleanup_pending()?;
+            return Ok(RetentionTurn {
+                more_work: owed,
+                ..RetentionTurn::idle(owed)
+            });
         };
         self.clean_unselected(ticket).await?;
         if self.floors_pending(partition, &plan)? {

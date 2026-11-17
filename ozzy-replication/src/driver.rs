@@ -14,10 +14,12 @@ mod exit_view;
 mod installation;
 mod poll;
 mod receive;
+mod rest;
+mod step_down;
 mod storage;
 mod validation;
 
-pub use installation::ActivationTicket;
+pub use installation::{ActivationTicket, CleanStop};
 pub use validation::ValidationTicket;
 
 use std::time::Duration;
@@ -112,6 +114,8 @@ pub struct ReplicaDriver {
     timing: Timing,
     now: Duration,
     contact_deadline: Duration,
+    /// When a backup of this view last acknowledged, or when the role began.
+    backup_heard_at: Duration,
     progress_deadline: Duration,
     persistence_deadline: Duration,
     /// When busy local storage last completed work; `None` while idle.
@@ -142,9 +146,21 @@ pub struct ReplicaDriver {
     /// Voters asking to leave a view newer than this normal voter's. Each gets
     /// a request to leave this view, which it answers with its fence.
     stale_answers: VoterSet,
+    /// Voters whose liveness the adapter proves by other means in this view.
+    covered: VoterSet,
+    /// A resting primary sends no heartbeat.
+    heartbeat: rest::Heartbeat,
 }
 
 impl ReplicaDriver {
+    /// Give a normal replica's unused reserved capacity back. It grows again
+    /// with use. For a replica that expects to stay idle.
+    pub fn trim(&mut self) {
+        if let Role::Normal(replica) = &mut self.role {
+            replica.trim();
+        }
+    }
+
     /// Attach scheduling to a bootstrapped or completely installed normal core.
     /// Intact restart must instead enter the existing nonvoting recovery path.
     pub fn from_normal(
@@ -192,6 +208,7 @@ impl ReplicaDriver {
             timing,
             now,
             contact_deadline: now.saturating_add(timing.primary_timeout),
+            backup_heard_at: now,
             persistence_deadline: now.saturating_add(timing.primary_timeout),
             storage_busy_since: None,
             progress_deadline: now
@@ -219,7 +236,24 @@ impl ReplicaDriver {
             exit_echo_at: Voters::splat(Duration::ZERO),
             fence_answers: VoterSet::EMPTY,
             stale_answers: VoterSet::EMPTY,
+            covered: VoterSet::EMPTY,
+            heartbeat: rest::Heartbeat::Sending,
         })
+    }
+
+    /// Begin every timeout at `now`, the adapter's first turn. The driver is
+    /// built before that turn, and the time until then is evidence of
+    /// nothing: no peer was heard or asked yet.
+    pub fn begin_timing(&mut self, now: Duration) -> Result<(), DriverError> {
+        self.observe_time(now)?;
+        let timing = self.timing;
+        self.contact_deadline = now.saturating_add(timing.primary_timeout);
+        self.backup_heard_at = now;
+        self.persistence_deadline = now.saturating_add(timing.primary_timeout);
+        self.progress_deadline = now.saturating_add(self.progress_timeout());
+        self.election_deadline = now.saturating_add(self.election_delay);
+        self.retry_at = self.retry_at.max(now);
+        Ok(())
     }
 
     /// Inspect normal evidence. No mutable access can bypass scheduling/fencing.
@@ -354,7 +388,9 @@ impl ReplicaDriver {
     fn normal_timed_out(&self, snapshot: &ReplicaSnapshot) -> bool {
         let primary = VoterIndex::primary(snapshot.scope.view) == self.local;
         let outstanding = snapshot.accepted != snapshot.committed || !snapshot.ready_for_appends;
-        (!primary && self.now >= self.contact_deadline)
+        (!primary
+            && !self.primary_covered(VoterIndex::primary(snapshot.scope.view))
+            && self.now >= self.contact_deadline)
             || (outstanding && self.now >= self.progress_deadline)
             || (snapshot.accepted.op > snapshot.journal.durable
                 && self.now >= self.persistence_deadline)
@@ -387,6 +423,7 @@ impl ReplicaDriver {
         }
         self.exit_votes = VoterSet::EMPTY;
         self.exit_retry_at = None;
+        self.uncover_all();
         // A new view is not durably promised yet, and this voter left the
         // view it would ask others to leave.
         self.fence_answers = VoterSet::EMPTY;

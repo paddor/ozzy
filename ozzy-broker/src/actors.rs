@@ -109,6 +109,7 @@ impl ActorSettings {
         checked: &CheckedConfig,
         placement: &PartitionPlacement,
         config: &JournalConfig,
+        sharers: usize,
     ) -> Result<Self, StartupError> {
         let journal = ShardJournalConfig::default();
         // Unlimited retention still sweeps idle producer sessions, once per
@@ -127,7 +128,7 @@ impl ActorSettings {
                 return Ok(Self::Local(LocalActorConfig {
                     retention_interval,
                     journal,
-                    proposal_lanes: 3,
+                    proposal_lanes: 4,
                     proposal_capacity: config.append_limits.max_operations,
                     turn_steps: 16,
                     evidence_quiet: EVIDENCE_QUIET,
@@ -135,7 +136,7 @@ impl ActorSettings {
             }
         };
         let pipeline = config.append_limits;
-        let replay_cache = replay_cache_limits(checked, placement, pipeline)?;
+        let replay_cache = replay_cache_limits(checked, placement, pipeline, sharers)?;
         let transfer = common_transfer(checked, pipeline)?;
         let data = data_queue(transfer)?;
         let installation = installation_config(config)?;
@@ -160,7 +161,7 @@ impl ActorSettings {
                 transfer,
                 sync_batch_target: SyncBatchTarget::half_window(pipeline),
                 evidence_quiet: EVIDENCE_QUIET,
-                proposal_lanes: 3,
+                proposal_lanes: 4,
                 proposal_capacity: pipeline.max_operations,
                 control: QueueLimits {
                     messages: 8,
@@ -237,6 +238,7 @@ fn replay_cache_limits(
     checked: &CheckedConfig,
     placement: &PartitionPlacement,
     pipeline: PipelineLimits,
+    partitions_on_shard: usize,
 ) -> Result<PipelineLimits, StartupError> {
     let shard = checked
         .plan
@@ -244,12 +246,6 @@ fn replay_cache_limits(
         .iter()
         .find(|shard| shard.id == placement.shard)
         .ok_or_else(|| StartupError::Runtime("partition has no application shard".into()))?;
-    let partitions_on_shard = checked
-        .plan
-        .partitions
-        .iter()
-        .filter(|partition| partition.shard == placement.shard)
-        .count();
     if partitions_on_shard == 0 {
         return Err(StartupError::Runtime(
             "partition has no shard placement".into(),
@@ -272,6 +268,16 @@ fn replay_cache_limits(
 }
 
 impl OpenedPartition {
+    /// Supply the evidence, if any, that this copy stopped cleanly as the
+    /// primary of its view. The caller removed it from the disk first.
+    #[must_use]
+    pub fn stopped_cleanly(mut self, stop: Option<ozzy_replication::driver::CleanStop>) -> Self {
+        if let (Some(stop), PartitionAuthority::Replicated(startup)) = (stop, &mut self.authority) {
+            startup.clean_stop(stop);
+        }
+        self
+    }
+
     /// Construct on the assigned shard after journal startup. Sessions come
     /// from the broker's established link table, never incoming packet claims.
     /// Absent brokers remain unbound; startup does not wait for their links.

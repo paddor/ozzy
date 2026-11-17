@@ -179,6 +179,12 @@ impl Writer {
         result.map_err(Into::into)
     }
 
+    /// Hand a settled segment to a new journal owner generation.
+    pub(crate) fn rebind(&mut self, generation: JournalGeneration) -> Result<(), WriterError> {
+        self.healthy()?;
+        self.state.rebind(generation)
+    }
+
     /// Validated physical segment header.
     pub const fn header(&self) -> &SegmentHeader {
         self.state.header()
@@ -227,6 +233,11 @@ impl Writer {
             .collect();
         self.append_with_limits_and_digests(operations, &digests, encoding, limits)
             .await
+    }
+
+    /// Give the reserved encode buffer back. Appends grow it as they need.
+    pub(crate) fn release_encode_buffer(&mut self) {
+        self.state.encode_buffer = Vec::new();
     }
 
     pub(crate) fn reserve_encode_buffer(

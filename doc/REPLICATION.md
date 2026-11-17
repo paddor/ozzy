@@ -17,6 +17,9 @@ terms.
 - The leader of view `v` is `brokers[v % 3]` in the persisted member order.
   Only an election activates it. `init` rotates the order per partition to
   spread leaders.
+- A runtime log names its own members: one broker makes it single durable
+  on that broker, three make it a group of its own. Brokers that are not
+  members hold no copy and drop its traffic.
 - One remaining broker never confirms. There is no forced promotion, lower
   quorum, or discard of confirmed history.
 - `CONFIGURATION` (256 bytes replicated, 128 bytes single durable) binds group
@@ -111,6 +114,15 @@ request from the view's primary is suspicion too: that primary cannot
 install its view. A restart's retained-history probe still votes and is
 not suspicion.
 
+A ready leader that gets no acknowledgment from either follower for the
+primary timeout is in doubt. Doubt is not suspicion and moves no view: it
+only tells an embedder's log to refuse appends, which could not commit.
+The next acknowledgment in the view ends it.
+
+A ready leader with nothing uncommitted may step down: it leaves its view
+for the next one a named follower leads, and the ordinary election runs.
+The follower leads only once it installs that view.
+
 | Step | Gate |
 | --- | --- |
 | Suspicion | Two brokers send EXIT_VIEW for the current view |
@@ -165,12 +177,39 @@ not suspicion.
 - Equal-ranked reports with different digests halt selection. Missing
   ancestry is never an empty suffix.
 
+## Rest
+
+An idle partition sends nothing. Its brokers prove each other alive with one
+[BEAT](PROTOCOL.md#beats) per broker pair every 100 ms instead of heartbeats
+and votes per partition.
+
+- A leader with nothing uncommitted, unapplied, or undurable sends REST as
+  its heartbeat. REST names the leader's shard and that shard's epoch. A
+  follower in the same state at the same commit answers REST_OK with its own.
+  Each side then rests toward the other.
+- A resting follower expects no contact and sends no vote. A leader sends a
+  resting follower no heartbeat and no START_VIEW, and is not in doubt. Once
+  every follower rests or has no link, the leader's heartbeat timer stops.
+- A side trusts the other while that broker's beats arrive on the same
+  session, name the agreed shard and epoch, and the last one is younger than
+  the primary timeout. When that fails, contact and doubt count from the last
+  beat, so a resting partition fails over as fast as a busy one.
+- Any other replica control from the peer ends the rest, and so does local
+  work: an accepted operation makes the leader and its followers speak again.
+- A voter that leaves its view while a peer may still trust it changes its
+  shard's epoch, at most once per beat interval. So does a shard that loses
+  an actor or stops. A new epoch ends every rest agreed under the old one;
+  healthy partitions agree again on their next heartbeat.
+- A beat lists only shards that took a turn within half the primary timeout,
+  so a stalled shard ends the rests of its partitions.
+
 ## Restart
 
 ```mermaid
 stateDiagram-v2
     direction LR
     [*] --> Election: serve
+    [*] --> Voting: serve, copy rejoins its view
     [*] --> Nonvoting: recover
     Election --> Voting: view installed and activated
     Voting --> Election: view change
@@ -180,10 +219,50 @@ stateDiagram-v2
 ```
 
 - `format` creates a group. `serve` never creates missing identity or history.
+- `provision` formats for a broker without a local identity, which it
+  publishes last.
+- A broker names its store origin in HELLO and WELCOME: a hash of its
+  volume IDs, the same in every run on those stores. Each peer records
+  the first origin it sees, durably and before the link, and gives no
+  link to another one. A broker that lost its local identity and stores
+  provisions like a new one, but under a new origin: it cannot vote,
+  acknowledge, or count toward a quorum, and the other two keep serving.
+  It returns only with its old local identity, as a nonvoting copy.
+- The record starts at the first link. A broker emptied before a peer
+  ever linked to it is not told apart by that peer.
 - An intact reopen validates configuration, history, promises, and installed
-  lineage, then enters election with a fresh writer incarnation.
-- A restart never resumes old leader authority. It requests the next view or
-  resumes an uninstalled promise. A promise alone grants no authority.
+  lineage, and takes a fresh writer incarnation.
+- A leader may have sent operations it never stored, so a restarted
+  leader without evidence of a clean stop requests the next view. A copy
+  with an uninstalled promise resumes that election. A promise alone grants
+  no authority.
+- A follower of its last installed view rejoins that view. It installs its
+  own log there: the committed prefix stays, the tail after it is staged
+  again, and both publish atomically. Then it votes as before and catches
+  up from the leader. No view changes, so the leader keeps serving.
+- Rejoining is safe because a follower's restart is a pause. It
+  acknowledged only what its disk holds, and it promised no later view, or
+  the reopen would have found that promise. So its log still holds every
+  operation the leader counted its vote for, in the lineage the leader
+  wrote.
+- The right to rejoin ends when a peer shows a later view or the attempt
+  fails. The copy then requests the next view. A rejoined follower whose
+  leader is gone times out like any other.
+- A leader that stops cleanly, with its whole log durable, leaves evidence
+  of it: the view and the end of its log. A shard writes the evidence of
+  its runtime logs once it has stopped, and the next start removes it from
+  the disk before any log opens, so only that one start can use it. A
+  leader that finds its log as the evidence names it rejoins its view the
+  same way and leads it again. It stored everything it sent, so its
+  restart is a pause too.
+- A resumed leader announces its log under its new writer incarnation with
+  START_VIEW, also in view zero. Followers that kept running take it as
+  contact. A copy that never installed the view installs that log, which
+  may hold operations of the view itself. Fresh appends wait until a
+  follower acknowledges the whole log.
+- A view that an election installed starts with its whole log applied on
+  every follower, and a leader replays nothing at or below it. A resumed
+  leader replays from wherever a follower's receipt stands.
 - Each segment roll publishes the applied prefix as the commit. After a
   restart, installation keeps local history through it and fetches only the
   rest, and replays only after the state the reopen rebuilt.
@@ -318,5 +397,7 @@ wall clock. A broker whose clock disagrees with the others stops them.
   `view_change/`), recovery (`recovery/`), repair (`flow/`), single durable
   (`local.rs`).
 - `ozzy-runtime/src/replica_actor/` and `replica_journal/`: actors, startup
-  probe, donors, promises, installation, writeback.
+  probe, donors, promises, installation, writeback, rest (`rest.rs`,
+  `partitions/resting.rs`).
+- `ozzy-runtime/src/frontend/service/beats.rs`: beats.
 - `ozzy-broker/src/journals/recovery.rs`: `recover` intents.

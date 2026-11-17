@@ -57,6 +57,10 @@ impl Service {
                 self.receive_clock(peer, access.kind, packet, envelope)?;
                 return Ok(None);
             }
+            Opcode::Beat => {
+                self.receive_beat(peer, access.kind, packet, envelope)?;
+                return Ok(None);
+            }
             Opcode::ReplicaState => self.bind_incoming_channel(peer, packet, envelope)?,
             _ => {}
         }

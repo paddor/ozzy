@@ -189,7 +189,11 @@ impl OwnedJournal {
 
     /// Capture the selection for a cleanup job beside later writes.
     fn capture_cleanup(&mut self, owed: Owed) -> Result<(), JournalError> {
-        let files = self.journal.ready()?.capture_unselected()?;
+        // A store that wants no spare yet keeps no retired segment as one.
+        let discard = !self.spare_due(self.journal.ready()?);
+        let journal = self.journal.ready_mut()?;
+        journal.discard_retired(discard);
+        let files = journal.capture_unselected()?;
         self.retention.attempts += 1;
         self.retention.cleaning = Cleaning::Captured(Box::new(CleanupWork {
             attempt: self.retention.attempts,
@@ -270,6 +274,18 @@ impl OwnedJournal {
                 self.faulted = true;
             }
         }
+    }
+
+    /// Whether a pass is captured, running, or still owed for the selected
+    /// manifest. Objects a reader pins wait for the next selection.
+    pub(super) fn cleanup_pending(&self) -> Result<bool, JournalError> {
+        let generation = self.journal.ready()?.manifest().generation;
+        Ok(self.cleaning()
+            || self
+                .retention
+                .cleaned
+                .as_ref()
+                .is_none_or(|cleaned| cleaned.generation != generation))
     }
 
     /// Whether a cleanup pass is captured or running.

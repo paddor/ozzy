@@ -50,7 +50,7 @@ pub struct Carry {
     pub capacity: u64,
 }
 
-/// Operations a plan must keep.
+/// What a plan must keep, and what the partition's owner gave up.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Kept {
     /// Highest committed operation; segments past it stay.
@@ -58,6 +58,9 @@ pub struct Kept {
     /// Oldest operation still holding a scheduled record; its segment and
     /// every later one stay.
     pub held_operation: Option<u64>,
+    /// Committed record floor of a partition its owner trims. A sealed
+    /// segment whose records all lie below it retires without a target.
+    pub trimmed: Option<Offset>,
 }
 
 /// Invalid summaries, limits, or capacity arithmetic.
@@ -66,7 +69,8 @@ pub struct Kept {
 pub struct PlanError;
 
 impl Plan {
-    /// Age and byte targets independently expire the oldest prefix. Newer
+    /// Age and byte targets and the owner's trim independently expire the
+    /// oldest prefix. Newer
     /// timestamps or protected accepted operations stop age-based retirement.
     /// A segment holding the held operation or later stops both targets; when
     /// one would retire it, it is the carry target. Without a trusted `now`
@@ -103,7 +107,10 @@ impl Plan {
                 .max_bytes
                 .is_some_and(|limit| selected_bytes > limit.get());
             let aged = expired(segment);
-            if !oversized && !aged {
+            let trimmed = kept
+                .trimmed
+                .is_some_and(|floor| segment.record_end <= floor);
+            if !oversized && !aged && !trimmed {
                 break;
             }
             if kept

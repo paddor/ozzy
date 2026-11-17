@@ -564,3 +564,60 @@ fn encoding_rejections_leave_reusable_output_buffers_unchanged() {
     );
     assert_eq!(metadata, [0xaa; 120]);
 }
+
+#[test]
+fn rest_offers_and_acceptances_round_trip_their_beat_source() {
+    use ozzy_replication::{BeatSource, PrepareOk};
+    let source = BeatSource {
+        shard: 0x0102_0304,
+        epoch: 0x0506_0708_090a_0b0c,
+    };
+    let scope = configuration().scope();
+    let prefix = Prefix::GENESIS;
+    let binding = PeerBinding::new(configuration(), node(1), session()).unwrap();
+    for message in [
+        Control::Rest {
+            commit: Commit {
+                scope,
+                committed: prefix,
+            },
+            source,
+        },
+        Control::RestOk {
+            ack: PrepareOk {
+                scope,
+                durable: prefix,
+            },
+            source,
+        },
+    ] {
+        assert_eq!(message.scope(), scope);
+        let mut metadata = [0; 132];
+        assert!(encode_control(node(1), session(), message, &mut metadata[..131]).is_err());
+        let encoded = encode_control(node(1), session(), message, &mut metadata).unwrap();
+        assert_eq!(encoded.metadata_bytes, 132);
+        assert_eq!(metadata[120..], [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+        let frames: [&[u8]; 3] = [&encoded.header, &metadata, &[]];
+        assert_eq!(
+            decode(&frames, binding, WireLimits::default()),
+            Ok(ReplicaMessage::Control(message))
+        );
+        // A short or padded source is not a rest.
+        assert!(
+            decode(
+                &[&encoded.header, &metadata[..131], &[]],
+                binding,
+                WireLimits::default()
+            )
+            .is_err()
+        );
+    }
+    let ack = Control::RestOk {
+        ack: PrepareOk {
+            scope,
+            durable: prefix,
+        },
+        source,
+    };
+    assert_eq!(ack.acknowledged(), Some(prefix));
+}

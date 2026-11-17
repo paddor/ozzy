@@ -197,8 +197,11 @@ impl OwnedJournal {
             held.index = None;
             held.sealed_indexes = None;
         }
+        // A store that wants no spare yet keeps no retired segment as one.
+        let discard = !self.spare_due(self.journal.ready()?);
         self.faulted = true;
         let journal = self.journal.ready_mut()?;
+        journal.discard_retired(discard);
         let (mut pinned_segment_ids, mut pinned_checkpoint_ids) = (Vec::new(), Vec::new());
         let (removed_objects, reclaimed_bytes) = match kind {
             StorageCleanup::Indexes => {

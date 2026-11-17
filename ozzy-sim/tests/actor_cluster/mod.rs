@@ -811,7 +811,7 @@ fn rewound_disks_fail_the_run() {
         let reason = failure(seed, "none", "rewind");
         // A history check, not a startup or liveness failure.
         assert!(
-            reason.contains("Confirmed reports digest") || reason.contains("past the converged op"),
+            reason.contains("reports digest") || reason.contains("past the converged op"),
             "seed {seed}: {reason}"
         );
     }

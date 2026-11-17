@@ -1,5 +1,6 @@
 //! Broker lifecycle assembled from the production shard, journal, and frontend owners.
 
+mod beats;
 mod config;
 mod context;
 #[cfg(feature = "simulation")]
@@ -7,6 +8,7 @@ pub(crate) use context::CutPeers;
 pub use context::ServingContext;
 pub(crate) use context::{Alarm, Timer};
 mod drain;
+mod logs;
 mod outbound;
 mod shard;
 
@@ -32,8 +34,18 @@ pub struct Broker {
     application: ApplicationShards,
     frontend: Frontend,
     devices: DeviceDrain,
-    serving: Vec<tokio::sync::watch::Receiver<bool>>,
+    registered: Registered,
     clock: ozzy_runtime::frontend::ClockTrust,
+    logs: logs::LogHandles,
+}
+
+/// What the shards handed over at registration.
+#[derive(Debug)]
+struct Registered {
+    /// Each shard's serving observation.
+    serving: Vec<tokio::sync::watch::Receiver<bool>>,
+    /// Log handles by topic and partition number.
+    logs: BTreeMap<(String, u32), ozzy_runtime::log::Log>,
 }
 
 struct Registration {
@@ -44,6 +56,8 @@ struct Registration {
     data: DataSender,
     replica: DataSender,
     routes: Vec<ozzy_proto::directory::RouteState>,
+    /// Log handles of the shard's partitions, by topic and number.
+    logs: Vec<(String, u32, ozzy_runtime::log::Log)>,
     handoff: oneshot::Sender<Binding>,
 }
 
@@ -125,7 +139,9 @@ impl Broker {
         crate::frontend::configure_network(&omq, &checked.plan)?;
         let (owner, lanes) = DevicePools::start(&checked.plan)?;
         let storage = ShardStorage { lanes, owner };
-        Self::start_on_storage(checked, journals, omq.into(), storage).await
+        let mut context = ServingContext::from(omq);
+        context.origins = crate::origins::PeerOrigins::load(&checked, &local)?;
+        Self::start_on_storage(checked, journals, context, storage).await
     }
 
     /// Serve using an externally owned file backend. The caller must provision
@@ -155,12 +171,9 @@ impl Broker {
         context: ServingContext,
         storage: ShardStorage<B, impl StorageOwner>,
     ) -> Result<Self, StartupError> {
-        let mut config = config::Config::new(&checked, context)?;
-        let clock = config.time.sdk_clock();
-        let admin = Admin::bind(&checked, &config.omq, config.local, config.clients, clock)?;
-        config.admin = admin.as_ref().map(Admin::hooks);
-        let config = Arc::new(config);
+        let (config, admin) = bound_config(&checked, context)?;
         let checked = Arc::new(checked);
+        let logs = config.log_handles(journals.logs.clone());
         let shards = checked.plan.shards.len();
         let (application_start, frontend_start) = startup_groups(shards);
         let devices = DeviceDrain::new(
@@ -193,13 +206,14 @@ impl Broker {
         // Keep both startup observations alive: neither owner publishes ready
         // until the bounded two-way shard/frontend handoff has completed.
         let error = match futures::future::join(application, frontend).await {
-            (Ok(application), Ok((frontend, serving))) => {
+            (Ok(application), Ok((frontend, registered))) => {
                 return Ok(Self {
                     application,
                     frontend,
                     devices,
-                    serving,
+                    registered,
                     clock: config.clock.clone(),
+                    logs,
                 });
             }
             (Err(error), Err(_)) => error,
@@ -230,6 +244,15 @@ impl Broker {
         self.frontend.io_threads()
     }
 
+    /// The log of partition `partition` of `topic`, on every broker that
+    /// holds a copy. Its status tells whether this broker leads it.
+    pub fn log(&self, topic: &str, partition: u32) -> Option<ozzy_runtime::log::Log> {
+        self.registered
+            .logs
+            .get(&(topic.to_owned(), partition))
+            .cloned()
+    }
+
     /// What the clock guard last concluded about this broker's clock.
     pub fn clock(&self) -> ozzy_runtime::frontend::ClockStatus {
         self.clock.status()
@@ -242,7 +265,7 @@ impl Broker {
     pub fn ready(
         &self,
     ) -> impl std::future::Future<Output = Result<(), StartupError>> + Send + 'static + use<> {
-        let mut shards = self.serving.clone();
+        let mut shards = self.registered.serving.clone();
         async move {
             for shard in &mut shards {
                 shard
@@ -279,6 +302,19 @@ impl Broker {
     }
 }
 
+/// The serving configuration with the admin endpoint bound, when the
+/// deployment has one.
+fn bound_config(
+    checked: &CheckedConfig,
+    context: ServingContext,
+) -> Result<(Arc<config::Config>, Option<Admin>), StartupError> {
+    let mut config = config::Config::new(checked, context)?;
+    let clock = config.time.sdk_clock();
+    let admin = Admin::bind(checked, &config.omq, config.local, config.clients, clock)?;
+    config.admin = admin.as_ref().map(Admin::hooks);
+    Ok((Arc::new(config), admin))
+}
+
 /// Wait for every shard to register, then start the dispatcher. Its service
 /// hands each shard its links and port before serving.
 async fn start_frontend(
@@ -286,13 +322,17 @@ async fn start_frontend(
     config: &Arc<config::Config>,
     mut registrations: mpsc::Receiver<Registration>,
     startup: crate::shards::lifecycle::Registration,
-) -> Result<(Frontend, Vec<tokio::sync::watch::Receiver<bool>>), StartupError> {
+) -> Result<(Frontend, Registered), StartupError> {
     let mut registered = BTreeMap::new();
+    let mut logs = BTreeMap::new();
     for _ in &checked.plan.shards {
-        let registration: Registration = registrations
+        let mut registration: Registration = registrations
             .recv()
             .await
             .ok_or_else(|| failure("shard registration ended"))?;
+        for (topic, partition, log) in registration.logs.drain(..) {
+            logs.insert((topic, partition), log);
+        }
         if registered.insert(registration.id, registration).is_some() {
             return Err(failure("duplicate shard registration"));
         }
@@ -306,6 +346,10 @@ async fn start_frontend(
         let (mut service, handoffs) = serving_config.service(registered.into_values().collect())?;
         serving_config.handoff(&mut service, handoffs)?;
         frontend.sample_clock(serving_config.install_clock(&mut service));
+        serving_config.install_beats(&mut service);
+        if let Some(origins) = &serving_config.origins {
+            origins.install(&mut service);
+        }
         #[cfg(feature = "simulation")]
         frontend.cut_peers(serving_config.cut.clone());
         frontend
@@ -330,7 +374,7 @@ async fn start_frontend(
     };
     Frontend::start_registered(plan, Some(config.omq.clone()), factory, startup)
         .await
-        .map(|frontend| (frontend, serving))
+        .map(|frontend| (frontend, Registered { serving, logs }))
 }
 
 fn failure(error: impl std::fmt::Display) -> StartupError {

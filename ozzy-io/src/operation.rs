@@ -109,6 +109,14 @@ pub struct Metadata {
     pub length: u64,
 }
 
+/// Bytes a listing retains: the names it was asked by and its entries.
+fn listing_bytes(named: usize, max_entries: usize, max_name_bytes: usize) -> Option<usize> {
+    max_entries
+        .checked_mul(size_of::<Entry>())?
+        .checked_add(max_name_bytes)?
+        .checked_add(named)
+}
+
 /// One owned directory name and its backend-reported type.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Entry {
@@ -213,6 +221,20 @@ pub enum Operation {
         /// Maximum aggregate name storage retained by this listing.
         max_name_bytes: usize,
     },
+    /// One page of a listing of any size: the entries whose names sort
+    /// right after `after`, as many as the bounds admit, in name order. An
+    /// empty page ends the listing.
+    ReadDirectoryPage {
+        /// Backend path to the target entry.
+        path: PathBuf,
+        /// The last name of the page before. `None` asks for the first page.
+        after: Option<OsString>,
+        /// Maximum entries retained by this page. At least one.
+        max_entries: usize,
+        /// Maximum aggregate name storage retained by this page. A name
+        /// that does not fit alone fails the page.
+        max_name_bytes: usize,
+    },
     /// Create one directory, refusing an existing entry.
     CreateDirectory {
         /// Backend path to the target entry.
@@ -289,10 +311,17 @@ impl Operation {
                 path,
                 max_entries,
                 max_name_bytes,
-            } => max_entries
-                .checked_mul(size_of::<Entry>())
-                .and_then(|bytes| bytes.checked_add(*max_name_bytes))
-                .and_then(|bytes| bytes.checked_add(path.capacity())),
+            } => listing_bytes(path.capacity(), *max_entries, *max_name_bytes),
+            Self::ReadDirectoryPage {
+                path,
+                after,
+                max_entries,
+                max_name_bytes,
+            } => after
+                .as_ref()
+                .map_or(0, OsString::capacity)
+                .checked_add(path.capacity())
+                .and_then(|named| listing_bytes(named, *max_entries, *max_name_bytes)),
             Self::Rename {
                 source,
                 destination,

@@ -101,6 +101,12 @@ pub struct OwnedJournal {
     reader: Option<ozzy_journal_segment::JournalPartitionIndex>,
     read_limits: ozzy_journal_segment::PartitionReadLimits,
     read_key: std::rc::Rc<()>,
+    /// The view last installed here and each partition's next offset at its
+    /// commit point.
+    installed_ends: Option<(
+        u64,
+        Vec<(ozzy_proto::PartitionIncarnation, ozzy_proto::Offset)>,
+    )>,
     limits: JournalLimits,
     recovery: CanonicalRecoveryLimits,
     buffer_generation: JournalGeneration,
@@ -231,6 +237,8 @@ impl OwnedJournal {
             ..configuration.scope()
         };
         let startup = JournalStartup {
+            rebuilt: false,
+            resumes: false,
             configuration,
             local: config.identity.replica_node_id,
             generation,
@@ -284,7 +292,7 @@ impl OwnedJournal {
             images,
             committed_base: None,
             room: room::Room::default(),
-            spare: spare::Spare::default(),
+            spare: spare::Spare::new(config.lazy_spare),
             indexing: indexing::Indexing::default(),
             dedup: dedup::State::new(config.deduplication),
             delay: config.delay,
@@ -300,6 +308,7 @@ impl OwnedJournal {
             reader,
             read_limits: config.reads,
             read_key: std::rc::Rc::new(()),
+            installed_ends: None,
             limits: config.limits,
             recovery: config.recovery,
             buffer_generation: generation,

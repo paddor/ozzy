@@ -106,6 +106,11 @@ impl<'a> RecordSpan<'a> {
         Offset::new(self.batch.summary.first_offset.get() + self.range.start as u64)
     }
 
+    /// Primary-resolved Unix time of the span's batch, in milliseconds.
+    pub fn append_timestamp_millis(&self) -> u64 {
+        self.batch.timestamp_millis
+    }
+
     /// Iterate borrowed selected records in offset order.
     pub fn records(&self) -> impl ExactSizeIterator<Item = RecordView<'a>> + '_ {
         self.range.clone().map(|index| RecordView {

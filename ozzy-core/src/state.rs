@@ -573,4 +573,8 @@ pub enum StateError {
     /// A carry does not start at the carry floor or is not exactly the held
     /// records before its end.
     CarryMismatch,
+    #[error("partition with delay or deduplication refuses owner appends")]
+    /// An owner append names no producer, so it cannot pass deduplication
+    /// or hold scheduled records.
+    OwnerAppendDisabled,
 }

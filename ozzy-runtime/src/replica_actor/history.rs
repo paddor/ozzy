@@ -340,6 +340,12 @@ impl ReplicaActor {
         };
         let operations: smallvec::SmallVec<[_; super::MAX_TRANSFER_OPERATIONS]> =
             fetched.wire_operations().collect();
+        // Only a replica that sends history needs this scratch, as large
+        // as its largest batch so far.
+        let bodies = fetched.buffer().body_bytes();
+        if self.payload.len() < bodies {
+            self.payload = vec![0; bodies];
+        }
         let encoded = wire::encode_ops(
             wire::EncodeContext {
                 sender: self.local,

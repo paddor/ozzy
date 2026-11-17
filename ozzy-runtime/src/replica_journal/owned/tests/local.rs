@@ -21,6 +21,7 @@ mod faults;
 mod identities;
 mod idle_producers;
 mod native;
+mod owner;
 mod partition;
 mod producer_dedup;
 mod producer_session;
@@ -53,6 +54,7 @@ fn local_config() -> OwnedConfig<Configuration> {
         write_group_bytes: base.write_group_bytes,
         reads: base.reads,
         producer_idle: base.producer_idle,
+        lazy_spare: false,
     }
 }
 

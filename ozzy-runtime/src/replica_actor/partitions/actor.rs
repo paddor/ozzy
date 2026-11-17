@@ -5,6 +5,7 @@ use crate::replica_actor::{
     ActorError, ActorStatus, LocalActor, ProposalSubmitter, ScheduledRecovery, ScheduledReplica,
 };
 use ozzy_proto::{GroupId, LinkSessionId, NodeId, PartitionIncarnation, directory::RouteState};
+use ozzy_replication::driver::CleanStop;
 
 /// Explicit partition mode. A failed group can never become a local actor.
 #[derive(Debug)]
@@ -85,6 +86,14 @@ impl PartitionActor {
         }
     }
 
+    /// Give a replicated actor's reserved but unused capacity back. See
+    /// [`ReplicaActor::trim`](crate::replica_actor::ReplicaActor::trim).
+    pub fn trim(&mut self) {
+        if let Self::Replicated(actor) = self {
+            actor.trim();
+        }
+    }
+
     /// Select the shared frontend's follower publication transport.
     pub fn enable_publication(&mut self) {
         if let Self::Replicated(actor) = self {
@@ -129,6 +138,29 @@ impl PartitionActor {
         match self {
             Self::Local(actor) => Some(actor.storage_idle()),
             Self::Replicated(_) | Self::Recovering(_) => None,
+        }
+    }
+
+    /// Whether this broker leads a replicated partition but heard no
+    /// follower for the primary timeout, so nothing it admits can commit.
+    pub(in crate::replica_actor) fn leader_doubt(&self) -> bool {
+        match self {
+            Self::Replicated(actor) => actor.leader_doubt(),
+            Self::Local(_) | Self::Recovering(_) => false,
+        }
+    }
+
+    /// Hand a replicated partition this broker leads to `target`. `None`
+    /// while accepted work is uncommitted.
+    pub(in crate::replica_actor) fn step_down(
+        &mut self,
+        target: NodeId,
+    ) -> Result<Option<u64>, ozzy_replication::driver::DriverError> {
+        match self {
+            Self::Replicated(actor) => actor.step_down(target),
+            Self::Local(_) | Self::Recovering(_) => {
+                Err(ozzy_replication::ReplicationError::WrongRole.into())
+            }
         }
     }
 
@@ -179,6 +211,15 @@ impl PartitionActor {
             Self::Local(actor) => actor.shutdown().await,
             Self::Replicated(actor) => actor.shutdown().await,
             Self::Recovering(actor) => Box::pin(actor.shutdown()).await,
+        }
+    }
+
+    /// Shut down like [`Self::shutdown`], and return a replicated primary's
+    /// evidence of a clean stop.
+    pub async fn stop(self) -> Result<Option<CleanStop>, ActorError> {
+        match self {
+            Self::Replicated(actor) => actor.stop().await,
+            other => other.shutdown().await.map(|()| None),
         }
     }
 }

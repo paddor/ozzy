@@ -1,5 +1,245 @@
 # Changelog
 
+## [Unreleased]
+
+### Breaking
+
+- `ozzy_broker::LogSpec` has a new `segment_bytes` field.
+- `ozzy_proto::handshake::Handshake` has a new `origin` field, sent as
+  the optional `store-origin` property, and
+  `ozzy_runtime::frontend::ReceiveError` a new `Origin` variant. A broker
+  with peers names the origin of its stores in HELLO and WELCOME and
+  refuses a broker peer that names none, so every broker of a cluster
+  must run this release.
+- `ozzy_core::state::StateError` has a new `OwnerAppendDisabled` variant,
+  and `ozzy_runtime::replica_journal::JournalError` a new `OwnerAppend`
+  variant.
+- `ozzy_core::retention::Kept` has a new `trimmed` field, and
+  `ozzy_runtime::replica_journal::PartitionFacts` a new `operation_floor`
+  field.
+
+- `ozzy_config::Deployment` has a new `logs` field, and
+  `ozzy_broker::FollowerRoutes` new `shards` and `runtime` fields.
+- The re-exported `Context` and `Endpoint` come from the omq-tokio 0.37
+  release instead of 0.34.
+- `ozzy_runtime::replica_journal::OwnedConfig` has a new `lazy_spare`
+  field.
+- The `[logs]` class defaults `segment_bytes` to 2 MiB instead of 4 MiB.
+- `ozzy_proto::Opcode` has new `Rest`, `RestOk`, and `Beat` variants, and
+  `ozzy_replication::wire::Control` new `Rest` and `RestOk` variants. A
+  broker of an older release rejects these commands, so every broker of a
+  cluster must run this release.
+- A store opened through an `ozzy_io::Local` made by `guarded_by` takes
+  the lane's lock for its own and has no `group.lock`. Runtime log stores
+  are opened this way under one `logs/volume.lock` per device, so a second
+  process on the same device's logs fails at start, not per log.
+- The pool and AIO backends no longer fail an open with `WouldBlock`
+  while idle handles hold descriptors: they park those first.
+- `ozzy_io::Operation` has a new `ReadDirectoryPage` variant.
+- `ozzy_io::Local::execute` admits the waiting jobs of a class in the
+  order they came, and a capacity change wakes only the front of that
+  order. A waiting job must be polled when woken, or dropped: left alone,
+  it keeps the jobs behind it asleep.
+- A broker beat names sixteen sources per shard instead of one, so every
+  broker of a cluster must run this release for groups to rest.
+  `Beats::source` and `Beats::withdraw` take the part of the shard, and
+  `ozzy_proto::beat::MAX_SHARDS` is 4096.
+- START_VIEW is valid in view zero, and a follower takes a START_VIEW of
+  its view under another writer generation as contact instead of a
+  conflict: a leader that resumed its view after a clean stop sends both.
+  A broker of an older release rejects them, so every broker of a cluster
+  must run this release.
+
+### Added
+
+- A runtime log may name its own segment size. `LogSpec::segment_bytes`
+  overrides the `[logs]` class's `segment_bytes` for that log, under the
+  same rules (`LogClass::segment_fits`). An idle log holds one segment on
+  disk and a log at most 256 segments, so one deployment can hold many
+  small logs beside a few busy or large ones. Creating a known log with
+  another size answers `Exists`.
+- `ozzy_log_bench` in `ozzy-bench` measures one log through the in-process
+  log API: records per second and confirmation latency for one writer, on
+  one or three brokers.
+- Peers refuse a broker that comes back on new stores. Each broker
+  records the store origin of its peers in `OZZY_PEERS` on its first
+  device, before the first link, and gives no link to a peer under
+  another origin. A broker whose local identity and stores were emptied
+  can therefore not vote or acknowledge with empty logs.
+  `BrokerIdentity::origin`, `ozzy_config::PeerRecord` and
+  `Service::install_origins` carry it.
+- `ozzy_broker::provision` makes an embedded broker ready to serve in one
+  call: it derives the shared identity, creates and binds the device
+  roots, formats the configured topics and publishes the local identity
+  last. An interrupted call is finished by the next one; a broker that
+  has its local identity is only checked.
+- `ValidatedDeployment::derive_identity` computes the shared identity from
+  `cluster.id`, the broker names and the topics, so brokers agree on it
+  without copying a file.
+- `ozzy_config::Topic` implements `Default`, and `Device::new` builds a
+  device with the default workers, for deployments built in code.
+- `Broker::log(topic, partition)` returns a `Log` handle for an embedder
+  that is a partition's only writer. `Log::append` adds a batch at the
+  offset the writer expects, in the view it leads. A batch at any other
+  offset fails with the partition's next offset, so the writer's later
+  batches in flight fail too. `Log::read` reads committed records by offset,
+  each with its append time. `Log::status` reports this broker's role and
+  view, the committed end, the end a new lead starts from, and the end at
+  the commit point its view was installed with. These batches name no producer and need a
+  partition without delay or deduplication.
+- A leader that hears no follower for the primary timeout reports the
+  `Doubt` role on its `Log` and refuses appends with `NotLeader`, since
+  nothing it admits could commit. Its term goes on when a follower of the
+  view answers. `ReplicaDriver::primary_doubt` reports the condition.
+- `Log::step_down(view, target)` hands a log to another broker. The
+  leader stops taking appends, waits up to a second for accepted records
+  to commit, then starts a view change to the next view the target
+  leads. At most one starts per second and log.
+  `ReplicaDriver::step_down` is the protocol step.
+- `Log::trim(view, expected_floor, floor)` moves a log's floor forward.
+  Records below it are gone for every reader. On a partition without a
+  retention policy, each copy then retires its sealed segments that hold
+  no record at or above the floor. Before, such a partition never freed
+  a segment.
+
+- `Broker::create_log(spec)` and `Broker::delete_log(id)` create and
+  delete a log while the broker runs; `Broker::logs` lists them and
+  `Broker::runtime_log(id)` returns the `Log` handle. A spec names the
+  log's ID, incarnation, and one or three member brokers: one member makes
+  a single durable log on that broker, also in a three-broker deployment.
+  The embedder gives every member the same spec. Each broker records its
+  logs beside their stores, opens them again at start, and keeps a deleted
+  log's record so its ID is never formatted twice. The new `[logs]` table
+  sets the class: `max_logs`, `segment_bytes`, `max_append_bytes`.
+- `PartitionActors::insert` and `remove` add and take a partition actor on
+  a running shard. `RoutingTable::with_runtime` routes broker traffic to
+  the logs a shared `RuntimeRoutes` names.
+- A `Log` handle reports `Stopped` once its log service is gone.
+- An idle replicated partition rests: it sends no heartbeats and no
+  votes. Each broker pair instead exchanges one `BEAT` every 100 ms,
+  which names the sender's live shards and their epochs. A leader's
+  heartbeat offers the rest with `REST` and a follower accepts with
+  `REST_OK`; any other message between them, or a beat that no longer
+  covers the agreement, ends it. A resting partition fails over as fast
+  as before. `ReplicaDriver::cover`, `uncover`, `rest`, and `settled`
+  are the protocol steps, `ozzy_runtime::frontend::Beats` the shared
+  beat state, and `PartitionActors::with_beats` turns it on for a shard.
+  Telemetry counts `replica_rest`, `replica_rest_end`, and
+  `shard_epoch_change`.
+
+### Changed
+
+- File handles hold descriptors on demand. When a shard's share of
+  `open_handles` is spent, the backend closes the descriptors of the
+  handles used longest ago and opens their paths again at the next use.
+  It follows the renames and removals it performs; a file without a name
+  and a locked file keep their descriptors. With one lock per device for
+  runtime logs, the descriptors a broker holds no longer grow with its
+  idle logs. Dropped handles are reclaimed without a scan of all handles.
+- `ozzy_io::Local::guarded_by` and `guard` share one held lock among the
+  stores of a lane.
+- A shard turn finds its marked partitions and due timers without looking
+  at every partition, and a leader keeps no timer for a vote it never
+  sends. The safety sweep of `PartitionActors::with_safety_sweep` visits
+  at most `turn_actors` partitions per interval instead of all of them,
+  so a shard with more partitions sees each once per several intervals.
+  With these, the CPU time of idle replicated logs no longer grows with
+  their count.
+- A runtime log reserves its pipeline at first use, not at start. The
+  broker trims each log actor it installs (`ReplicaActor::trim`,
+  `ScheduledReplica::trim`, `PartitionActor::trim`, `ProposalBuffer::trim`,
+  `AppendBuffer::trim`, and `trim` on the `ozzy_replication` driver, normal
+  replica, flow transmitter and receiver): queues, ledgers and arena
+  descriptors sized for a full pipeline are given back and grow again
+  with use, so the first writes to a log allocate. Topics still reserve
+  at start. A log reserves its read descriptors at its first read.
+- A replica allocates its history payload scratch when it first sends
+  history, as large as its largest batch. A fresh `DURABLE` file is
+  written from its image without a copy. A segment writer that a view
+  change installed no longer keeps the encode buffer reserved for the
+  staged copy. With these and the trim, an idle replicated log copy holds
+  about 150 KiB resident memory instead of about 365 KiB.
+- A follower that restarts with its disk intact rejoins the view it last
+  installed instead of requesting the next one, so restarting a follower
+  no longer moves leadership. A restarted leader requests the next view
+  unless it stopped cleanly. `ReplicaDriver::begin_rejoin_install` and `rejoin_pending` are the
+  protocol steps; `InstallTicket::rejoins` marks such an installation.
+- Each partition takes a fourth proposal lane and five more arenas from its
+  journal pool for its log. Arenas allocate only when used.
+- A shard splits the epoch its resting groups stand on into sixteen parts
+  by group ID. A voter that leaves its view withdraws its part only, and
+  only the groups whose agreement broke are visited. A view change of one
+  log used to end the rest of every group on its shard, so creating many
+  logs cost CPU time that grew with the square of their number.
+- Jobs that wait for a full device lane take it in the order they came,
+  and a capacity change wakes only the front of that order instead of
+  every waiting job. A broker that starts on many logs, or many groups
+  that change view at once, no longer spin their shards: three brokers
+  restarting on 512 idle replicated logs took 57 s and 164 s of CPU time,
+  and now take about 42 s and 73 s.
+- A shard opens its runtime logs at start a window at a time: 16 logs
+  may open or look for their leader at once. All copies electing at once
+  queued on the disk for longer than an election waits, so elections
+  repeated. A log without a leader after 8 s gives up its place and
+  doubles the window, so a broker that starts alone still opens all its
+  logs. Three brokers restarting on 512 idle replicated logs took 41 to
+  58 s with two to five view changes per log, and now take 31 to 42 s
+  with one, at less than half the CPU time.
+- A leader of a runtime log that stops cleanly leads the same view again
+  after a restart, without an election. A shard that stops writes which of
+  its logs it led with everything durable to `logs/stops/<shard>` on the
+  device, and the next start takes that evidence off the disk before it
+  opens a log. `ReplicaDriver::clean_stop` and `ViewChange::resume_primary`
+  are the protocol steps; `PartitionActors::stop`,
+  `JournalStartup::clean_stop` and `OpenedPartition::stopped_cleanly`
+  carry the evidence. A resumed leader replays to a follower from where
+  its receipt stands (`NormalReplica::replay_floor`), and a follower may
+  install operations of the view itself from it
+  (`InstallTicket::admits_view_tail`). Three brokers that stop one after
+  the other and restart on 512 idle replicated logs keep the view of
+  every log that still had its leader, and make about 29k disk
+  synchronizations instead of 35.7k.
+- A check of a journal's selected metadata synchronizes the unchanged
+  `CONFIGURATION` file once per journal owner, not at every check. A
+  reopened replicated log made nine such checks, each with two disk
+  synchronizations.
+- A view change whose selected log ends at the copy's own durable end
+  keeps the copy's segments also when part of that log is not yet
+  confirmed, as the one operation of an idle log is. Three brokers that
+  restarted on idle replicated logs made about 51 disk synchronizations
+  per copy, and now make about 21.
+- A view change that keeps a copy's whole log and adds nothing to it no
+  longer copies that log into a new segment. The copy publishes the new
+  view in its manifest and continues its active segment under the new
+  writer generation, through `GroupJournal::keeps_suffix` and
+  `keep_suffix`. Three brokers that restarted on idle replicated logs
+  held about 3.7 MiB per log copy and now hold about 2.8 MiB.
+
+### Fixed
+
+- A broker starts on any number of runtime log records. It listed the
+  `logs` directory in one job sized by the log class, which a class of
+  about 8,000 logs or a directory of many deleted logs pushed past what a
+  device lane admits, and the shard stopped. It now reads the directory a
+  page at a time.
+- A partition without a retention limit cleans up after a view change.
+  Cleanup ran only in a retention turn that had a plan, so such a
+  partition kept every segment and manifest a view change replaced, for
+  good. It now takes a turn at start and after each view change it
+  activates. Three brokers that restarted on idle replicated logs held
+  about 6.5 MiB per log copy and now hold about 3.7 MiB.
+- An idle runtime log no longer keeps a segment that a view change
+  replaced as its spare. `ozzy_journal_segment::GroupJournal::discard_retired`
+  makes cleanup unlink every unselected segment.
+- A replica's timeouts start at its actor's first turn, through the new
+  `ozzy_replication::driver::ReplicaDriver::begin_timing`. The driver was
+  built at time zero of the shard clock, so on an actor that first ran
+  more than an election timeout later, every timeout had already
+  expired. A new runtime log then changed view once right after its
+  creation, and a restarted follower gave up rejoining its view before
+  it began. Creating 512 idle replicated logs on three brokers made
+  about 59,500 disk synchronizations, and now makes about 30,800.
+
 ## [0.11.1] - 2026-11-12
 
 ### Fixed

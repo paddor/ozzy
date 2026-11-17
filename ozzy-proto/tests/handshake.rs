@@ -28,6 +28,7 @@ fn hello() -> Handshake {
         superseded_hello: None,
         instance_id: 3,
         hello_nonce: 4,
+        origin: None,
         parameters: Parameters::append(DataLimits::default(), handshake::PRODUCER).unwrap(),
     }
 }
@@ -76,6 +77,7 @@ fn hello_fixture_and_welcome_preserve_directional_receive_limits() {
         superseded_hello: None,
         instance_id: 8,
         hello_nonce: hello().hello_nonce,
+        origin: None,
         parameters: selected,
     };
     let header = handshake::encode(
@@ -268,4 +270,22 @@ fn streaming_capability_requires_append_and_all_known_ids_round_trip() {
     let mut bytes = Vec::with_capacity(1024);
     handshake::encode(envelope(), hello, &mut bytes, EnvelopeLimits::default()).unwrap();
     assert_eq!(decode(&bytes).unwrap(), hello);
+}
+
+#[test]
+fn a_store_origin_round_trips_and_zero_is_refused() {
+    let named = Handshake {
+        origin: Some(u128::MAX - 6),
+        ..hello()
+    };
+    let mut bytes = Vec::with_capacity(1024);
+    handshake::encode(envelope(), named, &mut bytes, EnvelopeLimits::default()).unwrap();
+    assert_eq!(decode(&bytes).unwrap(), named);
+    handshake::encode(envelope(), hello(), &mut bytes, EnvelopeLimits::default()).unwrap();
+    assert_eq!(decode(&bytes).unwrap().origin, None);
+    let zero = Handshake {
+        origin: Some(0),
+        ..hello()
+    };
+    assert!(handshake::encode(envelope(), zero, &mut bytes, EnvelopeLimits::default()).is_err());
 }

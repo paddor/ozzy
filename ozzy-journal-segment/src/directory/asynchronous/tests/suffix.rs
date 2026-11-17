@@ -2,6 +2,7 @@ use super::*;
 mod bounds;
 mod checkpoint_transfer;
 mod crashes;
+mod kept;
 use crate::{
     SuffixReplacement, SuffixReplacementError as Error, SuffixStreamLimits,
     logical_operation_digest,

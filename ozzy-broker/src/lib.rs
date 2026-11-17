@@ -25,7 +25,10 @@ mod format;
 mod frontend;
 mod host;
 mod journals;
+mod logs;
+mod origins;
 mod placement;
+mod provision;
 mod provisioning;
 mod serving;
 mod shards;
@@ -45,6 +48,9 @@ pub use journals::{
     JournalConfig, JournalPlan, OpenedPartition, PartitionAuthority, PartitionJournal,
     RecoveryIntent, RecoverySelection, check_partition_limits,
 };
+pub use logs::{CreateError, DeleteError, LogSpec, LogState};
+pub use ozzy_runtime::log;
+pub use provision::provision;
 pub use provisioning::{
     CheckedConfig, check_config, initialize_broker_identity, initialize_identity,
     load_broker_identity, load_deployment,

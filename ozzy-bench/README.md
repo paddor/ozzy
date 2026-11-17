@@ -345,6 +345,28 @@ To collect telemetry without a profiler:
 
 [Runtime](../doc/RUNTIME.md) owns the snapshot contents and limits.
 
+## One log
+
+`ozzy_log_bench` measures one log through the in-process log API: one
+writer, a window of owner appends in flight, one or three brokers in the
+process on real files.
+
+```sh
+ozzy_log_bench --root "$OZZY_ARTIFACT_ROOT/log-bench" --mode three \
+  --size 128 --batch 2048 --rate 35000 --segment-bytes 67108864
+```
+
+- `--root` is removed first.
+- Without `--rate` every append holds `--batch` records: saturation.
+  Latency is then per append, from its submission.
+- With `--rate` records arrive at that rate and an append takes those
+  that arrived while the window was full. Latency is per record, from its
+  arrival.
+- `--kind topic` appends to a topic partition, `--kind runtime` to a log
+  of the `[logs]` class.
+- Three brokers share the process and the disk. Compare with rivals laid
+  out the same way.
+
 ## Disk calibration
 
 `ozzy_disk_probe` overwrites an explicitly named scratch file. It measures disk

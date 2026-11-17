@@ -7,6 +7,9 @@
 mod routing;
 pub use routing::{Binding, Kind, Placement, Routed, RoutingError, RoutingTable};
 
+mod runtime_routes;
+pub use runtime_routes::{RuntimeRoute, RuntimeRoutes};
+
 mod dispatch;
 pub use dispatch::{DataPressure, Dispatcher, DispatcherLimits, Rejected, Rejection, SetupError};
 
@@ -18,8 +21,8 @@ pub use crate::peer_sessions::{Handled as Negotiated, LinkIds, Sessions as LinkS
 
 mod service;
 pub use service::{
-    Access, ClockNow, ClockSampling, ClockStatus, ClockTrust, Link, Links, ReceiveError, Service,
-    ServiceError,
+    Access, BeatTiming, Beats, ClockNow, ClockSampling, ClockStatus, ClockTrust, Link, Links,
+    ReceiveError, Service, ServiceError,
 };
 
 mod port;

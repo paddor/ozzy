@@ -5,6 +5,7 @@ use crate::replica_transport::FlushProgress;
 use crate::replica_transport::SendClass;
 use omq_tokio::{Message, TrySendError};
 use ozzy_proto::{LinkSessionId, NodeId};
+use ozzy_replication::driver::CleanStop;
 use ozzy_replication::wire::PeerBinding;
 use std::time::Duration;
 
@@ -71,6 +72,11 @@ impl ScheduledReplica {
         self.actor.history_receive_allocator = Some(owner.allocator());
         self.receive_owner = Some(owner.clone());
         Ok(())
+    }
+
+    /// See [`ReplicaActor::trim`].
+    pub fn trim(&mut self) {
+        self.actor.trim();
     }
 
     /// The adapter provides group PUB delivery and bounded PEER gap repair.
@@ -320,6 +326,23 @@ impl ScheduledReplica {
         self.actor.driver.scope().group_id
     }
 
+    /// Hand the group to `target`: leave the view this ready primary leads
+    /// for the next one `target` leads. `None` while work is uncommitted.
+    pub(in crate::replica_actor) fn step_down(
+        &mut self,
+        target: NodeId,
+    ) -> Result<Option<u64>, ozzy_replication::driver::DriverError> {
+        let view = self.actor.driver.step_down(target, self.now)?;
+        // The next visit runs the election this started.
+        self.actor.more_work |= view.is_some();
+        Ok(view)
+    }
+
+    /// Whether this ready primary heard no backup for the primary timeout.
+    pub(in crate::replica_actor) fn leader_doubt(&self) -> bool {
+        self.actor.driver.primary_doubt()
+    }
+
     /// Current per-partition route, including proposed leader changes. This is
     /// a routing hint. Only actor validation and activation permit admission.
     pub fn authority_hint(&self) -> ozzy_proto::nack::AuthorityHint {
@@ -397,6 +420,12 @@ impl ScheduledReplica {
         self.actor.shutdown().await
     }
 
+    /// Shut down like [`Self::shutdown`], and return the evidence of a clean
+    /// stop when this copy was a primary whose whole log was durable.
+    pub async fn stop(mut self) -> Result<Option<CleanStop>, ActorError> {
+        self.actor.stop().await
+    }
+
     fn observe(&mut self, now: Duration) -> Result<(), ScheduleError> {
         if !self.active {
             return Err(ScheduleError::Stopped);
@@ -436,6 +465,22 @@ pub enum ScheduleError {
 }
 
 impl ScheduledReplica {
+    /// Let this group rest on `beats`, which report `shard`.
+    pub(super) fn install_beats(&mut self, beats: crate::frontend::Beats, shard: u32) {
+        self.actor.install_beats(beats, shard);
+    }
+    /// Whether broker beats stand in for this group's heartbeats or votes.
+    pub(super) fn resting(&self) -> bool {
+        self.actor.resting()
+    }
+    /// Whether an agreement to rest no longer stands on the beats.
+    pub(super) fn rest_broken(&self) -> bool {
+        self.actor.rest_broken()
+    }
+    /// Whether the role left a view in which a peer may still trust it.
+    pub(super) fn take_withdrawal(&mut self) -> bool {
+        self.actor.take_withdrawal()
+    }
     pub(super) fn needs_checkpoint_recovery(&self) -> bool {
         self.actor.recovery_required
     }

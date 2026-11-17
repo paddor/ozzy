@@ -54,11 +54,43 @@ async fn open(backend: &mut impl Backend, path: &Path, mode: OpenMode) -> Handle
     handle.clone()
 }
 
+/// Every name in `root`, a page of one entry at a time, and the error of a
+/// page whose bound holds no name.
+async fn pages(
+    backend: &mut impl Backend,
+    root: &Path,
+) -> (Vec<std::ffi::OsString>, io::ErrorKind) {
+    let page = |after, max_name_bytes| Operation::ReadDirectoryPage {
+        path: root.into(),
+        after,
+        max_entries: 1,
+        max_name_bytes,
+    };
+    let mut names: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        let result = run(backend, page(names.last().cloned(), 128))
+            .await
+            .unwrap();
+        let Outcome::Directory(entries) = &*result else {
+            panic!("directory page")
+        };
+        assert!(entries.len() <= 1);
+        let Some(entry) = entries.first() else {
+            break;
+        };
+        names.push(entry.name.clone());
+    }
+    let oversized = run(backend, page(None, 1)).await.unwrap_err().kind();
+    (names, oversized)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct Observed {
     bytes: Vec<u8>,
     length: u64,
     names: Vec<std::ffi::OsString>,
+    paged: Vec<std::ffi::OsString>,
+    oversized_name: io::ErrorKind,
     lock_conflict: io::ErrorKind,
     closed_handle: io::ErrorKind,
 }
@@ -225,6 +257,7 @@ async fn file_workload(backend: &mut impl Backend, root: &Path) -> Observed {
     };
     let names = entries.iter().map(|entry| entry.name.clone()).collect();
     drop(result);
+    let (paged, oversized_name) = pages(backend, &root).await;
     for name in ["backup", "current"] {
         run(
             backend,
@@ -248,6 +281,8 @@ async fn file_workload(backend: &mut impl Backend, root: &Path) -> Observed {
         bytes,
         length,
         names,
+        paged,
+        oversized_name,
         lock_conflict,
         closed_handle,
     }
@@ -318,6 +353,8 @@ async fn controlled_pool_and_aio_backends_obey_the_same_file_contract() {
     assert_eq!(modeled, real);
     assert_eq!(real.bytes, b"bcdef\0\0\0\0");
     assert_eq!(real.length, 10);
+    assert_eq!(real.paged, real.names);
+    assert_eq!(real.oversized_name, io::ErrorKind::InvalidData);
     assert_eq!(real.lock_conflict, io::ErrorKind::WouldBlock);
     assert_eq!(real.closed_handle, io::ErrorKind::NotFound);
 }

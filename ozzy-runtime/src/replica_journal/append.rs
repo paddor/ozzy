@@ -4,6 +4,7 @@ mod assignment;
 mod body;
 pub(in crate::replica_journal) mod dedup;
 mod metadata;
+mod owner;
 mod producer;
 mod progress;
 mod release;
@@ -95,6 +96,8 @@ enum RequestKind {
     Canonical,
     Producer,
     Partition,
+    /// One producer-less APPEND batch from the partition's one writer.
+    Owner,
 }
 
 #[derive(Debug)]
@@ -306,6 +309,15 @@ impl AppendBuffer {
         self.bodies.clear();
         self.prepared.clear();
         self.body_digests.clear();
+    }
+
+    /// Give the unused descriptor capacity back and keep the journal lease.
+    /// It grows again with use. For a log that expects to stay idle.
+    pub fn trim(&mut self) {
+        self.progress_riders.shrink_to_fit();
+        self.entries.shrink_to_fit();
+        self.prepared.shrink_to_fit();
+        self.body_digests.shrink_to_fit();
     }
 
     pub(crate) fn allocator(&self) -> Option<crate::memory::Allocator> {

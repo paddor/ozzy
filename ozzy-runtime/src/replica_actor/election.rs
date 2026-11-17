@@ -47,6 +47,9 @@ impl ReplicaActor {
         let cleaning = self.journal.cleaning();
         if !cleaning {
             if let Some(ticket) = self.driver.installation_ticket() {
+                if ticket.rejoins() && self.staged.is_none() {
+                    return self.schedule_rejoin(&ticket, now);
+                }
                 return self.schedule_installation(&ticket);
             }
             if self.schedule_pin()? {
@@ -213,6 +216,29 @@ impl ReplicaActor {
         Ok(())
     }
 
+    /// A restarted backup began rejoining its installed view when the actor
+    /// was built, so no later view ever showed. Pin its own log, then begin
+    /// the journal installation. A later view met before that abandons the
+    /// attempt with nothing staged.
+    fn schedule_rejoin(
+        &mut self,
+        ticket: &ozzy_replication::InstallTicket,
+        now: Duration,
+    ) -> Result<(), ActorError> {
+        if self.driver.scope().view > ticket.scope().view {
+            self.driver.complete_abandon(*ticket, now)?;
+            self.more_work = true;
+            return Ok(());
+        }
+        if !self.schedule_pin()? && self.pinned == Some(ticket.source()) {
+            self.pending = Some(PendingIo::Begin(
+                self.journal
+                    .begin_installation(*ticket, self.config.installation)?,
+            ));
+        }
+        Ok(())
+    }
+
     fn select_or_install(&mut self) -> Result<(), ActorError> {
         let generation = self.ids.generation()?;
         let mut missing = None;
@@ -352,7 +378,10 @@ impl ReplicaActor {
                 self.activated = None;
             }
             Completed::Activate(ticket) => match self.driver.complete_activation(ticket) {
-                Ok(()) => self.activated = Some((ticket.scope(), ticket.generation())),
+                Ok(()) => {
+                    self.activated = Some((ticket.scope(), ticket.generation()));
+                    self.maintenance.retention.observe_selection(now);
+                }
                 Err(DriverError::StaleValidation) => {}
                 Err(error) => return Err(error.into()),
             },

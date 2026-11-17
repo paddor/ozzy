@@ -70,7 +70,11 @@ impl ReplicaDriver {
                 Control::StartViewChange(start) => changing.receive_start(from, start)?,
                 Control::DoViewChange(report) => changing.receive_report(from, report)?,
                 Control::StartView(start) => return Ok(Some(start)),
-                Control::Commit(_) | Control::PrepareOk { .. } | Control::ExitView(_) => {}
+                Control::Commit(_)
+                | Control::PrepareOk { .. }
+                | Control::Rest { .. }
+                | Control::RestOk { .. }
+                | Control::ExitView(_) => {}
             },
             Role::Installing(installing) => installing.observe_view(from, scope)?,
             Role::Fenced(_) => return Err(ViewChangeError::Faulted.into()),
@@ -83,10 +87,14 @@ impl ReplicaDriver {
     fn check_role(&self, voter: VoterIndex, message: Control) -> Result<(), DriverError> {
         let primary = VoterIndex::primary(message.scope().view);
         match message {
-            Control::Commit(_) | Control::StartView(_) if voter != primary => {
+            Control::Commit(_) | Control::Rest { .. } | Control::StartView(_)
+                if voter != primary =>
+            {
                 Err(ReplicationError::WrongRole.into())
             }
-            Control::PrepareOk { .. } | Control::DoViewChange(_) if self.local != primary => {
+            Control::PrepareOk { .. } | Control::RestOk { .. } | Control::DoViewChange(_)
+                if self.local != primary =>
+            {
                 Err(ReplicationError::WrongRole.into())
             }
             _ => Ok(()),
@@ -108,7 +116,7 @@ impl ReplicaDriver {
         let committed = normal.snapshot().committed;
         let mut behind = false;
         match message {
-            Control::Commit(commit) => {
+            Control::Commit(commit) | Control::Rest { commit, .. } => {
                 match normal.receive_commit(from, commit) {
                     Ok(()) => {}
                     // A backup behind the commit cannot check it yet, and the
@@ -120,7 +128,10 @@ impl ReplicaDriver {
                 }
                 self.contact_deadline = now.saturating_add(self.timing.primary_timeout);
             }
-            Control::PrepareOk { ack, .. } => normal.receive_ack(from, ack)?,
+            Control::PrepareOk { ack, .. } | Control::RestOk { ack, .. } => {
+                normal.receive_ack(from, ack)?;
+                self.backup_heard_at = now;
+            }
             Control::StartView(start) => {
                 normal.observe_installed_start(from, start)?;
                 self.contact_deadline = now.saturating_add(self.timing.primary_timeout);

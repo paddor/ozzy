@@ -196,11 +196,19 @@ impl Journal {
             limits,
             interrupted: false,
             cleaning: std::rc::Rc::default(),
+            discard: false,
             pins: std::rc::Rc::default(),
             validated_indexes: std::rc::Rc::default(),
             pack_layouts: std::cell::RefCell::default(),
             active_prefix: None,
         };
+        // OPTIMIZE: a reopened replicated copy publishes its manifest up to
+        // three times in a row: here when the log ends past the manifest,
+        // at the installation of its view, and at activation when the
+        // commit moved. Each costs four disk synchronizations. Carrying the
+        // recovered end, and the commit where it is known, into the
+        // installation's manifest would leave one. It must keep a copy from
+        // reporting or acknowledging a log end that no manifest records.
         if let Some(next) = journal.recovered_manifest(recovered)? {
             // Boxed: inline, this publication pushes broker startup past
             // the large-future bound.

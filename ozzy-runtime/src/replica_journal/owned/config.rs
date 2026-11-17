@@ -98,6 +98,10 @@ pub struct OwnedConfig<C = ConfigurationRecord> {
     /// A primary retires producer sessions unchanged and unopened this long.
     /// `None` keeps every session until the producer table fills.
     pub producer_idle: Option<std::time::Duration>,
+    /// Allocate the spare segment only once the active one is a quarter
+    /// full, so an empty partition holds one segment. `false` keeps a spare
+    /// allocated at all times.
+    pub lazy_spare: bool,
 }
 
 impl OwnedConfig {

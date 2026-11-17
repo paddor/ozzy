@@ -11,12 +11,15 @@ use std::{task::Poll, time::Duration};
 mod admin;
 mod failover;
 mod groups;
+#[cfg(target_os = "linux")]
+mod idle_logs;
 mod large;
 mod live;
 #[cfg(target_os = "linux")]
 mod perf;
 mod pressure;
 mod progress;
+mod provision;
 mod recovery;
 mod roll;
 mod sessions;

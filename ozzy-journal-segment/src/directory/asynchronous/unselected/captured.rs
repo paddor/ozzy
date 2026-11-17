@@ -36,6 +36,7 @@ impl Journal {
             manifest: self.manifest.clone(),
             current: self.current,
             active,
+            discard: self.discard,
             source: None,
             _slot: slot,
         })
@@ -74,6 +75,7 @@ pub struct UnselectedFiles {
     manifest: Manifest,
     current: CurrentReference,
     active: u64,
+    discard: bool,
     source: Option<u64>,
     _slot: CleanupSlot,
 }
@@ -90,6 +92,7 @@ impl UnselectedFiles {
             bounds: Bounds::Concurrent {
                 active: self.active,
             },
+            discard: self.discard,
             interrupted,
         }
     }

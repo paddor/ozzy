@@ -100,10 +100,19 @@ pub struct NormalReplica {
     acknowledged: Voters<OpNumber>,
     activation_tail: OpNumber,
     installed_view: Option<crate::StartView>,
+    /// This copy rejoined or resumed its view after a restart, so
+    /// `installed_view` describes its own log as the restart found it.
+    rejoined: bool,
     journal_tail: Option<Prefix>,
 }
 
 impl NormalReplica {
+    /// Give the unused part of the reserved operation ring back. It grows
+    /// again as operations are prepared.
+    pub fn trim(&mut self) {
+        self.operations.shrink_to_fit();
+    }
+
     /// Exact prefix released from the live window after application and persistence.
     pub const fn reclaimed_prefix(&self) -> Prefix {
         self.retained_base
@@ -169,6 +178,7 @@ impl NormalReplica {
             acknowledged: Voters::splat(OpNumber(0)),
             activation_tail: OpNumber(0),
             installed_view: None,
+            rejoined: false,
             journal_tail: None,
         })
     }
@@ -204,6 +214,7 @@ impl NormalReplica {
         self.acknowledged = Voters::splat(OpNumber(0));
         self.activation_tail = log.accepted.op;
         self.installed_view = None;
+        self.rejoined = false;
         self.journal_tail = (log.accepted != Prefix::GENESIS).then_some(log.accepted);
     }
 

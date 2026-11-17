@@ -8,8 +8,8 @@ use super::{Action, DriverError, ReplicaDriver, Role};
 use crate::wire::Control;
 use crate::{
     Commit, Digest, InstallOutcome, InstallTicket, InstallingView, JournalGeneration, LogSource,
-    Prefix, PreparedOperation, ReceivedStart, ReplicationError, Scope, StartView, ViewChangeError,
-    VoterSet,
+    Prefix, PreparedOperation, ReceivedStart, RejectedInstallation, ReplicationError, Scope,
+    StartView, ViewChangeError, VoterSet,
 };
 
 /// Whole-tail commit authority captured before worker-side image activation.
@@ -46,7 +46,32 @@ impl ActivationTicket {
     }
 }
 
+/// Evidence that a stopping primary stored every operation it admitted in
+/// its view. Kept across a clean stop, it lets the restarted primary resume
+/// that view instead of leaving it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CleanStop {
+    /// The view this copy leads.
+    pub view: u64,
+    /// Its whole log, durable when it stopped.
+    pub accepted: Prefix,
+}
+
 impl ReplicaDriver {
+    /// Clean-stop evidence of a normal primary whose whole log is durable.
+    /// Valid only if the caller admits and sends nothing afterwards.
+    pub fn clean_stop(&self) -> Option<CleanStop> {
+        let snapshot = self.normal()?.snapshot();
+        (snapshot.status == crate::Status::Normal
+            && crate::VoterIndex::primary(snapshot.scope.view) == self.local
+            && !snapshot.journal.faulted
+            && snapshot.journal.durable == snapshot.accepted.op)
+            .then_some(CleanStop {
+                view: snapshot.scope.view,
+                accepted: snapshot.accepted,
+            })
+    }
+
     /// Send one pending new-view activation commit. A voter set only while an
     /// installed view exists, so a missing view drops the pending set.
     pub(super) fn activation_action(&mut self) -> Result<Option<Action>, DriverError> {
@@ -126,6 +151,36 @@ impl ReplicaDriver {
         self.begin_install(Some(ReceivedStart { from, start }), generation, lookup)
     }
 
+    /// Whether this restarted backup may still rejoin the view it last
+    /// installed. Until the adapter tries, or the election deadline passes,
+    /// `poll` promises no later view.
+    pub fn rejoin_pending(&self) -> bool {
+        matches!(&self.role, Role::ViewChanging(changing) if changing.rejoinable())
+    }
+
+    /// Give up rejoining. The ordinary election of the next view runs.
+    pub fn decline_rejoin(&mut self) {
+        if let Role::ViewChanging(changing) = &mut self.role {
+            changing.decline_rejoin();
+        }
+    }
+
+    /// Begin a restarted backup's return to its installed view from its own
+    /// pinned log. The adapter supplies a fresh writer incarnation and runs
+    /// the same staging, publication and application recovery as any
+    /// installation. A rejection ends the attempt: the ordinary election of
+    /// the next view follows.
+    pub fn begin_rejoin_install(
+        &mut self,
+        generation: JournalGeneration,
+    ) -> Result<InstallTicket, DriverError> {
+        self.changing()?;
+        let Role::ViewChanging(changing) = self.take_role() else {
+            return Err(ViewChangeError::Faulted.into());
+        };
+        self.admit_install(changing.begin_rejoin_install(generation))
+    }
+
     fn begin_install(
         &mut self,
         backup: Option<ReceivedStart>,
@@ -140,6 +195,13 @@ impl ReplicaDriver {
             Some(received) => changing.begin_backup_install(received, generation, lookup),
             None => changing.begin_primary_install(generation),
         };
+        self.admit_install(admitted)
+    }
+
+    fn admit_install(
+        &mut self,
+        admitted: Result<InstallingView, RejectedInstallation>,
+    ) -> Result<InstallTicket, DriverError> {
         match admitted {
             Ok(installing) => {
                 let ticket = installing.ticket();
@@ -212,6 +274,7 @@ impl ReplicaDriver {
             InstallOutcome::ViewChanging(changing) => Role::ViewChanging(changing),
         };
         self.contact_deadline = now.saturating_add(self.timing.primary_timeout);
+        self.backup_heard_at = now;
         self.persistence_deadline = now.saturating_add(self.timing.primary_timeout);
         self.progress_deadline = now.saturating_add(self.progress_timeout());
         self.election_deadline = now.saturating_add(self.election_delay);

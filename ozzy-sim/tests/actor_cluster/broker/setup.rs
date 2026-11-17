@@ -294,5 +294,6 @@ pub(super) fn journal_config(index: usize, shape: Shape, group: usize) -> OwnedC
             concurrent_reads: 2,
         },
         producer_idle: (group == DEDUP_GROUP).then(|| shape.idle()),
+        lazy_spare: false,
     }
 }

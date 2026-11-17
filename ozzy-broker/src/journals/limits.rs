@@ -1,7 +1,5 @@
 use crate::StartupError;
-use ozzy_config::{
-    BrokerPlan, ControllerPlan, IoBackend, PartitionPlacement, Topic, ValidatedDeployment,
-};
+use ozzy_config::{BrokerPlan, ControllerPlan, IoBackend, PartitionPlacement, ValidatedDeployment};
 use ozzy_journal::operation::OperationLimits;
 use ozzy_journal_segment::{
     CanonicalRecoveryLimits, CheckpointLimits, DecodeLimits, ENTRY_HEADER_BYTES, GROUP_SEAL_BYTES,
@@ -14,19 +12,86 @@ use ozzy_runtime::replica_journal::{DedupLimits, DelayLimits, OwnedConfig};
 const CORE_CHECKPOINT_BYTES: usize = 32 * 1024 * 1024;
 
 /// Finite journal work bounds. Shared shard admission bounds aggregate live requests.
-pub(super) struct Settings {
+pub(crate) struct Settings {
     limits: JournalLimits,
     recovery: CanonicalRecoveryLimits,
     pipeline: PipelineLimits,
     reads: PartitionReadLimits,
     clients: usize,
+    lazy_spare: bool,
 }
 
-impl Settings {
-    pub(super) fn new(
+/// The sizes one partition's bounds derive from, and how many partitions
+/// share its shard's budgets.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Shape {
+    /// Maximum canonical append body.
+    pub(crate) max_append_bytes: u64,
+    /// Maximum physical bytes per segment file.
+    pub(crate) segment_bytes: u64,
+    /// Partitions the shard's budgets are split across.
+    pub(crate) sharers: usize,
+    /// Allocate the spare segment only once the active one fills.
+    pub(crate) lazy_spare: bool,
+}
+
+impl Shape {
+    /// The shape of a configured topic partition: it shares its shard with
+    /// the other configured partitions placed there.
+    pub(crate) fn topic(
         deployment: &ValidatedDeployment,
         plan: &BrokerPlan,
         placement: &PartitionPlacement,
+    ) -> Result<Self, StartupError> {
+        let topic = deployment.deployment().topic(&placement.topic)?;
+        Ok(Self {
+            max_append_bytes: topic.max_append_bytes,
+            segment_bytes: topic.segment_bytes,
+            sharers: static_sharers(plan, placement.shard),
+            lazy_spare: false,
+        })
+    }
+
+    /// The shape of a runtime log: it shares its shard with the configured
+    /// partitions there and an even part of the class's log bound.
+    pub(crate) fn log(
+        deployment: &ValidatedDeployment,
+        plan: &BrokerPlan,
+        placement: &PartitionPlacement,
+    ) -> Result<Self, StartupError> {
+        let logs = deployment
+            .deployment()
+            .logs
+            .ok_or_else(|| StartupError::Runtime("no runtime log class is configured".into()))?;
+        Ok(Self {
+            max_append_bytes: logs.max_append_bytes,
+            segment_bytes: logs.segment_bytes,
+            sharers: plan
+                .partitions
+                .iter()
+                .filter(|partition| partition.shard == placement.shard)
+                .count()
+                + logs.max_logs.div_ceil(plan.shards.len().max(1)),
+            lazy_spare: true,
+        })
+    }
+}
+
+/// Configured partitions on `shard`, at least one.
+fn static_sharers(plan: &BrokerPlan, shard: u32) -> usize {
+    plan.partitions
+        .iter()
+        .filter(|partition| partition.shard == shard)
+        .count()
+        .max(1)
+}
+
+impl Settings {
+    pub(crate) fn new(
+        deployment: &ValidatedDeployment,
+        plan: &BrokerPlan,
+        placement: &PartitionPlacement,
+        shape: Shape,
     ) -> Result<Self, StartupError> {
         let error = |reason: &str| {
             StartupError::Runtime(format!(
@@ -34,9 +99,8 @@ impl Settings {
                 placement.topic, placement.partition,
             ))
         };
-        let topic = deployment.deployment().topic(&placement.topic)?;
-        let execution = execution(deployment, plan, placement)?;
-        let sizes = Sizes::check(topic, &execution).map_err(error)?;
+        let execution = execution(plan, placement, shape)?;
+        let sizes = Sizes::check(shape, &execution).map_err(error)?;
         let pipeline = PipelineLimits {
             max_operations: sizes.operations,
             max_body_bytes: sizes.body,
@@ -51,7 +115,7 @@ impl Settings {
             max_resident_bytes: 0,
             ..IndexBuildLimits::default()
         };
-        let limits = sizes.journal_limits(topic, execution.direct, checkpoint);
+        let limits = sizes.journal_limits(shape, execution.direct, checkpoint);
         limits
             .validate_backend(execution.backend, execution.lane, &placement.directory)
             .map_err(|failure| error(&failure.to_string()))?;
@@ -73,10 +137,11 @@ impl Settings {
                 execution.resident_bytes,
             ),
             clients: deployment.deployment().limits.max_clients,
+            lazy_spare: shape.lazy_spare,
         })
     }
 
-    pub(super) fn config<C>(
+    pub(crate) fn config<C>(
         self,
         placement: &PartitionPlacement,
         identity: GroupIdentity,
@@ -98,6 +163,7 @@ impl Settings {
             write_group_bytes: self.pipeline.max_body_bytes,
             reads: self.reads,
             producer_idle: Some(std::time::Duration::from_secs(placement.producer_idle_secs)),
+            lazy_spare: self.lazy_spare,
         }
     }
 
@@ -122,7 +188,8 @@ pub fn check_partition_limits(
     plan: &BrokerPlan,
 ) -> Result<(), StartupError> {
     for placement in &plan.partitions {
-        let settings = Settings::new(deployment, plan, placement)?;
+        let shape = Shape::topic(deployment, plan, placement)?;
+        let settings = Settings::new(deployment, plan, placement, shape)?;
         let Some(limits) = settings.deduplication(placement) else {
             continue;
         };
@@ -168,7 +235,7 @@ struct Sizes {
 }
 
 impl Sizes {
-    fn check(topic: &Topic, execution: &Execution) -> Result<Self, &'static str> {
+    fn check(topic: Shape, execution: &Execution) -> Result<Self, &'static str> {
         let native = |bytes| usize::try_from(bytes).map_err(|_| "byte limit overflow");
         let (data, progress) = share_bytes(execution.backend, execution.lane)
             .map_err(|_| "device lane outside its backend")?;
@@ -195,7 +262,7 @@ impl Sizes {
 
     fn journal_limits(
         self,
-        topic: &Topic,
+        topic: Shape,
         direct: bool,
         checkpoint: CheckpointLimits,
     ) -> JournalLimits {
@@ -262,9 +329,9 @@ struct Execution {
 }
 
 fn execution(
-    deployment: &ValidatedDeployment,
     plan: &BrokerPlan,
     placement: &PartitionPlacement,
+    shape: Shape,
 ) -> Result<Execution, StartupError> {
     let error = |reason: &str| {
         StartupError::Runtime(format!(
@@ -281,16 +348,8 @@ fn execution(
     let (controller, lane) =
         controller_lane(plan, placement.shard).ok_or_else(|| error("missing device controller"))?;
     let backend = backend_limits(controller).map_err(error)?;
-    let max_append = deployment
-        .deployment()
-        .topic(&placement.topic)?
-        .max_append_bytes;
-    let partitions = plan
-        .partitions
-        .iter()
-        .filter(|partition| partition.shard == shard.id)
-        .count()
-        .max(1);
+    let max_append = shape.max_append_bytes;
+    let partitions = shape.sharers.max(1);
     Ok(Execution {
         backend,
         lane,

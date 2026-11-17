@@ -68,6 +68,15 @@ pub(super) struct Work {
 }
 
 impl Work {
+    /// Give unused reserved capacity back. Everything grows again with use.
+    pub(super) fn trim(&mut self) {
+        self.live.shrink_to_fit();
+        self.persisting_bytes.shrink_to_fit();
+        self.receive.trim();
+        self.recent.trim();
+        self.flow.trim();
+    }
+
     pub(super) fn new(
         config: &ActorConfig,
         channel: ozzy_replication::flow::Channel,
@@ -267,7 +276,7 @@ impl ReplicaActor {
             Ok(Some(start)) => self.start = Some((from, start)),
             Ok(None) => {}
             Err(DriverError::Replication(ReplicationError::HistoryGap)) => {
-                let Control::Commit(commit) = control else {
+                let (Control::Commit(commit) | Control::Rest { commit, .. }) = control else {
                     return Err(ActorError::history(HistoryReason::ReceiveWindow));
                 };
                 if self.work.deferred_commit.is_none_or(|(_, old)| {
