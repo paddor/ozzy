@@ -45,6 +45,10 @@ name = "ozzy_profile"
 path = "src/bin/ozzy_profile.rs"
 
 [[bin]]
+name = "ozzy_log_bench"
+path = "src/bin/ozzy_log_bench.rs"
+
+[[bin]]
 name = "ozzy_disk_probe"
 path = "src/bin/ozzy_disk_probe.rs"
 
