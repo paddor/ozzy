@@ -1,7 +1,7 @@
 //! Logs created and deleted while the brokers run: `Broker::create_log`,
 //! `delete_log`, `logs` and `runtime_log`, in single and three mode.
 
-use super::log::{append, appends_and_reads, leader, read_all};
+use super::log::{append, appends_and_reads, leader, read_all, record};
 use super::*;
 use ozzy_broker::log::{Log, LogRole};
 use ozzy_broker::{CreateError, DeleteError, LogSpec, LogState};
@@ -370,6 +370,45 @@ async fn a_resumed_leader_serves_a_follower_that_is_behind() {
         let appended = append(log, status.view, ahead, &[5]).await.unwrap();
         assert_eq!(appended.end.get(), ahead + 1);
         assert_eq!(read_all(log, 0, ahead + 1).await.len() as u64, ahead + 1);
+        cluster.shutdown().await;
+    })
+    .await
+    .expect("resumed leader made no bounded progress");
+}
+
+/// A leader stops cleanly with a record no follower confirmed, and comes
+/// back to a single follower that lacks it and a confirmed one before it.
+/// The leader cannot serve before a follower holds its whole log, so the
+/// follower asks it for what it lacks. The view goes on under the same
+/// leader, with both records.
+#[tokio::test(flavor = "current_thread")]
+async fn a_follower_fetches_the_unconfirmed_end_of_a_resumed_leaders_log() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let mut cluster = cluster(DeploymentMode::Three, 4).await;
+        let (stream, view, end) = led_log(&cluster).await;
+        cluster.isolate(0, true);
+        let leading = cluster.brokers[1].runtime_log(stream.id).unwrap();
+        let end = append(&leading, view, end, &[4]).await.unwrap().end.get();
+        cluster.stop(2).await;
+        // Nobody confirms this record. The leader stores it and stops.
+        let unconfirmed = leading
+            .append(view, Offset::new(end), vec![record(5, b"body")])
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let image = cluster.stop(1).await;
+        drop(unconfirmed);
+        cluster.isolate(0, false);
+        cluster.restore_clean(1, image).await;
+        copy(&cluster, 1, stream.id).await;
+        let logs = handles(&cluster, stream.id);
+        let (index, status) = leader(&logs, None).await;
+        assert_eq!(index, 1);
+        assert_eq!(status.view, view, "the resumed view gave up");
+        assert_eq!(status.committed_end.get(), end + 1, "the record is lost");
+        let log = &logs[index];
+        let appended = append(log, status.view, end + 1, &[6]).await.unwrap();
+        assert_eq!(appended.end.get(), end + 2);
+        assert_eq!(read_all(log, 0, end + 2).await.len() as u64, end + 2);
         cluster.shutdown().await;
     })
     .await

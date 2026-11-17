@@ -10,7 +10,7 @@ use ozzy_broker::log::{
 };
 use ozzy_proto::{MessageId, Offset};
 
-fn record(id: u8, body: &'static [u8]) -> LogRecord {
+pub(super) fn record(id: u8, body: &'static [u8]) -> LogRecord {
     LogRecord {
         id: MessageId::from_bytes([id; 16]),
         parts: [Bytes::from_static(body), Bytes::from_static(b"tail")]

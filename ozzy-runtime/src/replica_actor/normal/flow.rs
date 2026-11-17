@@ -140,6 +140,14 @@ impl Flow {
         Ok(())
     }
 
+    /// Whether the primary sends to this backup in its current receive
+    /// epoch.
+    pub(in crate::replica_actor) fn receiving(&self) -> bool {
+        self.local_handle
+            .as_ref()
+            .is_some_and(|bound| bound.established)
+    }
+
     pub(in crate::replica_actor) fn clear_compact_receipt(&mut self) {
         if let Some(bound) = &mut self.local_handle {
             bound.established = false;
@@ -290,7 +298,10 @@ impl ReplicaActor {
 
     /// Whether the receipt ledger belongs to this core's scope and journal
     /// generation. Activation leaves the old one until the next `flow_round`.
-    pub(super) fn receipt_current(&self, snapshot: &ozzy_replication::ReplicaSnapshot) -> bool {
+    pub(in crate::replica_actor) fn receipt_current(
+        &self,
+        snapshot: &ozzy_replication::ReplicaSnapshot,
+    ) -> bool {
         self.work.flow.key == Some((snapshot.scope, snapshot.journal.generation))
     }
 
@@ -386,7 +397,10 @@ impl ReplicaActor {
         }
     }
 
-    pub(super) fn retract_received(&mut self, now: Duration) -> Result<(), ActorError> {
+    pub(in crate::replica_actor) fn retract_received(
+        &mut self,
+        now: Duration,
+    ) -> Result<(), ActorError> {
         if let Some(snapshot) = self
             .driver
             .normal()

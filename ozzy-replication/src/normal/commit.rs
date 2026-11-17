@@ -116,7 +116,28 @@ impl NormalReplica {
         // A view has one descriptor per incarnation of its primary: one that
         // resumed the view after a clean stop announces its own log. A
         // rejoined backup installed its own log, not any descriptor.
+        self.announced = Some(start);
         Ok(())
+    }
+
+    /// On a backup: the log of a primary that resumed this view with
+    /// operations no backup confirmed, while this backup lacks its end.
+    /// Such a primary sends nothing until a backup holds its whole log, so
+    /// the backup fetches the rest from that source. A primary whose
+    /// announced log was committed sends what a backup lacks itself, and
+    /// so does every elected one: its backups installed its log.
+    pub fn missing_tail(&self) -> Option<crate::LogSource> {
+        let start = self.announced?;
+        (self.status == super::Status::Normal
+            && !self.is_primary()
+            && start.scope == self.configuration.scope()
+            && start.committed.op < start.accepted.op
+            && self.accepted.op < start.accepted.op)
+            .then(|| crate::LogSource {
+                voter: self.configuration.primary(start.scope.view),
+                generation: start.generation,
+                accepted: start.accepted,
+            })
     }
 
     /// Observe an authenticated primary's commit, including piggybacked commit.

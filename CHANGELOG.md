@@ -248,8 +248,13 @@
   whole log. No such follower meant an election, about six seconds
   later. The clean stop evidence now names the commit. A leader whose
   whole log was committed resumes once one follower answers in the view,
-  and replays from disk what that follower lacks. One that stopped with
-  uncommitted operations still needs a follower that holds them.
+  and replays from disk what that follower lacks.
+- A leader that resumed its view with operations no follower confirmed
+  no longer needs a follower that already holds them. It sends nothing
+  before one does, so a follower that lacked them never got them and the
+  view ended in an election. The follower now sees in START_VIEW that it
+  lacks the end of an uncommitted log and fetches it from the leader with
+  FETCH_OPS (`NormalReplica::missing_tail`, `OpsBatch::as_prepare`).
 - `Broker::create_log` right after a start no longer fails now and then.
   Every shard listed and cleaned the `logs` directory of its device, and
   one could remove the staged record another was writing. The records of

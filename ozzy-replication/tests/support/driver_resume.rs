@@ -2,7 +2,7 @@
 
 use super::*;
 use ozzy_replication::driver::CleanStop;
-use ozzy_replication::{PrepareOk, StartView};
+use ozzy_replication::{LogSource, PrepareOk, StartView};
 
 /// The disk of a copy that last installed view 4, which node 1 leads, with
 /// one accepted, uncommitted operation.
@@ -260,4 +260,37 @@ fn a_commit_past_the_recovered_log_does_not_resume() {
     let mut changing = recover(1, recovered());
     assert!(!changing.resume_primary(JournalGeneration(101), recovered(), second().prefix()));
     assert!(!changing.rejoinable());
+}
+
+/// A backup learns from the announcement of a resumed primary that it
+/// lacks the end of a log with unconfirmed operations, and names the source
+/// to fetch it from. It names none once it holds that log, and none for a
+/// log that was committed: its primary sends that one itself.
+#[test]
+fn a_backup_names_the_end_it_lacks_of_a_resumed_primarys_log() {
+    let now = Duration::from_secs(1);
+    let mut backup = driver(normal(1));
+    let scope = configuration().scope();
+    let announce = |committed: Prefix| StartView {
+        scope,
+        generation: JournalGeneration(102),
+        accepted: operation().prefix(),
+        committed,
+    };
+    assert_eq!(backup.normal().unwrap().missing_tail(), None);
+    let start = Control::StartView(announce(operation().prefix()));
+    backup.receive(node(0), start, now).unwrap();
+    assert_eq!(backup.normal().unwrap().missing_tail(), None, "committed");
+    let start = Control::StartView(announce(Prefix::GENESIS));
+    backup.receive(node(0), start, now).unwrap();
+    assert_eq!(
+        backup.normal().unwrap().missing_tail(),
+        Some(LogSource {
+            voter: node(0),
+            generation: JournalGeneration(102),
+            accepted: operation().prefix(),
+        })
+    );
+    backup.prepare(node(0), scope, &[operation()], now).unwrap();
+    assert_eq!(backup.normal().unwrap().missing_tail(), None, "caught up");
 }

@@ -2,6 +2,7 @@
 
 mod bridge;
 mod retired;
+mod tail;
 
 use crate::replica_actor::HistoryReason;
 use ozzy_replication::wire::{FetchOps, OpsBatch};
@@ -102,8 +103,13 @@ impl Lookup {
 #[derive(Debug, Clone, Copy)]
 pub(super) enum TransferPurpose {
     // A candidate digest is not usable until this scan reaches the source tail.
-    Lookup { op: OpNumber, found: Option<Prefix> },
+    Lookup {
+        op: OpNumber,
+        found: Option<Prefix>,
+    },
     Install,
+    /// A normal backup takes the end of a resumed primary's log.
+    Tail,
 }
 
 /// Other prefixes the election may check, which a lookup scan records as it
@@ -233,8 +239,10 @@ impl ReplicaActor {
         let request = transfer.request;
         // Selection-only lookup from an abandoned view supplies no new evidence.
         // Staging abort is scheduled separately, after admitted disk work settles.
-        if matches!(transfer.purpose, TransferPurpose::Lookup { .. })
-            && request.scope != self.driver.scope()
+        if matches!(
+            transfer.purpose,
+            TransferPurpose::Lookup { .. } | TransferPurpose::Tail
+        ) && request.scope != self.driver.scope()
         {
             self.transfer = None;
             return Ok(());
@@ -406,6 +414,7 @@ impl ReplicaActor {
                     self.transfer = Some(transfer);
                 }
             }
+            TransferPurpose::Tail => self.receive_tail(batch, transfer.request, now)?,
             TransferPurpose::Install => {
                 if self.pending.is_some() {
                     return Ok(());
