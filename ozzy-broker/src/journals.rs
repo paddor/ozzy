@@ -3,6 +3,7 @@
 pub(crate) mod limits;
 mod recovery;
 pub use limits::check_partition_limits;
+pub(crate) use recovery::OpenedRecovery;
 pub use recovery::{RecoveryIntent, RecoverySelection};
 
 use ozzy_config::{BrokerIdentity, DeploymentMode, PartitionIdentity, PartitionPlacement};

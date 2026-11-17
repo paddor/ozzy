@@ -22,9 +22,25 @@ pub async fn format_partition_journals(
     checked: &CheckedConfig,
     local: &BrokerIdentity,
 ) -> Result<(), StartupError> {
+    format_journals(checked, local, false).await
+}
+
+/// Format this broker's partitions, or with `unreplicated` only those no
+/// other broker holds: a broker that replaces a lost one makes the others
+/// as nonvoting copies when it starts, below the directories made here.
+pub(crate) async fn format_journals(
+    checked: &CheckedConfig,
+    local: &BrokerIdentity,
+    unreplicated: bool,
+) -> Result<(), StartupError> {
     check_volumes(checked, local)?;
-    let journals = JournalPlan::from_trusted_deployment(checked, local)?;
+    let mut journals = JournalPlan::from_trusted_deployment(checked, local)?;
+    // Every partition, also those not formatted here: a store that is
+    // there was not lost.
     preflight(&journals)?;
+    if unreplicated {
+        keep_unreplicated(&mut journals)?;
+    }
     let journals = Arc::new(journals.partitions);
     let roots: Arc<std::collections::BTreeMap<_, _>> = Arc::new(
         checked
@@ -78,6 +94,23 @@ pub async fn format_partition_journals(
     };
     devices.shutdown().await;
     result
+}
+
+/// Drop the replicated partitions from `journals`, and make the directory
+/// each of their stores goes below.
+fn keep_unreplicated(journals: &mut JournalPlan) -> Result<(), StartupError> {
+    let mut parents = BTreeSet::new();
+    journals.partitions.retain(|partition| {
+        let kept = matches!(partition.config, crate::JournalConfig::Local(_));
+        if !kept && let Some(parent) = partition.placement.directory.parent() {
+            parents.insert(parent.to_path_buf());
+        }
+        kept
+    });
+    for parent in &parents {
+        crate::volumes::create_durable(parent)?;
+    }
+    Ok(())
 }
 
 // Offline preflight rejects a mixed established/unformatted set before any

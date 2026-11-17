@@ -18,6 +18,7 @@ mod crash;
 mod delay;
 mod log;
 mod partition;
+mod replace;
 mod rest;
 mod runner;
 mod runtime_logs;

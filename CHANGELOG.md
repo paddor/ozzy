@@ -4,6 +4,8 @@
 
 ### Breaking
 
+- `ozzy_proto::handshake::Handshake` has a new `replacement` field,
+  sent as the optional `store-replacement` property.
 - `ozzy_broker::LogSpec` has a new `segment_bytes` field.
 - `ozzy_proto::handshake::Handshake` has a new `origin` field, sent as
   the optional `store-origin` property, and
@@ -61,6 +63,20 @@
 - `ozzy_log_bench` in `ozzy-bench` measures one log through the in-process
   log API: records per second and confirmation latency for one writer, on
   one or three brokers.
+- A broker that lost its local identity and stores comes back through
+  `ozzy_broker::provision_replacement`. It formats no replicated store:
+  every replicated partition, and every runtime log it is told to create,
+  starts as a nonvoting copy that votes once it holds the log of the
+  other two. It says in HELLO and WELCOME that it is a replacement, and
+  its peers keep its new store origin in place of the lost one. A marker
+  on its first device keeps this up across restarts until
+  `Broker::end_replacement`; `Broker::replacing` tells. A broker on
+  supplied storage is told with `ServingContext::replacing`.
+  `Service::announce_replacement`, `LinkSessions::set_replacement` and
+  `ozzy_journal_segment::recovery_unfinished` carry it.
+- A replicated runtime log whose store is gone when its broker starts,
+  or was left in the middle of a recovery, comes back as a nonvoting copy
+  and takes the log of the other two. Either stopped the shard before.
 - Peers refuse a broker that comes back on new stores. Each broker
   records the store origin of its peers in `OZZY_PEERS` on its first
   device, before the first link, and gives no link to a peer under
@@ -217,6 +233,15 @@
 
 ### Fixed
 
+- A leader that resumed its view after a clean stop keeps its broker up
+  when its only follower lacks the end of its log. The acknowledgment
+  fell inside the log the leader holds on disk only, and the broker
+  stopped on "operation metadata is outside the retained pipeline". The
+  view now commits nothing and the two elect the next one.
+- `Broker::create_log` right after a start no longer fails now and then.
+  Every shard listed and cleaned the `logs` directory of its device, and
+  one could remove the staged record another was writing. The records of
+  a device are read once.
 - A broker starts on any number of runtime log records. It listed the
   `logs` directory in one job sized by the log class, which a class of
   about 8,000 logs or a directory of many deleted logs pushed past what a

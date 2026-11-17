@@ -43,6 +43,7 @@ aggregate broker network traffic; see the configuration keys below.
 | `initialize_volumes`, `format_partition_journals` | Prepare device roots and journals |
 | `load_broker_identity` | Load this broker's store bindings |
 | `provision` | First start of an embedded broker in one call: derived shared identity, local identity, volumes, journals |
+| `provision_replacement` | The same for a broker that lost its stores: it holds every replicated log as a nonvoting copy until `Broker::end_replacement` |
 | `Broker::start_trusted` | Serve established stores |
 | `Broker::start_trusted_with_context` | Share an OMQ context with inproc SDKs |
 | `Broker::start_recovering_trusted` | Serve with `RecoverySelection`s |

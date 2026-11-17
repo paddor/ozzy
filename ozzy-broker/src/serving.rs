@@ -37,6 +37,7 @@ pub struct Broker {
     registered: Registered,
     clock: ozzy_runtime::frontend::ClockTrust,
     logs: logs::LogHandles,
+    replacement: crate::replacement::Replacement,
 }
 
 /// What the shards handed over at registration.
@@ -123,9 +124,13 @@ impl Broker {
         context: Option<Context>,
         selections: &[RecoverySelection],
     ) -> Result<Self, StartupError> {
-        let journals = Arc::new(
-            JournalPlan::from_trusted_deployment(&checked, &local)?.select_recovery(selections)?,
-        );
+        let replacement = crate::replacement::Replacement::load(&checked)?;
+        let mut journals =
+            JournalPlan::from_trusted_deployment(&checked, &local)?.select_recovery(selections)?;
+        if replacement.on() {
+            journals = journals.replace_lost()?;
+        }
+        let journals = Arc::new(journals);
         crate::check_volumes(&checked, &local)?;
         journals.check_recovery_intents()?;
         let omq = context.unwrap_or_else(|| {
@@ -140,7 +145,9 @@ impl Broker {
         let (owner, lanes) = DevicePools::start(&checked.plan)?;
         let storage = ShardStorage { lanes, owner };
         let mut context = ServingContext::from(omq);
-        context.origins = crate::origins::PeerOrigins::load(&checked, &local)?;
+        context.origins = crate::origins::PeerOrigins::load(&checked, &local)?
+            .map(|origins| origins.replacing(replacement.on()));
+        context.replacement = replacement;
         Self::start_on_storage(checked, journals, context, storage).await
     }
 
@@ -171,6 +178,7 @@ impl Broker {
         context: ServingContext,
         storage: ShardStorage<B, impl StorageOwner>,
     ) -> Result<Self, StartupError> {
+        let replacement = context.replacement.clone().armed(&journals);
         let (config, admin) = bound_config(&checked, context)?;
         let checked = Arc::new(checked);
         let logs = config.log_handles(journals.logs.clone());
@@ -214,6 +222,7 @@ impl Broker {
                     registered,
                     clock: config.clock.clone(),
                     logs,
+                    replacement,
                 });
             }
             (Err(error), Err(_)) => error,
@@ -251,6 +260,33 @@ impl Broker {
             .logs
             .get(&(topic.to_owned(), partition))
             .cloned()
+    }
+
+    /// Whether this broker replaces one that lost its stores and holds
+    /// every replicated log it is told to create as a nonvoting copy.
+    pub fn replacing(&self) -> bool {
+        self.replacement.on()
+    }
+
+    /// End the replacement: later logs are created as voting copies.
+    ///
+    /// Call it once this broker holds every log the lost one may have
+    /// held, so once [`Self::create_log`] answered for each log that
+    /// existed when this broker started. Copies that still recover stay
+    /// nonvoting until they are done, also across a restart.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the marker of the replacement cannot be removed. The
+    /// replacement then goes on.
+    pub fn end_replacement(&self) -> Result<(), StartupError> {
+        self.replacement.end()?;
+        if let Some(setup) = &self.logs.setup {
+            setup
+                .replacement()
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     /// What the clock guard last concluded about this broker's clock.

@@ -237,9 +237,20 @@ impl Cluster {
     }
 
     async fn install(&mut self, index: usize, image: Image, selections: &[RecoverySelection]) {
+        let context = self.contexts[index].clone();
+        self.install_on(index, image, selections, context).await;
+    }
+
+    async fn install_on(
+        &mut self,
+        index: usize,
+        image: Image,
+        selections: &[RecoverySelection],
+        context: ServingContext,
+    ) {
         let (checked, local) = self.configs[index].clone();
         let (broker, control, task) = start_image_selected(
-            self.contexts[index].clone(),
+            context,
             checked,
             local,
             selections,
@@ -293,6 +304,42 @@ impl Cluster {
         let (checked, local) = &self.configs[index];
         let image = Box::pin(provision_sized(checked, local, true, self.memory_limits)).await;
         self.restore(index, image).await;
+    }
+
+    /// Where broker `index` keeps its copy of runtime log `id`.
+    pub fn log_store(&self, index: usize, id: ozzy_proto::GroupId) -> PathBuf {
+        let broker = self.configs[index].0.local_broker().unwrap();
+        let device = broker.devices.values().next().unwrap();
+        let label = Uuid::from_bytes(*id.as_bytes()).simple().to_string();
+        device.root.join("logs").join(label)
+    }
+
+    /// Stop broker `index` cleanly and start it again as usual, but
+    /// without the tree at `path`.
+    pub async fn restart_without(&mut self, index: usize, path: &std::path::Path) {
+        let image = self.stop(index).await;
+        let checked = &self.configs[index].0;
+        let image = super::lose(checked, image, self.memory_limits, path).await;
+        self.restore_clean(index, image).await;
+    }
+
+    /// Stop broker `index` and start one in its place that lost every
+    /// store and says so: on newly formatted stores, its configured
+    /// partitions nonvoting, and every runtime log it is told to create a
+    /// nonvoting copy.
+    pub async fn replace(&mut self, index: usize) {
+        self.stop(index).await;
+        let (checked, local) = &self.configs[index];
+        let image = Box::pin(provision_sized(checked, local, true, self.memory_limits)).await;
+        let selections: Vec<_> = (checked.plan.partitions.iter())
+            .map(|partition| RecoverySelection {
+                topic: partition.topic.clone(),
+                partition: partition.partition,
+                intent: RecoveryIntent::Quarantine,
+            })
+            .collect();
+        let context = self.contexts[index].clone().replacing();
+        self.install_on(index, image, &selections, context).await;
     }
 
     /// Wait until every recovering partition has published its configuration.

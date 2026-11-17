@@ -18,6 +18,8 @@ pub struct ServingContext {
     pub(super) time: Time,
     /// The record of the stores behind each broker peer, when one is kept.
     pub(super) origins: Option<crate::origins::PeerOrigins>,
+    /// Whether the broker replaces one that lost its stores.
+    pub(super) replacement: crate::replacement::Replacement,
     /// Held-record memory bounds replacing the defaults: sealed rows loaded
     /// and active-segment rows.
     #[cfg(feature = "simulation")]
@@ -33,6 +35,7 @@ impl From<Context> for ServingContext {
             omq,
             time: Time::default(),
             origins: None,
+            replacement: crate::replacement::Replacement::default(),
             #[cfg(feature = "simulation")]
             held: None,
             #[cfg(feature = "simulation")]
@@ -42,6 +45,18 @@ impl From<Context> for ServingContext {
 }
 
 impl ServingContext {
+    /// Serve in place of a broker that lost its stores: every replicated
+    /// log this broker is told to create starts as a nonvoting copy, until
+    /// [`crate::Broker::end_replacement`]. A broker started on its own
+    /// devices reads this from the marker [`crate::provision_replacement`]
+    /// left; one on supplied storage is told here, and its caller selects
+    /// the recovery of the configured partitions.
+    #[must_use]
+    pub fn replacing(mut self) -> Self {
+        self.replacement = crate::replacement::Replacement::declared();
+        self
+    }
+
     /// Use the existing shared manual clock for protocol deadlines and append
     /// timestamps. Physical I/O execution and completion remain independent.
     #[cfg(feature = "simulation")]
@@ -57,6 +72,7 @@ impl ServingContext {
                 epoch_millis: Arc::new(AtomicU64::new(epoch_millis)),
             },
             origins: None,
+            replacement: crate::replacement::Replacement::default(),
             held: None,
             cut: CutPeers::default(),
         }

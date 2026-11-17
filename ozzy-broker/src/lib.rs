@@ -30,6 +30,7 @@ mod origins;
 mod placement;
 mod provision;
 mod provisioning;
+mod replacement;
 mod serving;
 mod shards;
 mod volumes;
@@ -50,7 +51,7 @@ pub use journals::{
 };
 pub use logs::{CreateError, DeleteError, LogSpec, LogState};
 pub use ozzy_runtime::log;
-pub use provision::provision;
+pub use provision::{provision, provision_replacement};
 pub use provisioning::{
     CheckedConfig, check_config, initialize_broker_identity, initialize_identity,
     load_broker_identity, load_deployment,

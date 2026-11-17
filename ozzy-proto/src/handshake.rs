@@ -26,7 +26,7 @@ pub const OWNER: u32 = 4;
 // Capability 14 is unassigned. Required use must fail, never imply delivery.
 const KNOWN_CAPABILITIES: u16 = 0x1fff;
 const MAX_PROPERTIES: usize = 32;
-const NAMES: [&[u8]; 11] = [
+const NAMES: [&[u8]; 12] = [
     b"versions",
     b"capabilities",
     b"required-capabilities",
@@ -38,6 +38,7 @@ const NAMES: [&[u8]; 11] = [
     b"max-record-bytes",
     b"superseded-hello",
     b"store-origin",
+    b"store-replacement",
 ];
 
 /// One endpoint's advertised receive limits and supported capability set.
@@ -156,6 +157,10 @@ pub struct Handshake {
     /// Nonzero identity of the stores a broker serves, the same in every
     /// run on them and new once they were made anew. Clients send none.
     pub origin: Option<u128>,
+    /// Whether the broker replaces one that lost its stores: its origin is
+    /// new, and it holds every replicated log as a nonvoting copy until the
+    /// copy has the log of the other two.
+    pub replacement: bool,
     /// Sender's receive bounds and capability advertisement/selection.
     pub parameters: Parameters,
 }
@@ -200,14 +205,16 @@ pub fn encode(
     ];
     let superseded = handshake.superseded_hello.map(u128::to_be_bytes);
     let origin = handshake.origin.map(u128::to_be_bytes);
+    let replacement = handshake.replacement.then_some(&[1_u8][..]);
     let optional = [
-        (&b"superseded-hello"[..], superseded.as_ref()),
-        (&b"store-origin"[..], origin.as_ref()),
+        (&b"superseded-hello"[..], superseded.as_ref().map(wide)),
+        (&b"store-origin"[..], origin.as_ref().map(wide)),
+        (&b"store-replacement"[..], replacement),
     ];
     let properties = (properties.into_iter()).chain(
         optional
             .into_iter()
-            .filter_map(|(name, value)| Some((name, &value?[..]))),
+            .filter_map(|(name, value)| Some((name, value?))),
     );
     // Identity, then one length-prefixed name and value per property.
     let size = properties
@@ -222,13 +229,23 @@ pub fn encode(
     if metadata.capacity() < size {
         return Err(HandshakeError::Capacity);
     }
-    metadata.clear();
-    metadata.extend_from_slice(&handshake.instance_id.to_be_bytes());
-    metadata.extend_from_slice(&handshake.hello_nonce.to_be_bytes());
+    write_identity(metadata, handshake);
     for (name, value) in properties {
         write_property(metadata, name, value)?;
     }
     Ok(header)
+}
+
+/// Start `metadata` over with the instance and the HELLO nonce.
+fn write_identity(metadata: &mut Vec<u8>, handshake: Handshake) {
+    metadata.clear();
+    metadata.extend_from_slice(&handshake.instance_id.to_be_bytes());
+    metadata.extend_from_slice(&handshake.hello_nonce.to_be_bytes());
+}
+
+/// The bytes of a wide optional property.
+fn wide(value: &[u8; 16]) -> &[u8] {
+    value
 }
 
 /// One length-prefixed property name and value.
@@ -276,6 +293,11 @@ pub fn decode(packet: Packet<'_>, limits: EnvelopeLimits) -> Result<Handshake, H
         instance_id,
         hello_nonce,
         origin: wide(values[10])?,
+        replacement: match values[11] {
+            None => false,
+            Some([1]) => true,
+            Some(_) => return Err(HandshakeError::Length),
+        },
         parameters,
     };
     validate_command(packet.envelope, handshake)?;
@@ -354,6 +376,7 @@ fn validate_command(envelope: Envelope, handshake: Handshake) -> Result<(), Hand
         || handshake.hello_nonce == 0
         || handshake.superseded_hello == Some(0)
         || handshake.origin == Some(0)
+        || (handshake.replacement && handshake.origin.is_none())
         || (envelope.opcode == Opcode::Hello && handshake.superseded_hello.is_some())
     {
         return Err(HandshakeError::Command);

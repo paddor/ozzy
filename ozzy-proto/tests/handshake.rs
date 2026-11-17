@@ -29,6 +29,7 @@ fn hello() -> Handshake {
         instance_id: 3,
         hello_nonce: 4,
         origin: None,
+        replacement: false,
         parameters: Parameters::append(DataLimits::default(), handshake::PRODUCER).unwrap(),
     }
 }
@@ -78,6 +79,7 @@ fn hello_fixture_and_welcome_preserve_directional_receive_limits() {
         instance_id: 8,
         hello_nonce: hello().hello_nonce,
         origin: None,
+        replacement: false,
         parameters: selected,
     };
     let header = handshake::encode(
@@ -288,4 +290,21 @@ fn a_store_origin_round_trips_and_zero_is_refused() {
         ..hello()
     };
     assert!(handshake::encode(envelope(), zero, &mut bytes, EnvelopeLimits::default()).is_err());
+}
+
+#[test]
+fn a_store_replacement_round_trips_and_needs_an_origin() {
+    let replacing = Handshake {
+        origin: Some(9),
+        replacement: true,
+        ..hello()
+    };
+    let mut bytes = Vec::with_capacity(1024);
+    handshake::encode(envelope(), replacing, &mut bytes, EnvelopeLimits::default()).unwrap();
+    assert_eq!(decode(&bytes).unwrap(), replacing);
+    let unnamed = Handshake {
+        replacement: true,
+        ..hello()
+    };
+    assert!(handshake::encode(envelope(), unnamed, &mut bytes, EnvelopeLimits::default()).is_err());
 }

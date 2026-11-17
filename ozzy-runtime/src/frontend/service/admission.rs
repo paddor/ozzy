@@ -30,7 +30,7 @@ impl Service {
         if packet.envelope.sender != peer {
             return Err(ReceiveError::Peer);
         }
-        self.check_origin(peer, kind, hello.origin)?;
+        self.check_origin(peer, kind, (hello.origin, hello.replacement))?;
         let handled = self.sessions.receive(peer, packet)?;
         let link = match handled.replaced {
             Some(established) => {
