@@ -86,6 +86,7 @@ impl NormalReplica {
         self.activation_tail = ticket.accepted().op;
         self.installed_view = Some(start);
         self.rejoined = ticket.rejoins();
+        self.backup_seen = false;
         self.journal_tail = None;
         self
     }

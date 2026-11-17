@@ -103,6 +103,8 @@ pub struct NormalReplica {
     /// This copy rejoined or resumed its view after a restart, so
     /// `installed_view` describes its own log as the restart found it.
     rejoined: bool,
+    /// A backup acknowledged in this view since it was installed here.
+    backup_seen: bool,
     journal_tail: Option<Prefix>,
 }
 
@@ -179,6 +181,7 @@ impl NormalReplica {
             activation_tail: OpNumber(0),
             installed_view: None,
             rejoined: false,
+            backup_seen: false,
             journal_tail: None,
         })
     }
@@ -215,6 +218,7 @@ impl NormalReplica {
         self.activation_tail = log.accepted.op;
         self.installed_view = None;
         self.rejoined = false;
+        self.backup_seen = false;
         self.journal_tail = (log.accepted != Prefix::GENESIS).then_some(log.accepted);
     }
 
@@ -355,13 +359,22 @@ impl NormalReplica {
         self.acknowledged[left].max(self.acknowledged[right])
     }
 
+    /// Whether a backup confirms this primary through `through`. One that
+    /// was elected needs a backup to hold its log that far in the new view.
+    /// One that resumed its view calls only when that much is committed, so
+    /// a quorum held it before the stop: any backup that still follows the
+    /// view confirms it, however short its own log.
+    fn backup_holds(&self, through: OpNumber) -> bool {
+        self.backup_acknowledged() >= through || (self.rejoined && self.backup_seen)
+    }
+
     fn ready_for_appends(&self) -> bool {
         self.status == Status::Normal
             && self.journal_tail.is_none()
             && (!self.is_primary()
                 || (self.applied.op >= self.activation_tail
                     && self.journal.snapshot().durable >= self.activation_tail
-                    && self.backup_acknowledged() >= self.activation_tail))
+                    && self.backup_holds(self.activation_tail)))
     }
 
     fn require_normal(&self) -> Result<(), ReplicationError> {

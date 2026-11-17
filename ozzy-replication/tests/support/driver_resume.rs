@@ -45,7 +45,7 @@ fn restarted(changing: ViewChange) -> ReplicaDriver {
 fn a_primary_that_stopped_cleanly_resumes_its_view() {
     let now = Duration::from_millis(5);
     let mut changing = recover(1, recovered());
-    assert!(changing.resume_primary(JournalGeneration(101), recovered()));
+    assert!(changing.resume_primary(JournalGeneration(101), recovered(), Prefix::GENESIS));
     let mut primary = restarted(changing);
     assert!(primary.rejoin_pending());
     assert_eq!(primary.poll(now).unwrap(), None, "no promise of view 5");
@@ -89,6 +89,7 @@ fn a_primary_that_stopped_cleanly_resumes_its_view() {
         Some(CleanStop {
             view: 4,
             accepted: operation().prefix(),
+            committed: operation().prefix(),
         })
     );
 }
@@ -106,7 +107,7 @@ fn only_the_primary_of_the_installed_view_may_resume_it() {
 
     let mut backup = recover(2, recovered());
     assert!(backup.rejoinable());
-    assert!(!backup.resume_primary(JournalGeneration(101), recovered()));
+    assert!(!backup.resume_primary(JournalGeneration(101), recovered(), Prefix::GENESIS));
 
     // View 7 is node 1's too, but it never installed it.
     let promised = RecoveredState {
@@ -117,7 +118,7 @@ fn only_the_primary_of_the_installed_view_may_resume_it() {
         ..recovered()
     };
     let mut changing = recover(1, promised);
-    assert!(!changing.resume_primary(JournalGeneration(101), promised));
+    assert!(!changing.resume_primary(JournalGeneration(101), promised, Prefix::GENESIS));
     assert!(!changing.rejoinable());
 }
 
@@ -130,6 +131,7 @@ fn clean_stop_evidence_needs_a_primary_with_a_durable_log() {
     let empty = CleanStop {
         view: 0,
         accepted: Prefix::GENESIS,
+        committed: Prefix::GENESIS,
     };
     assert_eq!(primary.clean_stop(), Some(empty));
     let Admission::Write { ticket, .. } = primary
@@ -148,6 +150,7 @@ fn clean_stop_evidence_needs_a_primary_with_a_durable_log() {
         Some(CleanStop {
             view: 0,
             accepted: operation().prefix(),
+            committed: Prefix::GENESIS,
         })
     );
 }
@@ -187,7 +190,7 @@ fn a_resumed_primary_waits_for_a_backup_that_lacks_the_end_of_its_log() {
         ..recovered()
     };
     let mut changing = recover(1, found);
-    assert!(changing.resume_primary(JournalGeneration(101), found));
+    assert!(changing.resume_primary(JournalGeneration(101), found, Prefix::GENESIS));
     let mut primary = restarted(changing);
     let ticket = primary
         .begin_rejoin_install(JournalGeneration(102))
@@ -208,4 +211,53 @@ fn a_resumed_primary_waits_for_a_backup_that_lacks_the_end_of_its_log() {
     };
     assert_eq!(acknowledge(operation().prefix()), Prefix::GENESIS);
     assert_eq!(acknowledge(second().prefix()), second().prefix());
+}
+
+/// The primary stopped with its whole log committed, as its evidence says,
+/// though the journal recorded no commit. It resumes with the log
+/// committed and waits only for a backup that still follows the view. One
+/// that lacks the end of the log will do: the primary activates, and
+/// catches that backup up as it does any lagging one.
+#[test]
+fn a_resumed_primary_with_a_committed_log_needs_only_a_backup_in_its_view() {
+    let now = Duration::from_millis(5);
+    let found = RecoveredState {
+        log: FrozenLog {
+            accepted: second().prefix(),
+            ..recovered().log
+        },
+        ..recovered()
+    };
+    let mut changing = recover(1, found);
+    assert!(changing.resume_primary(JournalGeneration(101), found, second().prefix()));
+    let mut primary = restarted(changing);
+    let ticket = primary
+        .begin_rejoin_install(JournalGeneration(102))
+        .unwrap();
+    assert_eq!(ticket.committed(), second().prefix());
+    primary
+        .complete_installation(ticket, second().prefix(), now)
+        .unwrap();
+    let scope = primary.normal().unwrap().scope();
+    assert!(primary.begin_activation().is_err(), "no backup yet");
+    let ack = PrepareOk {
+        scope,
+        durable: operation().prefix(),
+    };
+    primary
+        .receive(node(2), Control::PrepareOk { ack }, now)
+        .unwrap();
+    let activation = primary.begin_activation().unwrap();
+    primary.complete_activation(activation).unwrap();
+    let snapshot = primary.normal().unwrap().snapshot();
+    assert!(snapshot.ready_for_appends);
+    assert_eq!(snapshot.committed, second().prefix());
+}
+
+/// Evidence of a commit outside the recovered log gives no right to resume.
+#[test]
+fn a_commit_past_the_recovered_log_does_not_resume() {
+    let mut changing = recover(1, recovered());
+    assert!(!changing.resume_primary(JournalGeneration(101), recovered(), second().prefix()));
+    assert!(!changing.rejoinable());
 }

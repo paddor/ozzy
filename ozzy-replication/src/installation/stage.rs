@@ -274,11 +274,14 @@ impl ViewChange {
             generation: local.journal.generation,
             accepted: local.accepted,
         };
+        // A backup rejoins with the commit its journal recorded. A primary
+        // that resumes brings the commit it knew when it stopped.
+        let committed = promise.log().committed;
         let ticket = InstallTicket {
             scope: promise.scope(),
             rejoin: true,
             view_tail: true,
-            ..self.install_ticket(generation, source, local.committed, local.committed)?
+            ..self.install_ticket(generation, source, committed, local.committed)?
         };
         Ok(Admitted {
             ticket,
@@ -286,7 +289,7 @@ impl ViewChange {
                 scope: promise.scope(),
                 generation,
                 accepted: local.accepted,
-                committed: local.committed,
+                committed,
             },
             promise,
             body_bytes: 0,

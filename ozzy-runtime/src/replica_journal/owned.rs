@@ -238,7 +238,7 @@ impl OwnedJournal {
         };
         let startup = JournalStartup {
             rebuilt: false,
-            resumes: false,
+            resumes: None,
             configuration,
             local: config.identity.replica_node_id,
             generation,

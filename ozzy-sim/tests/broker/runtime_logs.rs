@@ -340,9 +340,9 @@ async fn a_replicated_log_keeps_its_view_across_a_cluster_restart() {
 }
 
 /// A leader stops cleanly and comes back to a single follower that lacks
-/// the end of its log. The leader resumes its view, but its log is on disk
-/// only and the follower's acknowledgment falls inside it, so the view
-/// cannot commit. The two elect the next view, which holds the whole log.
+/// the end of its log. The leader knows that log committed, resumes its
+/// view once the follower answers in it, and replays what the follower
+/// lacks from disk. No election runs.
 #[tokio::test(flavor = "current_thread")]
 async fn a_resumed_leader_serves_a_follower_that_is_behind() {
     tokio::time::timeout(Duration::from_secs(60), async {
@@ -358,12 +358,15 @@ async fn a_resumed_leader_serves_a_follower_that_is_behind() {
         copy(&cluster, 1, stream.id).await;
         let logs = handles(&cluster, stream.id);
         let (index, status) = leader(&logs, None).await;
+        assert_eq!(index, 1);
+        assert_eq!(status.view, view, "the resumed view gave up");
         assert_eq!(
             status.committed_end.get(),
             ahead,
             "the new view lost a record"
         );
         let log = &logs[index];
+        // Only the follower can confirm this, and only with the whole log.
         let appended = append(log, status.view, ahead, &[5]).await.unwrap();
         assert_eq!(appended.end.get(), ahead + 1);
         assert_eq!(read_all(log, 0, ahead + 1).await.len() as u64, ahead + 1);

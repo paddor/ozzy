@@ -104,24 +104,36 @@ impl ViewChange {
     /// has sent nothing since. Its restart is then a pause too. Without
     /// that evidence it must leave the view.
     ///
+    /// `committed` is what a quorum held of that log when the primary
+    /// stopped. The primary resumes with that much committed, however far
+    /// the commit its journal recorded trails it.
+    ///
     /// Returns whether the right was granted. It is not when the copy is
-    /// not that primary or already promised a later view.
+    /// not that primary, already promised a later view, or `committed`
+    /// does not lie between the recorded commit and the end of the log.
     pub fn resume_primary(
         &mut self,
         generation: JournalGeneration,
         recovered: RecoveredState,
+        committed: crate::Prefix,
     ) -> bool {
         let installed = recovered.scope.view;
+        let mut log = recovered.log;
         if self.promise != Promise::Prior(installed)
-            || recovered.log.last_normal_view != installed
+            || log.last_normal_view != installed
             || self.configuration.primary(installed) != self.configuration.voter(self.local)
+            || committed.op < log.committed.op
+            || committed.op > log.accepted.op
+            || (committed.op == log.committed.op && committed != log.committed)
+            || (committed.op == log.accepted.op && committed != log.accepted)
         {
             return false;
         }
+        log.committed = committed;
         self.rejoin = Some(PromiseTicket {
             scope: recovered.scope,
             generation,
-            log: recovered.log,
+            log,
         });
         true
     }
