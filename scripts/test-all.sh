@@ -31,6 +31,11 @@ if [[ "$phase" == lint ]]; then
     exit 0
 fi
 
+# Flush the build output before the run. Left dirty, the kernel writes it
+# out during the tests, and an fsync of a real-disk test on the same device
+# can stall past the test's progress limit.
+check_phase build cargo nextest run --workspace --no-run
+check_phase sync sync
 check_phase tests cargo nextest run --workspace --test-threads 8 \
     --status-level fail --final-status-level "${NEXTEST_FINAL_STATUS_LEVEL:-fail}"
 check_phase doctests cargo test --workspace --doc
