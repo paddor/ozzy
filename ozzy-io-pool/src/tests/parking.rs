@@ -168,8 +168,9 @@ async fn another_file_at_a_parked_handles_path_is_an_error() {
     let root = temp.path();
     let a = file(&mut client, root, "a").await;
     let b = file(&mut client, root, "b").await;
-    // Behind the pool's back.
-    std::fs::remove_file(root.join("a")).unwrap();
+    // Behind the pool's back. The old file keeps its inode under another
+    // name, so the new one cannot be given the same number.
+    std::fs::rename(root.join("a"), root.join("moved")).unwrap();
     std::fs::write(root.join("a"), b"impostor").unwrap();
     let error = read(&mut client, &a).await.unwrap_err();
     assert!(error.to_string().contains("another file"), "{error}");
