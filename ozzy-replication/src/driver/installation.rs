@@ -55,6 +55,9 @@ pub struct CleanStop {
     pub view: u64,
     /// Its whole log, durable when it stopped.
     pub accepted: Prefix,
+    /// What a quorum held of that log. The journal learns of a commit
+    /// late, so its own record of it may trail this.
+    pub committed: Prefix,
 }
 
 impl ReplicaDriver {
@@ -69,6 +72,7 @@ impl ReplicaDriver {
             .then_some(CleanStop {
                 view: snapshot.scope.view,
                 accepted: snapshot.accepted,
+                committed: snapshot.committed,
             })
     }
 

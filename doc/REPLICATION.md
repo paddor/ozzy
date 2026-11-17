@@ -250,7 +250,7 @@ stateDiagram-v2
   fails. The copy then requests the next view. A rejoined follower whose
   leader is gone times out like any other.
 - A leader that stops cleanly, with its whole log durable, leaves evidence
-  of it: the view and the end of its log. A shard writes the evidence of
+  of it: the view, the end of its log, and how much of it was committed. A shard writes the evidence of
   its runtime logs once it has stopped, and the next start removes it from
   the disk before any log opens, so only that one start can use it. A
   leader that finds its log as the evidence names it rejoins its view the
@@ -259,12 +259,17 @@ stateDiagram-v2
 - A resumed leader announces its log under its new writer incarnation with
   START_VIEW, also in view zero. Followers that kept running take it as
   contact. A copy that never installed the view installs that log, which
-  may hold operations of the view itself. Fresh appends wait until a
-  follower acknowledges the whole log.
-- A resumed leader holds its log on disk only. What a follower that lacks
-  the end of it acknowledges falls inside that log and counts for nothing.
-  With no other follower the view commits nothing, and the two elect the
-  next one.
+  may hold operations of the view itself.
+- A resumed leader starts with the commit its evidence names, which may
+  be ahead of the one its journal recorded. When that is its whole log, a
+  quorum held the log before the stop. The leader then serves as soon as
+  one follower answers in the view, and replays from disk what that
+  follower lacks.
+- A resumed leader whose log ends in uncommitted operations waits until a
+  follower acknowledges the whole log. It holds that log on disk only, so
+  what a follower acknowledges inside it counts for nothing. With no
+  follower that holds the end, the view commits nothing, and the two
+  elect the next one.
 - A view that an election installed starts with its whole log applied on
   every follower, and a leader replays nothing at or below it. A resumed
   leader replays from wherever a follower's receipt stands.

@@ -27,6 +27,7 @@ impl NormalReplica {
         if !self.is_primary() || voter == self.local {
             return Err(ReplicationError::WrongRole);
         }
+        self.backup_seen = true;
         if prefix.op < self.applied.op {
             return Ok(());
         }
@@ -95,7 +96,7 @@ impl NormalReplica {
             .is_none_or(|installed| installed.accepted != snapshot.accepted)
             || snapshot.committed != snapshot.accepted
             || snapshot.journal.durable < snapshot.accepted.op
-            || (self.is_primary() && self.backup_acknowledged() < snapshot.accepted.op)
+            || (self.is_primary() && !self.backup_holds(snapshot.accepted.op))
         {
             return Err(ReplicationError::ActivationPending);
         }

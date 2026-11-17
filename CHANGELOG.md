@@ -4,6 +4,10 @@
 
 ### Breaking
 
+- `ozzy_replication::driver::CleanStop` has a new `committed` field, and
+  `ViewChange::resume_primary` takes that commit. The evidence files in
+  `logs/stops` changed format: a broker that stopped under an older
+  version elects its runtime log leaders again once.
 - `ozzy_proto::handshake::Handshake` has a new `replacement` field,
   sent as the optional `store-replacement` property.
 - `ozzy_broker::LogSpec` has a new `segment_bytes` field.
@@ -236,8 +240,16 @@
 - A leader that resumed its view after a clean stop keeps its broker up
   when its only follower lacks the end of its log. The acknowledgment
   fell inside the log the leader holds on disk only, and the broker
-  stopped on "operation metadata is outside the retained pipeline". The
-  view now commits nothing and the two elect the next one.
+  stopped on "operation metadata is outside the retained pipeline". Such
+  an acknowledgment now counts for nothing.
+- A leader that resumed its view serves a follower that lacks the end of
+  its log. It came back with the commit its journal had recorded, which
+  trails the real one, and then waited for a follower to acknowledge the
+  whole log. No such follower meant an election, about six seconds
+  later. The clean stop evidence now names the commit. A leader whose
+  whole log was committed resumes once one follower answers in the view,
+  and replays from disk what that follower lacks. One that stopped with
+  uncommitted operations still needs a follower that holds them.
 - `Broker::create_log` right after a start no longer fails now and then.
   Every shard listed and cleaned the `logs` directory of its device, and
   one could remove the staged record another was writing. The records of

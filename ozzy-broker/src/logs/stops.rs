@@ -17,9 +17,10 @@ use std::{
 /// The directory below a device's log directory that holds the evidence.
 const DIRECTORY: &str = "stops";
 const STAGED: &str = "staged";
-const MAGIC: &[u8; 8] = b"OZZYSTOP";
-/// Group, view, operation number, and digest.
-const ENTRY_BYTES: usize = 16 + 8 + 8 + 32;
+const MAGIC: &[u8; 8] = b"OZZYSTP2";
+/// Group, view, and the operation number and digest of the accepted and
+/// of the committed prefix.
+const ENTRY_BYTES: usize = 16 + 8 + 2 * (8 + 32);
 
 /// The clean stops of the logs of one device, by log.
 pub(crate) type Stops = BTreeMap<GroupId, CleanStop>;
@@ -30,8 +31,10 @@ fn encode(stops: &[(GroupId, CleanStop)]) -> Vec<u8> {
     for (group, stop) in stops {
         bytes.extend_from_slice(group.as_bytes());
         bytes.extend_from_slice(&stop.view.to_le_bytes());
-        bytes.extend_from_slice(&stop.accepted.op.0.to_le_bytes());
-        bytes.extend_from_slice(stop.accepted.digest.as_bytes());
+        for prefix in [stop.accepted, stop.committed] {
+            bytes.extend_from_slice(&prefix.op.0.to_le_bytes());
+            bytes.extend_from_slice(prefix.digest.as_bytes());
+        }
     }
     bytes
 }
@@ -49,12 +52,12 @@ fn decode(bytes: &[u8], stops: &mut Stops) {
     for entry in entries {
         let (group, rest) = entry.split_at(16);
         let (view, rest) = rest.split_at(8);
-        let (op, digest) = rest.split_at(8);
-        let (Ok(group), Ok(view), Ok(op), Ok(digest)) = (
+        let (accepted, committed) = rest.split_at(8 + 32);
+        let (Ok(group), Ok(view), Some(accepted), Some(committed)) = (
             group.try_into(),
             view.try_into(),
-            op.try_into(),
-            digest.try_into(),
+            prefix(accepted),
+            prefix(committed),
         ) else {
             return;
         };
@@ -62,13 +65,20 @@ fn decode(bytes: &[u8], stops: &mut Stops) {
             GroupId::from_bytes(group),
             CleanStop {
                 view: u64::from_le_bytes(view),
-                accepted: Prefix {
-                    op: OpNumber(u64::from_le_bytes(op)),
-                    digest: Digest::from_bytes(digest),
-                },
+                accepted,
+                committed,
             },
         );
     }
+}
+
+/// An operation number and the digest of the log through it.
+fn prefix(bytes: &[u8]) -> Option<Prefix> {
+    let (op, digest) = bytes.split_at_checked(8)?;
+    Some(Prefix {
+        op: OpNumber(u64::from_le_bytes(op.try_into().ok()?)),
+        digest: Digest::from_bytes(digest.try_into().ok()?),
+    })
 }
 
 /// Publish the clean stops of `shard` below `directory`: staged, synced,
@@ -183,12 +193,14 @@ mod tests {
     use super::*;
 
     fn stop(view: u64, op: u64) -> CleanStop {
+        let prefix = |op: u64| Prefix {
+            op: OpNumber(op),
+            digest: Digest::from_bytes([op.to_le_bytes()[0]; 32]),
+        };
         CleanStop {
             view,
-            accepted: Prefix {
-                op: OpNumber(op),
-                digest: Digest::from_bytes([op.to_le_bytes()[0]; 32]),
-            },
+            accepted: prefix(op),
+            committed: prefix(op / 2),
         }
     }
 
