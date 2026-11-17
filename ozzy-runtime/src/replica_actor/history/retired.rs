@@ -118,8 +118,8 @@ impl ReplicaActor {
         }) else {
             return Ok(false);
         };
-        if let TransferPurpose::Install = transfer.purpose {
-            return self.retired_install(transfer.request, notice);
+        if !matches!(transfer.purpose, TransferPurpose::Lookup { .. }) {
+            return self.retired_other(&transfer, notice);
         }
         if notice.before.op <= transfer.request.predecessor.op {
             // The source does not hold the expected prefix a lookup started
@@ -174,6 +174,22 @@ impl ReplicaActor {
         } else {
             return Ok(true);
         }
+        Ok(false)
+    }
+
+    /// A notice for a transfer that is no lookup. A primary that would not
+    /// serve the end of its log to this backup leads again and sends the
+    /// rest itself: the backup is not behind what the primary still holds.
+    fn retired_other(
+        &mut self,
+        transfer: &super::Transfer,
+        notice: wire::HistoryRetired,
+    ) -> Result<bool, ActorError> {
+        if let TransferPurpose::Install = transfer.purpose {
+            return self.retired_install(transfer.request, notice);
+        }
+        self.transfer = None;
+        self.tail_refused = Some(transfer.request.source);
         Ok(false)
     }
 

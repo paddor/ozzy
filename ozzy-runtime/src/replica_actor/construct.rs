@@ -112,6 +112,7 @@ impl ReplicaActor {
             start: None,
             lookup: Lookup::default(),
             transfer: None,
+            tail_refused: None,
             staged: None,
             journal_scope,
             activated,

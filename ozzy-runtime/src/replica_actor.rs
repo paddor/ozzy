@@ -138,6 +138,9 @@ pub struct ReplicaActor {
     start: Option<(NodeId, StartView)>,
     lookup: Lookup,
     transfer: Option<Transfer>,
+    /// A resumed primary's log whose end it would not let this backup
+    /// fetch: it sends it itself.
+    tail_refused: Option<LogSource>,
     staged: Option<Prefix>,
     journal_scope: Scope,
     activated: Option<(Scope, JournalGeneration)>,
@@ -236,6 +239,7 @@ impl ReplicaActor {
         self.normal_round(now)?;
         self.donor_round()?;
         self.schedule(now)?;
+        self.schedule_tail()?;
         self.retry_transfer(now)?;
         self.ack(now)?;
         self.publish_status(true);

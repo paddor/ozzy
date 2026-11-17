@@ -90,6 +90,13 @@ impl<'a> OpsBatch<'a> {
         self.batch.operations()
     }
 
+    /// These operations as a prepare that claims `committed`. Only for a
+    /// chunk the primary of the view sent from its own log: a backup then
+    /// admits it as it admits that primary's prepares.
+    pub const fn as_prepare(self, committed: Prefix) -> super::PrepareBatch<'a> {
+        super::PrepareBatch::from_batch(committed, self.batch)
+    }
+
     /// Match the live outstanding request after authenticated session decoding.
     ///
     /// The adapter invalidates pending requests when their session or role ends.

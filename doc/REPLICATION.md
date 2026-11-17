@@ -266,10 +266,15 @@ stateDiagram-v2
   one follower answers in the view, and replays from disk what that
   follower lacks.
 - A resumed leader whose log ends in uncommitted operations waits until a
-  follower acknowledges the whole log. It holds that log on disk only, so
-  what a follower acknowledges inside it counts for nothing. With no
-  follower that holds the end, the view commits nothing, and the two
-  elect the next one.
+  follower acknowledges the whole log, and sends nothing before. It holds
+  that log on disk only, so what a follower acknowledges inside it counts
+  for nothing.
+- A follower that lacks the end of such a log fetches it. START_VIEW
+  names the log and its commit, the follower asks the leader for the
+  operations after its own with FETCH_OPS, as an installing copy does,
+  and admits them as it admits prepares. Each chunk goes into a fresh
+  receive epoch. A leader that leads again answers that the history is
+  retired, and sends the rest itself.
 - A view that an election installed starts with its whole log applied on
   every follower, and a leader replays nothing at or below it. A resumed
   leader replays from wherever a follower's receipt stands.

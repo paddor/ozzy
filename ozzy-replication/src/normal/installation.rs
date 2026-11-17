@@ -87,6 +87,7 @@ impl NormalReplica {
         self.installed_view = Some(start);
         self.rejoined = ticket.rejoins();
         self.backup_seen = false;
+        self.announced = None;
         self.journal_tail = None;
         self
     }

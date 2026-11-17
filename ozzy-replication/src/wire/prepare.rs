@@ -212,6 +212,10 @@ pub struct PrepareBatch<'a> {
 }
 
 impl<'a> PrepareBatch<'a> {
+    pub(super) const fn from_batch(committed: Prefix, batch: DecodedBatch<'a>) -> Self {
+        Self { committed, batch }
+    }
+
     /// Active primary view and immutable group configuration.
     pub const fn scope(self) -> Scope {
         self.batch.scope

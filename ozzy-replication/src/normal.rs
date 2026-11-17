@@ -105,6 +105,8 @@ pub struct NormalReplica {
     rejoined: bool,
     /// A backup acknowledged in this view since it was installed here.
     backup_seen: bool,
+    /// The log the primary last announced for this view, on a backup.
+    announced: Option<crate::StartView>,
     journal_tail: Option<Prefix>,
 }
 
@@ -182,6 +184,7 @@ impl NormalReplica {
             installed_view: None,
             rejoined: false,
             backup_seen: false,
+            announced: None,
             journal_tail: None,
         })
     }
@@ -219,6 +222,7 @@ impl NormalReplica {
         self.installed_view = None;
         self.rejoined = false;
         self.backup_seen = false;
+        self.announced = None;
         self.journal_tail = (log.accepted != Prefix::GENESIS).then_some(log.accepted);
     }
 
