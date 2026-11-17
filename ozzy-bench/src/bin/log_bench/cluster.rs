@@ -109,6 +109,7 @@ pub(crate) async fn start(options: &Options) -> Result<Cluster> {
             id: LOG,
             incarnation: PartitionIncarnation::from_bytes([0xB8; 16]),
             members,
+            segment_bytes: Some(options.segment_bytes),
         };
         for broker in &brokers {
             broker.create_log(spec.clone()).await?;

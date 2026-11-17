@@ -160,6 +160,7 @@ async fn a_step_down_ends_the_rest_of_its_part_of_the_shard_only() {
                 id: id(index),
                 incarnation: PartitionIncarnation::from_bytes([index + 100; 16]),
                 members: nodes.to_vec(),
+                segment_bytes: None,
             };
             for broker in &cluster.brokers {
                 broker.create_log(spec.clone()).await.unwrap();

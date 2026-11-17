@@ -4,6 +4,7 @@
 
 ### Breaking
 
+- `ozzy_broker::LogSpec` has a new `segment_bytes` field.
 - `ozzy_proto::handshake::Handshake` has a new `origin` field, sent as
   the optional `store-origin` property, and
   `ozzy_runtime::frontend::ReceiveError` a new `Origin` variant. A broker
@@ -51,6 +52,15 @@
 
 ### Added
 
+- A runtime log may name its own segment size. `LogSpec::segment_bytes`
+  overrides the `[logs]` class's `segment_bytes` for that log, under the
+  same rules (`LogClass::segment_fits`). An idle log holds one segment on
+  disk and a log at most 256 segments, so one deployment can hold many
+  small logs beside a few busy or large ones. Creating a known log with
+  another size answers `Exists`.
+- `ozzy_log_bench` in `ozzy-bench` measures one log through the in-process
+  log API: records per second and confirmation latency for one writer, on
+  one or three brokers.
 - Peers refuse a broker that comes back on new stores. Each broker
   records the store origin of its peers in `OZZY_PEERS` on its first
   device, before the first link, and gives no link to a peer under

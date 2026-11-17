@@ -28,7 +28,8 @@ pub struct Deployment {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LogClass {
-    /// Maximum physical bytes per segment file.
+    /// Physical bytes per segment file of a log that names no size of its
+    /// own.
     #[serde(default = "default_log_segment_bytes")]
     pub segment_bytes: u64,
     /// Maximum canonical append body.
@@ -36,6 +37,14 @@ pub struct LogClass {
     pub max_append_bytes: u64,
     /// Logs one broker may hold at once.
     pub max_logs: usize,
+}
+
+impl LogClass {
+    /// Whether a log of this class may have segments of `bytes`: at least
+    /// 1 MiB, aligned to 4 KiB, and twice the class's append bound.
+    pub const fn segment_fits(&self, bytes: u64) -> bool {
+        bytes >= 1024 * 1024 && bytes.is_multiple_of(4096) && self.max_append_bytes <= bytes / 2
+    }
 }
 
 /// Deployment authority, independent of local topology.

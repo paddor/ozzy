@@ -155,6 +155,12 @@ impl LogSetup {
                     && second != third => {}
             _ => return Err(invalid("members must be this broker or the three brokers")),
         }
+        let segment_bytes = spec.segment_bytes.unwrap_or(self.class.segment_bytes);
+        if !self.class.segment_fits(segment_bytes) {
+            return Err(invalid(
+                "segment_bytes must be 1 MiB or more, 4 KiB aligned, and twice the append bound",
+            ));
+        }
         let placement = self
             .placement(&self.checked.plan.name, spec.id)
             .map_err(|error| CreateError::Failed(error.to_string()))?;
@@ -171,7 +177,7 @@ impl LogSetup {
             volume: *volume,
             store,
             generation: 1,
-            segment_bytes: self.class.segment_bytes,
+            segment_bytes,
             max_append_bytes: self.class.max_append_bytes,
             state: LogState::Creating,
         })

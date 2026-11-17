@@ -423,8 +423,10 @@ partition with one writer, reached only through its `Log` handle from
   interrupted deletions, and discards creations that never finished.
   `Broker::ready` waits for them. A recorded log that cannot open stops
   the shard.
-- The `[logs]` class sets segment size, append bound, and the number of
-  logs per broker. A log keeps the sizes it was created with.
+- The `[logs]` class sets the append bound, the number of logs per broker,
+  and the segment size of a log whose spec names none. A spec may name its
+  own: small segments for many idle logs, large ones for a busy or large
+  log. A log keeps the sizes it was created with.
 - An empty log holds one segment. Its spare is allocated once the active
   segment is a quarter full.
 - The dispatcher routes only broker traffic to a runtime log and holds no

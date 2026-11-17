@@ -69,6 +69,7 @@ fn spec(index: usize, members: &[NodeId]) -> LogSpec {
         id: GroupId::from_bytes(id),
         incarnation: PartitionIncarnation::from_bytes(incarnation),
         members: members.to_vec(),
+        segment_bytes: None,
     }
 }
 
@@ -161,6 +162,69 @@ async fn idle_logs_share_a_small_descriptor_budget_and_one_lock() {
     for broker in brokers {
         broker.shutdown().await.unwrap();
     }
+}
+
+/// A log holds segments of the size its spec names, another log of the
+/// same class those of the class, and both keep theirs over a restart.
+#[tokio::test(flavor = "current_thread")]
+async fn a_log_keeps_the_segment_size_its_spec_names() {
+    const MIB: u64 = 1024 * 1024;
+    let root = tempfile::tempdir().unwrap();
+    let runtime = WriterRuntime::new().unwrap();
+    let deployment = deployment_with(root.path(), DeploymentMode::Single, 1, |config| {
+        config.logs = Some(ozzy_config::LogClass {
+            segment_bytes: 2 * MIB,
+            max_append_bytes: 256 * 1024,
+            max_logs: 2,
+        });
+    });
+    let nodes: Vec<NodeId> = deployment
+        .iter()
+        .map(|(checked, _)| {
+            NodeId::from_bytes(*checked.identity.brokers[&checked.plan.name].as_bytes())
+        })
+        .collect();
+    let again = deployment.clone();
+    let brokers = start_brokers(&runtime, deployment).await;
+    let large = LogSpec {
+        segment_bytes: Some(16 * MIB),
+        ..spec(1, &nodes)
+    };
+    let empty = allocated(root.path());
+    brokers[0].create_log(spec(0, &nodes)).await.unwrap();
+    let small = allocated(root.path());
+    brokers[0].create_log(large).await.unwrap();
+    let both = allocated(root.path());
+    assert!(
+        (2 * MIB..4 * MIB).contains(&(small - empty)),
+        "{small} {empty}"
+    );
+    assert!(
+        (16 * MIB..18 * MIB).contains(&(both - small)),
+        "{both} {small}"
+    );
+    tokio::time::timeout(Duration::from_secs(30), all_led(&brokers, 2, &nodes))
+        .await
+        .unwrap();
+    for broker in brokers {
+        broker.shutdown().await.unwrap();
+    }
+    let (checked, local) = again.into_iter().next().unwrap();
+    let context = runtime.context().clone();
+    let broker = Broker::start_trusted_with_context(checked, local, context)
+        .await
+        .unwrap();
+    let brokers = [broker];
+    tokio::time::timeout(Duration::from_secs(30), all_led(&brokers, 2, &nodes))
+        .await
+        .unwrap();
+    let reopened = allocated(root.path());
+    assert!(
+        (18 * MIB..22 * MIB).contains(&(reopened - empty)),
+        "{reopened} {empty}"
+    );
+    let [broker] = brokers;
+    broker.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -24,6 +24,7 @@ fn spec(id: u8, members: &[ozzy_proto::NodeId]) -> LogSpec {
         id: GroupId::from_bytes([id; 16]),
         incarnation: PartitionIncarnation::from_bytes([id + 100; 16]),
         members: members.to_vec(),
+        segment_bytes: None,
     }
 }
 
@@ -56,6 +57,11 @@ async fn a_replicated_log_is_created_served_and_deleted_at_run_time() {
                 ..stream.clone()
             };
             assert_eq!(broker.create_log(other).await, Err(CreateError::Exists));
+            let resized = LogSpec {
+                segment_bytes: Some(64 * 1024 * 1024),
+                ..stream.clone()
+            };
+            assert_eq!(broker.create_log(resized).await, Err(CreateError::Exists));
         }
         let logs = handles(&cluster, stream.id);
         let (index, view, end) = appends_and_reads(&logs).await;
@@ -153,6 +159,16 @@ async fn a_local_log_lives_on_its_one_member_in_a_three_broker_cluster() {
             cluster.brokers[0].create_log(two).await,
             Err(CreateError::Invalid(_))
         ));
+        for bytes in [4096, 1024 * 1024 + 1, 1024 * 1024] {
+            let small = LogSpec {
+                segment_bytes: Some(bytes),
+                ..own.clone()
+            };
+            assert!(matches!(
+                cluster.brokers[0].create_log(small).await,
+                Err(CreateError::Invalid(_))
+            ));
+        }
         assert_eq!(cluster.brokers[0].create_log(own.clone()).await, Ok(()));
         let log = cluster.brokers[0].runtime_log(own.id).unwrap();
         let (_, view, end) = appends_and_reads(std::slice::from_ref(&log)).await;

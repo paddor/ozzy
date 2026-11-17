@@ -110,6 +110,7 @@ says what each mode confirms.
 - `[logs]` is the class of every log an embedder creates at run time. Its
   sizes follow the topic rules, and `max_logs` plus the configured
   partitions fit `max_partitions`. Without the table a broker creates none.
+  A log may be created with its own `segment_bytes` under the same rules.
 - `producer_idle_secs` is positive. A producer session with no open or append
   that long retires; resuming its identity starts fresh sequences.
 - Shard and device byte budgets must cover the largest `max_append_bytes`.

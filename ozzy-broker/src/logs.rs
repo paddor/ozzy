@@ -27,6 +27,11 @@ pub struct LogSpec {
     /// One broker for a local log, or all three for a replicated one. The
     /// first leads the first view.
     pub members: Vec<NodeId>,
+    /// Bytes per segment file, or the class's `segment_bytes`. An idle log
+    /// holds one segment on disk and a log at most 256, so small segments
+    /// suit many small logs and large ones a busy or large log. Fixed at
+    /// creation.
+    pub segment_bytes: Option<u64>,
 }
 
 /// Why a broker did not create a log.

@@ -232,9 +232,7 @@ fn validate_logs(config: &Deployment) -> Result<(), ConfigError> {
         "max_append_bytes must be at most 8 MiB",
     )?;
     require(
-        logs.segment_bytes >= 1024 * 1024
-            && logs.segment_bytes % 4096 == 0
-            && logs.max_append_bytes <= logs.segment_bytes / 2,
+        logs.segment_fits(logs.segment_bytes),
         "logs.segment_bytes",
         "segment must be aligned and leave framing space beyond max_append_bytes",
     )
