@@ -15,11 +15,11 @@ fn class(max_logs: usize) -> ozzy_config::LogClass {
     }
 }
 
-async fn cluster(mode: DeploymentMode, max_logs: usize) -> broker::Cluster {
+pub(super) async fn cluster(mode: DeploymentMode, max_logs: usize) -> broker::Cluster {
     broker::Cluster::configured(mode, None, |config| config.logs = Some(class(max_logs))).await
 }
 
-fn spec(id: u8, members: &[ozzy_proto::NodeId]) -> LogSpec {
+pub(super) fn spec(id: u8, members: &[ozzy_proto::NodeId]) -> LogSpec {
     LogSpec {
         id: GroupId::from_bytes([id; 16]),
         incarnation: PartitionIncarnation::from_bytes([id + 100; 16]),
@@ -29,12 +29,22 @@ fn spec(id: u8, members: &[ozzy_proto::NodeId]) -> LogSpec {
 }
 
 /// Handles of log `id` on every running broker, in broker order.
-fn handles(cluster: &broker::Cluster, id: GroupId) -> Vec<Log> {
+pub(super) fn handles(cluster: &broker::Cluster, id: GroupId) -> Vec<Log> {
     cluster
         .brokers
         .iter()
         .map(|broker| broker.runtime_log(id).unwrap())
         .collect()
+}
+
+/// Broker `index`'s copy of `id`, once its shard opened it.
+pub(super) async fn copy(cluster: &broker::Cluster, index: usize, id: GroupId) -> Log {
+    loop {
+        if let Some(log) = cluster.brokers[index].runtime_log(id) {
+            return log;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 /// A replicated log created on all three brokers elects the first member,
@@ -327,4 +337,38 @@ async fn a_replicated_log_keeps_its_view_across_a_cluster_restart() {
     })
     .await
     .expect("cluster restart made no bounded progress");
+}
+
+/// A leader stops cleanly and comes back to a single follower that lacks
+/// the end of its log. The leader resumes its view, but its log is on disk
+/// only and the follower's acknowledgment falls inside it, so the view
+/// cannot commit. The two elect the next view, which holds the whole log.
+#[tokio::test(flavor = "current_thread")]
+async fn a_resumed_leader_serves_a_follower_that_is_behind() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let mut cluster = cluster(DeploymentMode::Three, 4).await;
+        let (stream, view, end) = led_log(&cluster).await;
+        cluster.isolate(0, true);
+        let leading = cluster.brokers[1].runtime_log(stream.id).unwrap();
+        let ahead = append(&leading, view, end, &[4]).await.unwrap().end.get();
+        cluster.stop(2).await;
+        let image = cluster.stop(1).await;
+        cluster.isolate(0, false);
+        cluster.restore_clean(1, image).await;
+        copy(&cluster, 1, stream.id).await;
+        let logs = handles(&cluster, stream.id);
+        let (index, status) = leader(&logs, None).await;
+        assert_eq!(
+            status.committed_end.get(),
+            ahead,
+            "the new view lost a record"
+        );
+        let log = &logs[index];
+        let appended = append(log, status.view, ahead, &[5]).await.unwrap();
+        assert_eq!(appended.end.get(), ahead + 1);
+        assert_eq!(read_all(log, 0, ahead + 1).await.len() as u64, ahead + 1);
+        cluster.shutdown().await;
+    })
+    .await
+    .expect("resumed leader made no bounded progress");
 }

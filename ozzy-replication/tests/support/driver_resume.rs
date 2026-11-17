@@ -151,3 +151,61 @@ fn clean_stop_evidence_needs_a_primary_with_a_durable_log() {
         })
     );
 }
+
+/// The operation after [`operation`].
+fn second() -> PreparedOperation {
+    let body = OperationBody::Barrier(Barrier {
+        operation_id: OperationId::from_bytes([11; 16]),
+    });
+    let bytes = encode_operation_body(&body, OperationLimits::default()).unwrap();
+    PreparedOperation::from_verified(
+        &CanonicalOperation {
+            group_id: configuration().scope().group_id,
+            configuration_epoch: 1,
+            original_view: 0,
+            op_number: 2,
+            previous_digest: operation().prefix().digest,
+            kind: body.kind(),
+            body: &bytes,
+        },
+        canonical_body_digest(&bytes),
+    )
+}
+
+/// A backup that lacks the end of the resumed primary's log acknowledges
+/// an operation inside it. The primary keeps that log on disk and has no
+/// prefix to count the acknowledgment at: it commits nothing and keeps
+/// leading. The acknowledgment of the whole log commits it.
+#[test]
+fn a_resumed_primary_waits_for_a_backup_that_lacks_the_end_of_its_log() {
+    let now = Duration::from_millis(5);
+    let found = RecoveredState {
+        log: FrozenLog {
+            accepted: second().prefix(),
+            ..recovered().log
+        },
+        ..recovered()
+    };
+    let mut changing = recover(1, found);
+    assert!(changing.resume_primary(JournalGeneration(101), found));
+    let mut primary = restarted(changing);
+    let ticket = primary
+        .begin_rejoin_install(JournalGeneration(102))
+        .unwrap();
+    primary
+        .validate_install_suffix(&[operation(), second()])
+        .unwrap();
+    primary
+        .complete_installation(ticket, Prefix::GENESIS, now)
+        .unwrap();
+    let scope = primary.normal().unwrap().scope();
+    let mut acknowledge = |durable: Prefix| {
+        let ack = PrepareOk { scope, durable };
+        primary
+            .receive(node(2), Control::PrepareOk { ack }, now)
+            .unwrap();
+        primary.normal().unwrap().snapshot().committed
+    };
+    assert_eq!(acknowledge(operation().prefix()), Prefix::GENESIS);
+    assert_eq!(acknowledge(second().prefix()), second().prefix());
+}

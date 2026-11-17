@@ -30,7 +30,21 @@ impl NormalReplica {
         if prefix.op < self.applied.op {
             return Ok(());
         }
-        if self.prefix_at(prefix.op)? != prefix {
+        let known = match self.prefix_at(prefix.op) {
+            // A primary that resumed its view keeps its log on disk as a
+            // tail, and a backup may lack the end of it. What that backup
+            // acknowledges inside the tail has no prefix here to check or
+            // to commit at. Its acknowledgment of the tail's end counts.
+            // An elected view starts with the whole tail on every backup,
+            // so there such an acknowledgment stays an error.
+            Err(ReplicationError::HistoryUnavailable)
+                if self.rejoined && self.journal_tail.is_some() =>
+            {
+                return Ok(());
+            }
+            known => known?,
+        };
+        if known != prefix {
             return Err(self.conflict());
         }
         self.acknowledged[voter] = self.acknowledged[voter].max(prefix.op);
