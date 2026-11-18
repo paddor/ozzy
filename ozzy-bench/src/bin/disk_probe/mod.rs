@@ -1,6 +1,7 @@
 //! One writer, fresh unwritten extents, and separately measured write/barrier times.
 use clap::{Parser, ValueEnum};
 use ozzy_bench::automation::{self, Result, isolation, source};
+use ozzy_bench::measure::percentile;
 use rustix::fs::{AtFlags, FallocateFlags, FlockOperation, StatxFlags};
 use serde_json::{Value, json};
 use std::{
@@ -136,9 +137,7 @@ fn fill(bytes: &mut [u8]) {
 
 fn latencies(values: &mut [u64]) -> Value {
     values.sort_unstable();
-    let percentile = |n: usize| {
-        (!values.is_empty()).then(|| values[(values.len() * n).div_ceil(100) - 1] as f64 / 1000.0)
-    };
+    let percentile = |n: usize| percentile(values, n * 10).map(|nanos| nanos as f64 / 1000.0);
     json!({"samples":values.len(),"p50_us":percentile(50),"p99_us":percentile(99),
         "max_us":values.last().map(|v| *v as f64 / 1000.0)})
 }

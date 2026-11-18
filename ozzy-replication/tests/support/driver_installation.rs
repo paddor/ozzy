@@ -511,28 +511,7 @@ fn an_installing_backup_withdraws_suspicion_until_its_installation_stalls() {
 
 /// A backup of view 4 whose disk holds one accepted, uncommitted operation.
 fn restarted_backup() -> ReplicaDriver {
-    let changing = ViewChange::recover_intact(
-        configuration(),
-        node(2),
-        JournalGeneration(101),
-        RecoveredState {
-            scope: Scope {
-                view: 4,
-                ..configuration().scope()
-            },
-            log: FrozenLog {
-                last_normal_view: 4,
-                accepted: operation().prefix(),
-                committed: Prefix::GENESIS,
-            },
-        },
-        PipelineLimits {
-            max_operations: 8,
-            max_body_bytes: 1024,
-        },
-    )
-    .unwrap();
-    ReplicaDriver::from_view_change(changing, Duration::ZERO, timing()).unwrap()
+    restarted(recover(2, recovered()))
 }
 
 /// An intact restarted backup installs its own log in the view it last

@@ -1,13 +1,13 @@
 //! Logs created and deleted while the brokers run: `Broker::create_log`,
 //! `delete_log`, `logs` and `runtime_log`, in single and three mode.
 
-use super::log::{append, appends_and_reads, leader, read_all, record};
+use super::log::{append, appends_and_reads, follows, leader, order_logs, read_all, record};
 use super::*;
 use ozzy_broker::log::{Log, LogRole};
 use ozzy_broker::{CreateError, DeleteError, LogSpec, LogState};
 use ozzy_proto::{GroupId, Offset, PartitionIncarnation};
 
-fn class(max_logs: usize) -> ozzy_config::LogClass {
+pub(super) fn class(max_logs: usize) -> ozzy_config::LogClass {
     ozzy_config::LogClass {
         segment_bytes: 4 * 1024 * 1024,
         max_append_bytes: 1024 * 1024,
@@ -77,11 +77,7 @@ async fn a_replicated_log_is_created_served_and_deleted_at_run_time() {
         let (index, view, end) = appends_and_reads(&logs).await;
         assert_eq!(index, 1, "the first member leads the first view");
         // The configured topic still works beside it.
-        let orders: Vec<_> = cluster
-            .brokers
-            .iter()
-            .map(|broker| broker.log("orders", 0).unwrap())
-            .collect();
+        let orders = order_logs(&cluster);
         appends_and_reads(&orders).await;
 
         // A follower reopens the log from its record and rejoins.
@@ -94,11 +90,7 @@ async fn a_replicated_log_is_created_served_and_deleted_at_run_time() {
             cluster.brokers[2].logs(),
             vec![(stream.id, LogState::Ready)]
         );
-        let mut status = cluster.brokers[2].runtime_log(stream.id).unwrap().status();
-        let rejoined = *status
-            .wait_for(|status| status.role == LogRole::Follower)
-            .await
-            .unwrap();
+        let rejoined = follows(&cluster.brokers[2].runtime_log(stream.id).unwrap()).await;
         assert_eq!(rejoined.view, view);
         // Only the leader and the returned follower are left to commit, so
         // the follower first repairs what it missed.
@@ -137,11 +129,7 @@ async fn a_replicated_log_is_created_served_and_deleted_at_run_time() {
             vec![(stream.id, LogState::Deleted)]
         );
         // The configured topic outlived the log beside it.
-        let orders: Vec<_> = cluster
-            .brokers
-            .iter()
-            .map(|broker| broker.log("orders", 0).unwrap())
-            .collect();
+        let orders = order_logs(&cluster);
         let (index, status) = leader(&orders, None).await;
         let end = status.committed_end.get();
         append(&orders[index], status.view, end, &[8])
@@ -254,15 +242,19 @@ async fn a_single_broker_keeps_its_runtime_logs_across_a_restart() {
     .expect("single runtime log made no bounded progress");
 }
 
-/// A replicated log on every broker, led by broker 1, with three records.
-async fn led_log(cluster: &broker::Cluster) -> (LogSpec, u64, u64) {
-    let nodes = [cluster.node(1), cluster.node(2), cluster.node(0)];
-    let stream = spec(1, &nodes);
+/// Replicated log `id` on every broker with three records, led by
+/// `members[0]`.
+pub(super) async fn led_log(
+    cluster: &broker::Cluster,
+    id: u8,
+    members: [usize; 3],
+) -> (LogSpec, u64, u64) {
+    let stream = spec(id, &members.map(|index| cluster.node(index)));
     for broker in &cluster.brokers {
         assert_eq!(broker.create_log(stream.clone()).await, Ok(()));
     }
     let (index, view, end) = appends_and_reads(&handles(cluster, stream.id)).await;
-    assert_eq!(index, 1, "the first member leads the first view");
+    assert_eq!(index, members[0], "the first member leads the first view");
     (stream, view, end)
 }
 
@@ -286,7 +278,7 @@ async fn leads(cluster: &broker::Cluster, index: usize, id: GroupId) -> (Log, u6
 async fn a_replicated_log_keeps_its_view_across_a_clean_leader_restart() {
     tokio::time::timeout(Duration::from_secs(60), async {
         let mut cluster = cluster(DeploymentMode::Three, 4).await;
-        let (stream, view, end) = led_log(&cluster).await;
+        let (stream, view, end) = led_log(&cluster, 1, [1, 2, 0]).await;
         let image = cluster.stop(1).await;
         cluster.restore_clean(1, image).await;
         let (log, resumed, committed) = leads(&cluster, 1, stream.id).await;
@@ -317,7 +309,7 @@ async fn a_replicated_log_keeps_its_view_across_a_clean_leader_restart() {
 async fn a_replicated_log_keeps_its_view_across_a_cluster_restart() {
     tokio::time::timeout(Duration::from_secs(60), async {
         let mut cluster = cluster(DeploymentMode::Three, 4).await;
-        let (stream, view, mut end) = led_log(&cluster).await;
+        let (stream, view, mut end) = led_log(&cluster, 1, [1, 2, 0]).await;
         for round in 0..2 {
             let mut images = Vec::new();
             for index in [2, 1, 0] {
@@ -347,7 +339,7 @@ async fn a_replicated_log_keeps_its_view_across_a_cluster_restart() {
 async fn a_resumed_leader_serves_a_follower_that_is_behind() {
     tokio::time::timeout(Duration::from_secs(60), async {
         let mut cluster = cluster(DeploymentMode::Three, 4).await;
-        let (stream, view, end) = led_log(&cluster).await;
+        let (stream, view, end) = led_log(&cluster, 1, [1, 2, 0]).await;
         cluster.isolate(0, true);
         let leading = cluster.brokers[1].runtime_log(stream.id).unwrap();
         let ahead = append(&leading, view, end, &[4]).await.unwrap().end.get();
@@ -385,7 +377,7 @@ async fn a_resumed_leader_serves_a_follower_that_is_behind() {
 async fn a_follower_fetches_the_unconfirmed_end_of_a_resumed_leaders_log() {
     tokio::time::timeout(Duration::from_secs(60), async {
         let mut cluster = cluster(DeploymentMode::Three, 4).await;
-        let (stream, view, end) = led_log(&cluster).await;
+        let (stream, view, end) = led_log(&cluster, 1, [1, 2, 0]).await;
         cluster.isolate(0, true);
         let leading = cluster.brokers[1].runtime_log(stream.id).unwrap();
         let end = append(&leading, view, end, &[4]).await.unwrap().end.get();

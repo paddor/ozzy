@@ -19,13 +19,30 @@ pub(super) fn record(id: u8, body: &'static [u8]) -> LogRecord {
     }
 }
 
+/// Clear the retention limits of the `orders` topic, so it keeps its history.
+pub(super) fn keep_orders(config: &mut ozzy_config::Deployment) {
+    config.topics.get_mut("orders").unwrap().retention = ozzy_config::TopicRetention::default();
+}
+
+/// A cluster whose `orders` topic keeps every record.
+pub(super) async fn order_cluster(mode: DeploymentMode) -> broker::Cluster {
+    broker::Cluster::configured(mode, None, keep_orders).await
+}
+
 /// Logs of partition 0 on every running broker, in broker order.
-fn logs(cluster: &broker::Cluster) -> Vec<Log> {
+pub(super) fn order_logs(cluster: &broker::Cluster) -> Vec<Log> {
     cluster
         .brokers
         .iter()
         .map(|broker| broker.log("orders", 0).unwrap())
         .collect()
+}
+
+/// The status of `log` once its copy follows.
+pub(super) async fn follows(log: &Log) -> LogStatus {
+    let mut status = log.status();
+    let following = status.wait_for(|status| status.role == LogRole::Follower);
+    *following.await.unwrap()
 }
 
 /// The broker that leads partition 0 in a view above `after`, and its status.
@@ -165,12 +182,8 @@ pub(super) async fn appends_and_reads(logs: &[Log]) -> (usize, u64, u64) {
 async fn owner_log_appends_at_expected_offsets_and_reads_in_every_mode() {
     tokio::time::timeout(Duration::from_secs(60), async {
         for mode in [DeploymentMode::Single, DeploymentMode::Three] {
-            let cluster = broker::Cluster::configured(mode, None, |config| {
-                config.topics.get_mut("orders").unwrap().retention =
-                    ozzy_config::TopicRetention::default();
-            })
-            .await;
-            appends_and_reads(&logs(&cluster)).await;
+            let cluster = order_cluster(mode).await;
+            appends_and_reads(&order_logs(&cluster)).await;
             cluster.shutdown().await;
         }
     })
@@ -181,14 +194,10 @@ async fn owner_log_appends_at_expected_offsets_and_reads_in_every_mode() {
 #[tokio::test(flavor = "current_thread")]
 async fn owner_log_moves_to_a_new_leader_at_the_committed_end() {
     tokio::time::timeout(Duration::from_secs(60), async {
-        let mut cluster = broker::Cluster::configured(DeploymentMode::Three, None, |config| {
-            config.topics.get_mut("orders").unwrap().retention =
-                ozzy_config::TopicRetention::default();
-        })
-        .await;
-        let (index, view, end) = appends_and_reads(&logs(&cluster)).await;
+        let mut cluster = order_cluster(DeploymentMode::Three).await;
+        let (index, view, end) = appends_and_reads(&order_logs(&cluster)).await;
         let image = cluster.stop(index).await;
-        let survivors = logs(&cluster);
+        let survivors = order_logs(&cluster);
         let (next, status) = leader(&survivors, Some(view)).await;
         let lead = status.lead.unwrap();
         assert_eq!(lead.start_end.get(), end);
@@ -217,12 +226,8 @@ async fn owner_log_moves_to_a_new_leader_at_the_committed_end() {
 #[tokio::test(flavor = "current_thread")]
 async fn owner_log_leader_doubts_while_no_follower_answers() {
     tokio::time::timeout(Duration::from_secs(60), async {
-        let cluster = broker::Cluster::configured(DeploymentMode::Three, None, |config| {
-            config.topics.get_mut("orders").unwrap().retention =
-                ozzy_config::TopicRetention::default();
-        })
-        .await;
-        let logs = logs(&cluster);
+        let cluster = order_cluster(DeploymentMode::Three).await;
+        let logs = order_logs(&cluster);
         let (index, view, end) = appends_and_reads(&logs).await;
         let log = &logs[index];
         let lead = log.status().borrow().lead;
@@ -269,12 +274,8 @@ async fn owner_log_leader_doubts_while_no_follower_answers() {
 #[tokio::test(flavor = "current_thread")]
 async fn owner_log_steps_down_to_the_named_follower() {
     tokio::time::timeout(Duration::from_secs(60), async {
-        let cluster = broker::Cluster::configured(DeploymentMode::Three, None, |config| {
-            config.topics.get_mut("orders").unwrap().retention =
-                ozzy_config::TopicRetention::default();
-        })
-        .await;
-        let logs = logs(&cluster);
+        let cluster = order_cluster(DeploymentMode::Three).await;
+        let logs = order_logs(&cluster);
         let (index, view, end) = appends_and_reads(&logs).await;
         let log = &logs[index];
         let step =
@@ -326,12 +327,8 @@ async fn owner_log_steps_down_to_the_named_follower() {
 async fn owner_log_trims_forward_from_the_expected_floor() {
     tokio::time::timeout(Duration::from_secs(60), async {
         for mode in [DeploymentMode::Single, DeploymentMode::Three] {
-            let mut cluster = broker::Cluster::configured(mode, None, |config| {
-                config.topics.get_mut("orders").unwrap().retention =
-                    ozzy_config::TopicRetention::default();
-            })
-            .await;
-            let all = logs(&cluster);
+            let mut cluster = order_cluster(mode).await;
+            let all = order_logs(&cluster);
             let (index, view, end) = appends_and_reads(&all).await;
             let log = &all[index];
             let trim = |log: &Log, view, expected, floor| {
@@ -381,7 +378,7 @@ async fn owner_log_trims_forward_from_the_expected_floor() {
                     );
                 }
                 let image = cluster.stop(index).await;
-                let survivors = logs(&cluster);
+                let survivors = order_logs(&cluster);
                 let (next, status) = leader(&survivors, Some(view)).await;
                 assert_eq!(status.retained_from.get(), end);
                 assert_eq!(
@@ -403,26 +400,15 @@ async fn owner_log_trims_forward_from_the_expected_floor() {
 #[tokio::test(flavor = "current_thread")]
 async fn owner_log_keeps_its_leader_across_a_follower_restart() {
     tokio::time::timeout(Duration::from_secs(60), async {
-        let mut cluster = broker::Cluster::configured(DeploymentMode::Three, None, |config| {
-            config.topics.get_mut("orders").unwrap().retention =
-                ozzy_config::TopicRetention::default();
-        })
-        .await;
-        let (index, view, end) = appends_and_reads(&logs(&cluster)).await;
+        let mut cluster = order_cluster(DeploymentMode::Three).await;
+        let (index, view, end) = appends_and_reads(&order_logs(&cluster)).await;
         let (restarted, other) = ((index + 1) % 3, (index + 2) % 3);
         let image = cluster.stop(restarted).await;
         // The follower misses these records while it is down.
         let log = cluster.brokers[index].log("orders", 0).unwrap();
         let appended = append(&log, view, end, &[4, 5]).await.unwrap();
         cluster.restore_clean(restarted, image).await;
-        let mut status = cluster.brokers[restarted]
-            .log("orders", 0)
-            .unwrap()
-            .status();
-        let rejoined = *status
-            .wait_for(|status| status.role == LogRole::Follower)
-            .await
-            .unwrap();
+        let rejoined = follows(&cluster.brokers[restarted].log("orders", 0).unwrap()).await;
         assert_eq!(rejoined.view, view, "the restart moved the view");
         // Only the leader and the returned follower are left to commit.
         let _image = cluster.stop(other).await;

@@ -113,7 +113,8 @@ impl ReplicaDriver {
                 .normal()
                 .is_none_or(|normal| !normal.snapshot().ready_for_appends)
             {
-                self.election_delay = self
+                self.timers.election_delay = self
+                    .timers
                     .election_delay
                     .saturating_mul(2)
                     .min(self.timing.max_election_timeout);

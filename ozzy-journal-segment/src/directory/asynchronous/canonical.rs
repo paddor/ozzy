@@ -38,7 +38,7 @@ impl Journal {
             chunk_bytes,
             layout.encoded_bytes()?,
         )?;
-        self.interrupted = true;
+        self.run.interrupted = true;
         let mut writer = plan.start().await?;
         for fragment in layout.encode().chunks(writer.fragment_bytes()) {
             writer.push(fragment).await?;
@@ -47,7 +47,7 @@ impl Journal {
             writer.push(fragment).await?;
         }
         let files = writer.finish().await?;
-        self.interrupted = false;
+        self.run.interrupted = false;
         Ok(files)
     }
 

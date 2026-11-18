@@ -15,16 +15,20 @@ use ozzy_journal::operation::{
     Barrier, CanonicalOperation, OperationBody, OperationLimits, canonical_body_digest,
     encode_operation_body,
 };
-use ozzy_proto::{GroupId, LinkSessionId, NodeId, OperationId};
+use ozzy_proto::{LinkSessionId, NodeId, OperationId};
 use ozzy_replication::driver::{Action, DriverError, ReplicaDriver, Timing};
 use ozzy_replication::wire::{
     Control, PeerBinding, ReplicaMessage, WireLimits, decode, encode_control,
 };
 use ozzy_replication::{
-    Admission, Configuration, Digest, FrozenLog, JournalGeneration, NormalReplica, PipelineLimits,
-    Prefix, PreparedOperation, RecoveredState, ReplicationError, Scope, StartViewChange,
-    ViewChange, ViewChangeError,
+    Admission, Digest, FrozenLog, JournalGeneration, NormalReplica, PipelineLimits, Prefix,
+    PreparedOperation, RecoveredState, ReplicationError, Scope, StartViewChange, ViewChange,
+    ViewChangeError,
 };
+
+#[path = "support/driver_fixture.rs"]
+mod fixture;
+use fixture::{LIMITS, configuration, driver, node, normal, timing};
 
 #[path = "support/driver_installation.rs"]
 mod installation;
@@ -141,36 +145,16 @@ fn partitioned_minority_cannot_select_but_healed_quorum_resumes_after_lost_votes
     panic!("healthy quorum failed to select acknowledged history");
 }
 
-fn node(index: u8) -> NodeId {
-    NodeId::from_bytes([index + 1; 16])
-}
-
-fn configuration() -> Configuration {
-    Configuration::new(
-        GroupId::from_bytes([7; 16]),
-        1,
-        Digest::from_bytes([8; 32]),
-        [node(0), node(1), node(2)],
-    )
-    .unwrap()
-}
-
-fn normal(index: u8) -> NormalReplica {
-    NormalReplica::bootstrap(
-        configuration(),
-        node(index),
-        JournalGeneration(u128::from(index) + 1),
-        PipelineLimits {
-            max_operations: 8,
-            max_body_bytes: 1024,
-        },
-    )
-    .unwrap()
-}
-
+/// The first operation of the log.
 fn operation() -> PreparedOperation {
+    barrier(1, 10, Digest::ZERO)
+}
+
+/// Barrier operation `number` with `id`, after the one with digest
+/// `previous`.
+fn barrier(number: u64, id: u8, previous: Digest) -> PreparedOperation {
     let body = OperationBody::Barrier(Barrier {
-        operation_id: OperationId::from_bytes([10; 16]),
+        operation_id: OperationId::from_bytes([id; 16]),
     });
     let bytes = encode_operation_body(&body, OperationLimits::default()).unwrap();
     PreparedOperation::from_verified(
@@ -178,8 +162,8 @@ fn operation() -> PreparedOperation {
             group_id: configuration().scope().group_id,
             configuration_epoch: 1,
             original_view: 0,
-            op_number: 1,
-            previous_digest: Digest::ZERO,
+            op_number: number,
+            previous_digest: previous,
             kind: body.kind(),
             body: &bytes,
         },
@@ -187,18 +171,30 @@ fn operation() -> PreparedOperation {
     )
 }
 
-fn timing() -> Timing {
-    Timing {
-        heartbeat: Duration::from_millis(10),
-        primary_timeout: Duration::from_millis(100),
-        retransmit: Duration::from_millis(10),
-        election_timeout: Duration::from_millis(200),
-        max_election_timeout: Duration::from_secs(2),
+/// The disk of a copy that last installed view 4, which node 1 leads, with
+/// one accepted, uncommitted operation.
+fn recovered() -> RecoveredState {
+    RecoveredState {
+        scope: Scope {
+            view: 4,
+            ..configuration().scope()
+        },
+        log: FrozenLog {
+            last_normal_view: 4,
+            accepted: operation().prefix(),
+            committed: Prefix::GENESIS,
+        },
     }
 }
 
-fn driver(normal: NormalReplica) -> ReplicaDriver {
-    ReplicaDriver::from_normal(normal, Duration::ZERO, timing()).unwrap()
+/// Voter `local` after an intact restart that found `recovered` on disk.
+fn recover(local: u8, recovered: RecoveredState) -> ViewChange {
+    let generation = JournalGeneration(101);
+    ViewChange::recover_intact(configuration(), node(local), generation, recovered, LIMITS).unwrap()
+}
+
+fn restarted(changing: ViewChange) -> ReplicaDriver {
+    ReplicaDriver::from_view_change(changing, Duration::ZERO, timing()).unwrap()
 }
 
 #[test]
@@ -607,28 +603,7 @@ fn invalid_peers_scopes_and_time_cannot_postpone_primary_failure() {
 
 #[test]
 fn intact_restart_drives_a_higher_promise_and_failed_publication_stops_votes() {
-    let changing = ViewChange::recover_intact(
-        configuration(),
-        node(1),
-        JournalGeneration(101),
-        RecoveredState {
-            scope: Scope {
-                view: 4,
-                ..configuration().scope()
-            },
-            log: FrozenLog {
-                last_normal_view: 4,
-                accepted: operation().prefix(),
-                committed: Prefix::GENESIS,
-            },
-        },
-        PipelineLimits {
-            max_operations: 8,
-            max_body_bytes: 1024,
-        },
-    )
-    .unwrap();
-    let mut replica = ReplicaDriver::from_view_change(changing, Duration::ZERO, timing()).unwrap();
+    let mut replica = restarted(recover(1, recovered()));
     assert!(replica.normal().is_none());
     let Some(Action::PersistPromise(ticket)) = replica.poll(Duration::ZERO).unwrap() else {
         panic!("restart immediately schedules a higher durable promise");

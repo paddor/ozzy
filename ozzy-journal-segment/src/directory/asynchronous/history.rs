@@ -29,7 +29,7 @@ impl Journal {
                     self.writer.written_position(),
                     self.writer.state().structural_digest(),
                 ),
-                pins: &self.pins,
+                pins: &self.run.pins,
             },
             self.limits,
             max_segment_bytes,

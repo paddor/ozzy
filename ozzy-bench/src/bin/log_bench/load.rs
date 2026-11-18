@@ -4,6 +4,7 @@
 
 use super::{Options, Report, Result};
 use bytes::Bytes;
+use ozzy_bench::measure::cpu;
 use ozzy_broker::log::{AppendError, Appended, Log, LogRecord, Pending, SubmitError};
 use ozzy_proto::{MessageId, Offset};
 use std::collections::VecDeque;
@@ -15,20 +16,6 @@ struct Sent {
     count: u64,
     at: Instant,
     pending: Pending<Appended, AppendError>,
-}
-
-/// CPU time this process used so far.
-fn cpu() -> Result<Duration> {
-    let stat = std::fs::read_to_string("/proc/self/stat")?;
-    let fields: Vec<&str> = stat
-        .rsplit_once(')')
-        .ok_or("unreadable /proc/self/stat")?
-        .1
-        .split_whitespace()
-        .collect();
-    let ticks = fields[11].parse::<u64>()? + fields[12].parse::<u64>()?;
-    // Clock ticks are 100 per second on Linux.
-    Ok(Duration::from_millis(ticks * 10))
 }
 
 struct Writer<'a> {
@@ -151,7 +138,7 @@ pub(crate) async fn run(options: &Options, log: &Log) -> Result<Report> {
         while writer.submit()? {}
         match writer.wait().await? {
             Some(Some(sent)) if sent.at >= warm => {
-                before = before.or(Some(cpu()?));
+                before = before.or_else(|| Some(cpu()));
                 writer.latencies(&sent, &mut micros);
                 appends += 1;
             }
@@ -159,7 +146,7 @@ pub(crate) async fn run(options: &Options, log: &Log) -> Result<Report> {
             None => full = true,
         }
     }
-    let after = cpu()?;
+    let after = cpu();
     Ok(Report {
         elapsed: Instant::now().saturating_duration_since(warm),
         appends,

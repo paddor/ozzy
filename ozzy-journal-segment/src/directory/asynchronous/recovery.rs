@@ -181,13 +181,7 @@ impl RecoveryDirectory {
             evidence,
             checkpoint: None,
             limits: self.limits,
-            interrupted: false,
-            cleaning: std::rc::Rc::default(),
-            discard: false,
-            pins: std::rc::Rc::default(),
-            validated_indexes: std::rc::Rc::default(),
-            pack_layouts: std::cell::RefCell::default(),
-            active_prefix: None,
+            run: super::RunState::default(),
         })
     }
 
@@ -306,7 +300,7 @@ impl Journal {
         self.validate_authority_files().await?;
         let candidate = self.recover_canonical_candidate(limits).await?;
         let temporary = format!(".CONFIGURATION.recovered.{}.tmp", publication.generation.0);
-        self.interrupted = true;
+        self.run.interrupted = true;
         self.directory.configuration_replaced();
         self.directory
             .install_immutable(&temporary, configuration)
@@ -321,7 +315,7 @@ impl Journal {
             .sync_directory(self.root().to_path_buf())
             .await?;
         self.configuration = Some(configuration.to_vec());
-        self.interrupted = false;
+        self.run.interrupted = false;
         Ok(candidate)
     }
 }

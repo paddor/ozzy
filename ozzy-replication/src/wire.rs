@@ -42,6 +42,7 @@ pub use recovery::{
 pub use transfer::{FetchOps, OpsBatch, encode_fetch, encode_ops};
 
 use fields::{ReadFields, WriteFields, validate_election_view, validate_prefix, validate_scope};
+use ozzy_proto::beat::SHARD_BYTES;
 use ozzy_proto::layout::{Reader, Writer};
 use ozzy_proto::{Envelope, EnvelopeLimits, Opcode};
 use ozzy_proto::{LinkSessionId, NodeId};
@@ -53,8 +54,6 @@ use crate::{
 };
 
 const COMMON_BYTES: usize = 80;
-/// A beat source: shard number and epoch.
-const SOURCE_BYTES: usize = 12;
 
 /// Authenticated peer and established session supplied by the transport adapter.
 ///
@@ -194,8 +193,32 @@ pub enum Control {
 impl Control {
     /// Claimed prefix for routing/replay hints. This does not validate its evidence.
     pub const fn acknowledged(self) -> Option<Prefix> {
+        match self.ack() {
+            Some(ack) => Some(ack.durable),
+            None => None,
+        }
+    }
+
+    /// The acknowledgment of a backup, resting or not.
+    pub(crate) const fn ack(self) -> Option<PrepareOk> {
         match self {
-            Self::PrepareOk { ack, .. } | Self::RestOk { ack, .. } => Some(ack.durable),
+            Self::PrepareOk { ack } | Self::RestOk { ack, .. } => Some(ack),
+            _ => None,
+        }
+    }
+
+    /// The commit announcement of a primary, resting or not.
+    pub(crate) const fn commit(self) -> Option<Commit> {
+        match self {
+            Self::Commit(commit) | Self::Rest { commit, .. } => Some(commit),
+            _ => None,
+        }
+    }
+
+    /// The beat source a rest offer or its acceptance names.
+    const fn source(self) -> Option<BeatSource> {
+        match self {
+            Self::Rest { source, .. } | Self::RestOk { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -203,11 +226,8 @@ impl Control {
     /// Exact group, immutable configuration digest, and active/proposed view.
     pub const fn scope(self) -> Scope {
         match self {
-            Self::PrepareOk { ack, .. } | Self::RestOk { ack, .. } => ack.scope,
-            Self::Commit(message)
-            | Self::Rest {
-                commit: message, ..
-            } => message.scope,
+            Self::PrepareOk { ack } | Self::RestOk { ack, .. } => ack.scope,
+            Self::Commit(commit) | Self::Rest { commit, .. } => commit.scope,
             Self::ExitView(scope) => scope,
             Self::StartViewChange(message) => message.scope,
             Self::DoViewChange(message) => message.scope,
@@ -286,19 +306,16 @@ pub fn encode_control(
     let mut writer = Writer::with_len(output, metadata_bytes)?;
     writer.scope(scope, sender)?;
     match message {
-        Control::PrepareOk { ack } => writer.prefix(ack.durable)?,
-        Control::Commit(message) => writer.prefix(message.committed)?,
-        Control::Rest { commit, source } => {
+        Control::PrepareOk { ack } | Control::RestOk { ack, .. } => writer.prefix(ack.durable)?,
+        Control::Commit(commit) | Control::Rest { commit, .. } => {
             writer.prefix(commit.committed)?;
-            write_source(&mut writer, source)?;
-        }
-        Control::RestOk { ack, source } => {
-            writer.prefix(ack.durable)?;
-            write_source(&mut writer, source)?;
         }
         Control::StartViewChange(_) | Control::ExitView(_) => {}
         Control::DoViewChange(message) => election::write_report(&mut writer, message)?,
         Control::StartView(message) => election::write_start(&mut writer, message)?,
+    }
+    if let Some(source) = message.source() {
+        writer.bytes(&source.to_bytes())?;
     }
     Ok(ControlEncoding {
         header,
@@ -439,21 +456,13 @@ fn decode_uncorrelated(
 /// Validate the fields of `message` and return its metadata length.
 fn control_bytes(message: Control) -> Result<usize, WireError> {
     Ok(match message {
-        Control::PrepareOk { ack, .. } => {
+        Control::PrepareOk { ack } | Control::RestOk { ack, .. } => {
             validate_prefix(ack.durable)?;
-            COMMON_BYTES + 40
+            progress_bytes(message)
         }
-        Control::Commit(message) => {
-            validate_prefix(message.committed)?;
-            COMMON_BYTES + 40
-        }
-        Control::Rest { commit, .. } => {
+        Control::Commit(commit) | Control::Rest { commit, .. } => {
             validate_prefix(commit.committed)?;
-            COMMON_BYTES + 40 + SOURCE_BYTES
-        }
-        Control::RestOk { ack, .. } => {
-            validate_prefix(ack.durable)?;
-            COMMON_BYTES + 40 + SOURCE_BYTES
+            progress_bytes(message)
         }
         Control::StartViewChange(message) => {
             validate_election_view(message.scope)?;
@@ -471,17 +480,14 @@ fn control_bytes(message: Control) -> Result<usize, WireError> {
     })
 }
 
-fn write_source(writer: &mut Writer<'_>, source: BeatSource) -> Result<(), WireError> {
-    writer.u32(source.shard)?;
-    writer.u64(source.epoch)?;
-    Ok(())
-}
-
-fn read_source(reader: &mut Reader<'_>) -> Result<BeatSource, WireError> {
-    Ok(BeatSource {
-        shard: reader.u32()?,
-        epoch: reader.u64()?,
-    })
+/// Metadata bytes of a commit or acknowledgment: its prefix, and the beat
+/// source of a resting one.
+const fn progress_bytes(message: Control) -> usize {
+    if message.source().is_some() {
+        COMMON_BYTES + 40 + SHARD_BYTES
+    } else {
+        COMMON_BYTES + 40
+    }
 }
 
 fn decode_control(
@@ -490,30 +496,30 @@ fn decode_control(
     mut reader: Reader<'_>,
 ) -> Result<Control, WireError> {
     let message = match opcode {
-        Opcode::PrepareOk => Control::PrepareOk {
-            ack: PrepareOk {
+        Opcode::PrepareOk | Opcode::RestOk => {
+            let ack = PrepareOk {
                 scope,
                 durable: reader.prefix()?,
-            },
-        },
-        Opcode::Commit => Control::Commit(Commit {
-            scope,
-            committed: reader.prefix()?,
-        }),
-        Opcode::Rest => Control::Rest {
-            commit: Commit {
+            };
+            if opcode == Opcode::RestOk {
+                let source = BeatSource::from_bytes(reader.array()?);
+                Control::RestOk { ack, source }
+            } else {
+                Control::PrepareOk { ack }
+            }
+        }
+        Opcode::Commit | Opcode::Rest => {
+            let commit = Commit {
                 scope,
                 committed: reader.prefix()?,
-            },
-            source: read_source(&mut reader)?,
-        },
-        Opcode::RestOk => Control::RestOk {
-            ack: PrepareOk {
-                scope,
-                durable: reader.prefix()?,
-            },
-            source: read_source(&mut reader)?,
-        },
+            };
+            if opcode == Opcode::Rest {
+                let source = BeatSource::from_bytes(reader.array()?);
+                Control::Rest { commit, source }
+            } else {
+                Control::Commit(commit)
+            }
+        }
         Opcode::StartViewChange => {
             validate_election_view(scope)?;
             Control::StartViewChange(StartViewChange { scope })

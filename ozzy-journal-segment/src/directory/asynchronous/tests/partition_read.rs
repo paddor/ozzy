@@ -113,7 +113,7 @@ fn async_incremental_reads_capture_exact_prefix_without_file_work() {
     let mut index = drive(&mut controller, Index::open(&journal, read_config(8192))).unwrap();
     let journal = append(&mut controller, journal, &mut index, 0, 0);
     let captured = capture(&index, &journal, 0, 1, 1);
-    assert!(journal.pins.is_pinned(1));
+    assert!(journal.run.pins.is_pinned(1));
     assert!(matches!(
         index.prepare_read(
             &journal,
@@ -127,7 +127,7 @@ fn async_incremental_reads_capture_exact_prefix_without_file_work() {
     ));
     let journal = append(&mut controller, journal, &mut index, 1, 0);
     assert_eq!(read(&mut controller, captured), (vec![0], 0));
-    assert!(!journal.pins.is_pinned(1));
+    assert!(!journal.run.pins.is_pinned(1));
     let captured = capture(&index, &journal, 0, 2, 1);
     assert_eq!(read(&mut controller, captured), (vec![0], 0));
     let captured = capture(&index, &journal, 0, 2, 2);
@@ -278,7 +278,7 @@ fn async_resident_delivery_releases_file_protection_and_keeps_bounded_selection(
     let mut index = drive(&mut controller, Index::open(&journal, read_config(0))).unwrap();
     let journal = append(&mut controller, journal, &mut index, 0, 0);
     let resident = capture(&index, &journal, 0, 1, 1).into_resident().unwrap();
-    assert!(!journal.pins.is_pinned(1));
+    assert!(!journal.run.pins.is_pinned(1));
     let mut journal = append(&mut controller, journal, &mut index, 1, 0);
     let cold = capture(&index, &journal, 0, 1, 1)
         .into_resident()
@@ -523,7 +523,7 @@ fn async_read_cancellation_releases_admission_without_invalidating_owner() {
     let journal = append(&mut controller, journal, &mut index, 1, 0);
     let captured = capture(&index, &journal, 0, 1, 1);
     drop(captured);
-    assert!(!journal.pins.is_pinned(1));
+    assert!(!journal.run.pins.is_pinned(1));
     let captured = capture(&index, &journal, 0, 1, 1);
     #[expect(
         clippy::redundant_closure_for_method_calls,

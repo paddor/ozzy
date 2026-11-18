@@ -110,7 +110,7 @@ impl Journal {
             capacity,
             max_probes,
             chunk_bytes: self.limits.io.chunk_bytes,
-            pins: self.pins.clone(),
+            pins: self.run.pins.clone(),
         })
     }
 
@@ -143,7 +143,7 @@ impl Journal {
         let successor = match prepared {
             Some(file)
                 if !file.faulted
-                    && Rc::ptr_eq(&file.scope.pins, &self.pins)
+                    && Rc::ptr_eq(&file.scope.pins, &self.run.pins)
                     && file.scope.identity == self.manifest.identity
                     && file.scope.predecessor == self.writer.header().segment_id()
                     && file.scope.generation == self.writer.written_position().generation()
@@ -361,7 +361,7 @@ impl Pending {
         let mut rolled = completed.result?;
         self.journal.writer.transfer_buffers_to(&mut rolled.writer);
         self.journal.writer = rolled.writer;
-        self.journal.active_prefix = None;
+        self.journal.run.active_prefix = None;
         self.journal.directory = rolled.directory;
         self.journal.manifest = rolled.manifest;
         self.journal.current = rolled.current;

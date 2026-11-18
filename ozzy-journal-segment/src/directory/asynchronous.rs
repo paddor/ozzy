@@ -119,6 +119,14 @@ pub struct Journal {
     evidence: Option<evidence::Copies>,
     checkpoint: Option<Checkpoint>,
     limits: Limits,
+    run: RunState,
+}
+
+/// What a journal gathers while it runs. An opened journal starts empty.
+#[derive(Debug, Default)]
+struct RunState {
+    /// Set while a metadata mutation is in flight; one left set fences the
+    /// journal until it is reopened.
     interrupted: bool,
     pins: std::rc::Rc<crate::retention::PinRegistry>,
     /// Set while a cleanup capture lives; checkpoint selection waits for it.
@@ -159,10 +167,10 @@ impl Journal {
         segments: &[u64],
         checkpoints: &[ozzy_proto::CheckpointId],
     ) -> bool {
-        segments.iter().any(|&id| !self.pins.is_pinned(id))
+        segments.iter().any(|&id| !self.run.pins.is_pinned(id))
             || checkpoints
                 .iter()
-                .any(|&id| !self.pins.checkpoint_is_pinned(id))
+                .any(|&id| !self.run.pins.checkpoint_is_pinned(id))
     }
     /// Exact persisted adapter configuration bytes, when present.
     pub fn configuration(&self) -> Option<&[u8]> {
@@ -181,7 +189,7 @@ impl Journal {
     }
     /// Whether failure or canceled mutation fences further use.
     pub fn is_faulted(&self) -> bool {
-        self.interrupted || self.writer.is_faulted() || self.directory.is_faulted()
+        self.run.interrupted || self.writer.is_faulted() || self.directory.is_faulted()
     }
 
     fn healthy(&self) -> Result<(), DirectoryError> {

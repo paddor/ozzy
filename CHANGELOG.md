@@ -146,6 +146,10 @@
   beat state, and `PartitionActors::with_beats` turns it on for a shard.
   Telemetry counts `replica_rest`, `replica_rest_end`, and
   `shard_epoch_change`.
+- `ozzy_proto::beat::ShardEpoch` has `to_bytes` and `from_bytes`, and
+  `ozzy_replication::BeatSource` is that type under its old name.
+  `ozzy_journal_segment::is_recovery_marker` tells the marker of an
+  unfinished recovery from a group configuration.
 
 ### Changed
 

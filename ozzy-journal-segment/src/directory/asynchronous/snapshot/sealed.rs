@@ -51,7 +51,7 @@ impl Journal {
         }
         let leases = sources
             .iter()
-            .map(|source| self.pins.protect_prepared_segment(source.segment_id))
+            .map(|source| self.run.pins.protect_prepared_segment(source.segment_id))
             .collect::<Result<Vec<_>, _>>()
             .map_err(DirectoryError::from)?;
         Ok(Some(SealedSchedules {
@@ -78,7 +78,7 @@ impl Journal {
     fn validated(&self, sources: &[IndexSource]) -> bool {
         sources
             .iter()
-            .all(|source| self.validated_indexes.holds(*source))
+            .all(|source| self.run.validated_indexes.holds(*source))
     }
 }
 

@@ -178,13 +178,7 @@ impl Admission {
     /// Wait for capacity without retaining a request or reserving a permit.
     /// The caller retries admission. Its own bounded state owns pending bytes.
     pub async fn ready(&self, shard: usize, class: Class, bytes: usize) -> io::Result<()> {
-        self.0
-            .changed
-            .wait_for(|| match self.check(shard, class, bytes) {
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => None,
-                result => Some(result),
-            })
-            .await
+        self.ready_or(shard, class, bytes, || {}).await
     }
 
     /// Whether an operation of `class` with `bytes` must wait for capacity

@@ -47,8 +47,8 @@ impl ReplicaDriver {
     /// backup, any voter but the primary.
     pub fn cover(&mut self, voter: NodeId) -> Result<(), DriverError> {
         let voter = self.configuration.voter_index(voter)?;
-        let primary = VoterIndex::primary(self.require_normal()?.snapshot().scope.view);
-        if voter == self.local || (primary != self.local && voter != primary) {
+        let view = self.require_normal()?.snapshot().scope.view;
+        if voter == self.local || (!self.leads(view) && voter != VoterIndex::primary(view)) {
             return Err(crate::ReplicationError::WrongRole.into());
         }
         self.covered.insert(voter);
@@ -68,10 +68,10 @@ impl ReplicaDriver {
         let Some(normal) = self.normal() else {
             return Ok(());
         };
-        if VoterIndex::primary(normal.snapshot().scope.view) == self.local {
-            self.backup_heard_at = self.backup_heard_at.max(heard);
+        if self.leads(normal.snapshot().scope.view) {
+            self.timers.backup_heard_at = self.timers.backup_heard_at.max(heard);
         } else {
-            self.contact_deadline = heard.saturating_add(self.timing.primary_timeout);
+            self.timers.contact_deadline = heard.saturating_add(self.timing.primary_timeout);
         }
         Ok(())
     }
@@ -88,7 +88,7 @@ impl ReplicaDriver {
     pub fn rest(&mut self, resting: bool) {
         if self.resting() && !resting {
             // The next poll sends the heartbeat the rest held back.
-            self.retry_at = self.now;
+            self.timers.retry_at = self.now;
         }
         self.heartbeat = if resting {
             Heartbeat::Resting

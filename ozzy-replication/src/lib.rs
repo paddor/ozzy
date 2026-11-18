@@ -265,14 +265,7 @@ pub struct Commit {
 /// Where a voter runs its group: one beat source of its broker, at the
 /// epoch that source reported. A broker beat that still names the pair says
 /// the voter stands by what it sent under it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BeatSource {
-    /// The voter's own number of the source. It means nothing on another
-    /// broker.
-    pub shard: u32,
-    /// The source's epoch when the voter sent this.
-    pub epoch: u64,
-}
+pub use ozzy_proto::beat::ShardEpoch as BeatSource;
 
 /// Rejected replication event. Capacity and missing history are recoverable;
 /// conflicting current lineage faults the normal core.

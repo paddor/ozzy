@@ -37,6 +37,7 @@ impl Journal {
         location: OperationLocation,
     ) -> Result<DecodedOperation<'static>, Error> {
         let _lease = self
+            .run
             .pins
             .protect_prepared_segment(source.index.segment_id)
             .map_err(DirectoryError::from)?;
@@ -127,6 +128,7 @@ impl Journal {
         limits: ReadLimits,
     ) -> Result<Vec<(IndexedRecord, LogPosition)>, Error> {
         let _lease = self
+            .run
             .pins
             .protect_prepared_segment(source.index.segment_id)
             .map_err(DirectoryError::from)?;

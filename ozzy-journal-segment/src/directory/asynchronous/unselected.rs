@@ -434,12 +434,12 @@ impl Journal {
             access: &self.access,
             root: self.directory.root(),
             limits: self.limits,
-            pins: &self.pins,
+            pins: &self.run.pins,
             manifest: &self.manifest,
             current: self.current,
             bounds: Bounds::Exclusive,
-            discard: self.discard,
-            interrupted: &mut self.interrupted,
+            discard: self.run.discard,
+            interrupted: &mut self.run.interrupted,
         }
     }
 
@@ -447,7 +447,7 @@ impl Journal {
     /// instead of keeping one as the spare. For a store that wants no spare
     /// yet. An existing spare stays.
     pub const fn discard_retired(&mut self, discard: bool) {
-        self.discard = discard;
+        self.run.discard = discard;
     }
 
     /// Checks shared by the exclusive passes. Authority validation fences
