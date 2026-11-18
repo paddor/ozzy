@@ -3,9 +3,6 @@
 
 use super::{Command, Log, Pending, SubmitError};
 use ozzy_proto::Offset;
-use std::future::Future;
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use tokio::sync::oneshot;
 
 /// Why a trim did not commit. `Unknown` ends the writer's term; after any
@@ -70,24 +67,13 @@ impl Log {
         expected_floor: Offset,
         floor: Offset,
     ) -> Result<Pending<(), TrimError>, SubmitError> {
-        let (reply, pending) = oneshot::channel();
-        self.submit(
+        self.submit(0, |reply| {
             Command::Trim(TrimRequest {
                 view,
                 expected: expected_floor,
                 floor,
                 reply,
-            }),
-            0,
-        )?;
-        Ok(Pending(pending))
-    }
-}
-
-impl Future for Pending<(), TrimError> {
-    type Output = Result<(), TrimError>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.poll_reply(cx, TrimError::Stopped)
+            })
+        })
     }
 }

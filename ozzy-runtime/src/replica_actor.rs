@@ -282,7 +282,7 @@ impl ReplicaActor {
             }
             Action::Broadcast(Control::Commit(commit)) => {
                 for voter in 0..3 {
-                    if self.configuration.voters()[voter] != self.local {
+                    if self.peer(voter) != self.local {
                         self.heartbeat(voter, commit)?;
                     }
                 }
@@ -337,12 +337,23 @@ impl ReplicaActor {
         offer(&mut self.outbox, to, class, message)
     }
 
+    /// The voter slot of `node`, if it votes in this group.
+    fn voter_slot(&self, node: NodeId) -> Option<usize> {
+        voter_slot(self.configuration, node)
+    }
+
+    /// The broker in voter slot `voter`.
+    fn peer(&self, voter: usize) -> NodeId {
+        self.configuration.voters()[voter]
+    }
+
+    /// The primary of the current view.
+    fn primary(&self) -> NodeId {
+        self.configuration.primary(self.driver.scope().view)
+    }
+
     fn session(&self, to: NodeId) -> Option<LinkSessionId> {
-        let index = self
-            .configuration
-            .voters()
-            .iter()
-            .position(|peer| *peer == to)?;
+        let index = self.voter_slot(to)?;
         self.bindings[index].map(|_| self.config.sessions[index])
     }
 
@@ -371,7 +382,7 @@ impl ReplicaActor {
         else {
             return Ok(());
         };
-        let from = self.configuration.voters()[index];
+        let from = self.peer(index);
         let Ok(decoded) = wire::decode(&frames, binding, self.wire_limits) else {
             return Ok(());
         };
@@ -411,7 +422,7 @@ impl ReplicaActor {
             return Ok(());
         }
         // A primary has no vote to repeat, so it keeps no timer for one.
-        let primary = self.configuration.primary(self.driver.scope().view);
+        let primary = self.primary();
         if primary == self.local {
             return Ok(());
         }
@@ -463,6 +474,14 @@ fn routed<'a>(
         .iter()
         .position(|voter| voter.as_bytes() == route)?;
     Some((index, bindings[index]?, frames))
+}
+
+/// The voter slot of `node` in `configuration`, if it votes there.
+fn voter_slot(configuration: Configuration, node: NodeId) -> Option<usize> {
+    configuration
+        .voters()
+        .iter()
+        .position(|voter| *voter == node)
 }
 
 /// A control packet without payload, its metadata copied out of the actor's

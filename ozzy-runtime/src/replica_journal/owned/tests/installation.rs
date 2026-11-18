@@ -175,6 +175,14 @@ fn policy() -> InstallationConfig {
     }
 }
 
+/// The policy of a store that keeps the primary's segment size.
+fn kept_policy() -> InstallationConfig {
+    InstallationConfig {
+        segment_capacity: 32768,
+        ..policy()
+    }
+}
+
 fn request(ticket: &InstallTicket) -> FetchOps {
     FetchOps {
         scope: ticket.scope(),
@@ -692,10 +700,7 @@ fn begin_kept(controller: &mut Controller, io: Local) -> (Voter, InstallTicket) 
         .begin_primary_install(JournalGeneration(101))
         .unwrap();
     assert_eq!(ticket.retained(), ticket.accepted());
-    let config = InstallationConfig {
-        segment_capacity: 32768,
-        ..policy()
-    };
+    let config = kept_policy();
     drive(
         controller,
         primary.journal.begin_installation(ticket, config),
@@ -756,10 +761,7 @@ fn owned_aborted_kept_installation_leaves_the_old_writer() {
 fn owned_installation_that_ends_at_the_own_log_keeps_an_unconfirmed_tail() {
     let (mut controller, io) = setup();
     let (mut primary, _) = selected_from(&mut controller, io, (3, 1));
-    let config = InstallationConfig {
-        segment_capacity: 32768,
-        ..policy()
-    };
+    let config = kept_policy();
     // The tail after the retained prefix passes through the driver, and
     // the journal stages none of it.
     let ticket = stage_local_with(&mut controller, &mut primary, config);

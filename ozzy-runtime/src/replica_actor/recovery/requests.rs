@@ -2,6 +2,7 @@
 //! metadata, operation and checkpoint requests that carry it.
 
 use super::{Pending, RecoveryActor, Retry};
+use crate::replica_actor::voter_slot;
 use crate::replica_actor::{ActorError, Duration, Prefix, SendClass, control_message, offer, wire};
 use crate::replica_journal::{RecoveryPlan, RecoveryStorage};
 use ozzy_replication::recovery::RecoveryTicket;
@@ -95,11 +96,7 @@ impl<J: RecoveryStorage> RecoveryActor<J> {
         }
         let request = *request;
         retry.sent(now, self.timing);
-        let index = self
-            .configuration
-            .voters()
-            .iter()
-            .position(|voter| *voter == request.source.voter)
+        let index = voter_slot(self.configuration, request.source.voter)
             .ok_or(ozzy_replication::recovery::RecoveryError::InvalidResponse)?;
         if self.bindings[index].is_none() {
             return Ok(());
@@ -129,11 +126,7 @@ impl<J: RecoveryStorage> RecoveryActor<J> {
         }
         let request = *request;
         retry.sent(now, self.timing);
-        let index = self
-            .configuration
-            .voters()
-            .iter()
-            .position(|&voter| voter == request.source.voter)
+        let index = voter_slot(self.configuration, request.source.voter)
             .ok_or(ozzy_replication::recovery::RecoveryError::InvalidResponse)?;
         if self.bindings[index].is_none() {
             return Ok(());

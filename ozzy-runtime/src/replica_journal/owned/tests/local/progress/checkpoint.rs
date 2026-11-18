@@ -67,13 +67,9 @@ fn checkpoint_with_pending_plan_recovers_the_same_coordinator_and_source_as_unin
     let (mut controller, io) = setup();
     let (mut journal, mut driver) = initialized(&mut controller, io);
     let buffer = request_progress(&journal, &driver, Some(2), 90);
-    let receipt = admit(&mut controller, &mut journal, &mut driver, buffer);
-    write(&mut controller, &mut journal, &mut driver, receipt);
-    sync_apply(&mut controller, &mut journal, &mut driver);
+    commit(&mut controller, &mut journal, &mut driver, buffer);
     let buffer = plan(&journal, 91);
-    let receipt = admit(&mut controller, &mut journal, &mut driver, buffer);
-    write(&mut controller, &mut journal, &mut driver, receipt);
-    sync_apply(&mut controller, &mut journal, &mut driver);
+    commit(&mut controller, &mut journal, &mut driver, buffer);
     let buffer = plan(&journal, 92);
     let pending = admit(&mut controller, &mut journal, &mut driver, buffer);
     assert_eq!(

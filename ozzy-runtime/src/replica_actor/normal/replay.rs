@@ -59,12 +59,7 @@ impl ReplicaActor {
         self.bindings[voter]?;
         let peer = self.work.flow.peers[voter].as_ref()?;
         let sender = peer.sender()?;
-        if self
-            .outbox
-            .queued(self.configuration.voters()[voter], SendClass::Data)?
-            .0
-            > 0
-        {
+        if self.outbox.queued(self.peer(voter), SendClass::Data)?.0 > 0 {
             return None;
         }
         let repair = peer.repair(false);
@@ -185,7 +180,7 @@ impl ReplicaActor {
                         buffer,
                     )
                     .map_err(|rejected| rejected.reason)?,
-                to: self.configuration.voters()[index],
+                to: self.peer(index),
             });
             self.work.replay_plan = Some(plan);
             crate::profiling::event(crate::profiling::Event::ReplayDiskFetch);
@@ -202,12 +197,7 @@ impl ReplicaActor {
     ) -> Result<(), ActorError> {
         let request = fetched.request();
         let issued = self.work.replay_plan.take();
-        let voter = self
-            .configuration
-            .voters()
-            .iter()
-            .position(|peer| *peer == to)
-            .ok_or_else(super::flow::no_channel)?;
+        let voter = self.voter_slot(to).ok_or_else(super::flow::no_channel)?;
         let Some(plan) = issued.filter(|old| self.replay_current(old, voter, request, now)) else {
             self.recycle(fetched.into_buffer())?;
             return Ok(());
@@ -272,7 +262,7 @@ impl ReplicaActor {
         let mut packets = self.prepare_packets(scope, committed, &operations, &payload)?;
         drop(operations);
         self.recycle(fetched.into_buffer())?;
-        let to = self.configuration.voters()[voter];
+        let to = self.peer(voter);
         let packet = self.bind_packet(
             packets[voter].take().ok_or_else(super::flow::no_channel)?,
             plan.channel.epoch,

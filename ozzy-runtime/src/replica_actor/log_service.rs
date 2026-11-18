@@ -9,9 +9,16 @@ mod reads;
 mod step_down;
 mod trims;
 
-use super::{ActorError, PartitionActor, PartitionStatus, ProposalSubmitter};
-use crate::log::{Command, LogLimits, LogPort, LogRole, LogStatus};
-use crate::replica_journal::{PartitionReadBuffer, PartitionReadLimits, ProposalBuffer};
+use super::{
+    ActorError, PartitionActor, PartitionStatus, PendingProposal, ProposalOutcome,
+    ProposalSubmitter,
+};
+use crate::log::{
+    AppendError, Command, LogLimits, LogPort, LogRole, LogStatus, StepDownError, TrimError,
+};
+use crate::replica_journal::{
+    JournalError, PartitionReadBuffer, PartitionReadLimits, ProposalBuffer,
+};
 use futures::task::AtomicWaker;
 use ozzy_replication::{JournalGeneration, PipelineLimits, Scope};
 use std::sync::Arc;
@@ -29,7 +36,6 @@ pub struct LogLane {
     arenas: Vec<ProposalBuffer>,
     reads: PartitionReadBuffer,
     read_limits: PartitionReadLimits,
-    max_records: usize,
     operations: ozzy_journal::operation::OperationLimits,
 }
 
@@ -73,9 +79,25 @@ impl LogLane {
             arenas,
             reads,
             read_limits,
-            max_records: operation.max_records,
             operations: operation,
         })
+    }
+
+    /// Take back an arena for the next proposal.
+    fn recycle(&mut self, mut buffer: ProposalBuffer) {
+        buffer.clear();
+        self.arenas.push(buffer);
+    }
+
+    /// Submit a prepared arena. A refused one returns to the lane.
+    fn submit(&mut self, buffer: ProposalBuffer) -> Option<PendingProposal> {
+        match self.submitter.try_submit(buffer) {
+            Ok(pending) => Some(pending),
+            Err(unsubmitted) => {
+                self.recycle(unsubmitted.buffer);
+                None
+            }
+        }
     }
 }
 
@@ -87,14 +109,42 @@ struct Term {
     generation: JournalGeneration,
 }
 
-impl Term {
-    /// The authority a proposal of this term names.
-    const fn authority(self) -> ozzy_proto::append::Authority {
-        ozzy_proto::append::Authority {
-            group_id: self.scope.group_id,
-            config_epoch: self.scope.configuration_epoch,
-            view: self.scope.view,
+/// Why a request naming a view does not run in the current term.
+#[derive(Debug, Clone, Copy)]
+enum Fenced {
+    /// The request names another view than the term's.
+    View { named: u64, current: u64 },
+    /// This broker leads no term, or may not propose in it now.
+    NotLeader,
+}
+
+/// Give `$error` the two variants of `Fenced`.
+macro_rules! fenced {
+    ($($error:ident),+) => {$(
+        impl From<Fenced> for $error {
+            fn from(fenced: Fenced) -> Self {
+                match fenced {
+                    Fenced::View { named, current } => Self::View { named, current },
+                    Fenced::NotLeader => Self::NotLeader,
+                }
+            }
         }
+    )+};
+}
+
+fenced!(AppendError, TrimError, StepDownError);
+
+/// The answer a finished proposal gives its owner request.
+fn settle<E: From<Fenced>>(
+    outcome: ProposalOutcome,
+    unknown: E,
+    refusal: impl FnOnce(&JournalError) -> E,
+) -> Result<(), E> {
+    match outcome {
+        ProposalOutcome::Committed { .. } => Ok(()),
+        ProposalOutcome::NotAdmitted => Err(Fenced::NotLeader.into()),
+        ProposalOutcome::Unknown => Err(unknown),
+        ProposalOutcome::Invalid(error) => Err(refusal(&error)),
     }
 }
 
@@ -152,7 +202,7 @@ impl LogService {
         self.lane = None;
         self.term = None;
         self.read = None;
-        self.refuse_step_down(crate::log::StepDownError::NotLeader);
+        self.refuse_step_down(StepDownError::NotLeader);
         for flight in self.appends.drain(..) {
             flight.unknown();
         }
@@ -256,6 +306,28 @@ impl LogService {
         };
         self.port.publish(status);
         status != published
+    }
+
+    /// The term a request for `view` runs in.
+    fn fence(&self, view: u64) -> Result<Term, Fenced> {
+        match self.term {
+            Some(term) if term.scope.view == view => Ok(term),
+            Some(term) => Err(Fenced::View {
+                named: view,
+                current: term.scope.view,
+            }),
+            None => Err(Fenced::NotLeader),
+        }
+    }
+
+    /// The term a proposal for `view` may be submitted in: the leader is
+    /// neither in doubt nor stepping down.
+    fn admitting(&self, view: u64) -> Result<Term, Fenced> {
+        let term = self.fence(view)?;
+        if self.stepping.is_some() || self.port.published().role == LogRole::Doubt {
+            return Err(Fenced::NotLeader);
+        }
+        Ok(term)
     }
 
     /// Take queued requests while arenas and the read slot allow.

@@ -19,7 +19,7 @@ impl PartitionActors {
     pub fn insert(&mut self, actor: PartitionActor) -> Result<(), Box<Uninserted>> {
         let error = if self.stopped {
             Some(PartitionError::Stopped)
-        } else if self.actors.len() >= self.maximum
+        } else if self.slots.len() >= self.maximum
             || self.wakeups.as_ref().is_some_and(|wakeups| wakeups.full())
         {
             Some(PartitionError::Limits)
@@ -31,13 +31,9 @@ impl PartitionActors {
         if let Some(error) = error {
             return Err(Box::new(Uninserted { error, actor }));
         }
-        let slot = self.actors.len();
+        let slot = self.slots.len();
         self.index.insert(actor.group(), slot);
-        self.actors.push(actor);
-        self.native.push(None);
-        self.coordinators.push(None);
-        self.readers.push(None);
-        self.logs.push(None);
+        self.slots.push(super::Slot::new(actor));
         self.install_beats(slot);
         if let Some(wakeups) = &mut self.wakeups {
             wakeups.grow();
@@ -56,11 +52,7 @@ impl PartitionActors {
             return Err(PartitionError::Stopped);
         }
         let slot = self.index.remove(&group).ok_or(PartitionError::Unknown)?;
-        drop(self.native.swap_remove(slot));
-        drop(self.coordinators.swap_remove(slot));
-        drop(self.readers.swap_remove(slot));
-        drop(self.logs.swap_remove(slot));
-        let actor = self.actors.swap_remove(slot);
+        let actor = self.slots.swap_remove(slot).actor;
         if matches!(actor, PartitionActor::Replicated(_)) {
             // Its peers may still trust the role it had.
             self.request_withdrawal(actor.group());
@@ -69,8 +61,8 @@ impl PartitionActors {
             wakeups.swap_remove(slot);
         }
         // The last actor moved into the freed slot, with its marks.
-        if let Some(moved) = self.actors.get(slot) {
-            self.index.insert(moved.group(), slot);
+        if let Some(moved) = self.slots.get(slot) {
+            self.index.insert(moved.actor.group(), slot);
         }
         self.recovered.retain(|recovered| *recovered != group);
         self.next = 0;

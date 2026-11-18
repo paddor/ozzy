@@ -68,9 +68,7 @@ fn retain(controller: &mut Controller, journal: &mut OwnedJournal, driver: &mut 
         )
         .unwrap();
         if let Some(buffer) = turn.proposal {
-            let receipt = admit(controller, journal, driver, buffer);
-            write(controller, journal, driver, receipt);
-            sync_apply(controller, journal, driver);
+            commit(controller, journal, driver, buffer);
         }
         run_retention_jobs(controller, journal);
     }

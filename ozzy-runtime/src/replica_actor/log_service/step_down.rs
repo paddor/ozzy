@@ -35,15 +35,11 @@ impl LogService {
             || self
                 .stepped_at
                 .is_some_and(|at| now < at.saturating_add(INTERVAL));
-        let refusal = match self.term {
-            None => Some(StepDownError::NotLeader),
-            Some(term) if term.scope.view != request.view => Some(StepDownError::View {
-                named: request.view,
-                current: term.scope.view,
-            }),
-            Some(_) if request.target == local => Some(StepDownError::Target),
-            Some(_) if limited => Some(StepDownError::Limited),
-            Some(_) => None,
+        let refusal = match self.fence(request.view) {
+            Err(fenced) => Some(fenced.into()),
+            Ok(_) if request.target == local => Some(StepDownError::Target),
+            Ok(_) if limited => Some(StepDownError::Limited),
+            Ok(_) => None,
         };
         if let Some(error) = refusal {
             let _ = request.reply.send(Err(error));

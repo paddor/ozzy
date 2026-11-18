@@ -192,9 +192,7 @@ fn owner_batches_survive_power_loss_and_replay_without_producers() {
         "{reason:?}"
     );
     let next = owned(&journal, authority, 4, 9, 1);
-    let receipt = admit(&mut controller, &mut journal, &mut driver, next);
-    write(&mut controller, &mut journal, &mut driver, receipt);
-    sync_apply(&mut controller, &mut journal, &mut driver);
+    commit(&mut controller, &mut journal, &mut driver, next);
     read(&mut controller, &mut journal, &driver, 5);
     drive(&mut controller, journal.shutdown()).unwrap();
 }
@@ -222,9 +220,7 @@ fn trim(
             local_config().limits.operations,
         )
         .unwrap();
-    let receipt = admit(controller, journal, driver, buffer);
-    write(controller, journal, driver, receipt);
-    sync_apply(controller, journal, driver);
+    commit(controller, journal, driver, buffer);
 }
 
 /// Run retention turns, their proposals and their jobs until none is owed.
@@ -244,9 +240,7 @@ fn retain(
         )
         .unwrap();
         if let Some(proposal) = result.proposal {
-            let receipt = admit(controller, journal, driver, proposal);
-            write(controller, journal, driver, receipt);
-            sync_apply(controller, journal, driver);
+            commit(controller, journal, driver, proposal);
         }
         super::retention::run_retention_jobs(controller, journal);
         if !result.more_work {
@@ -270,9 +264,7 @@ fn an_owner_trim_retires_the_sealed_segments_below_its_floor() {
     let (mut journal, mut driver) = owner_journal(&mut controller, io);
     for first in [0, 2, 4, 6] {
         let batch = owned(&journal, authority(&driver), first, first as u8 + 1, 2);
-        let receipt = admit(&mut controller, &mut journal, &mut driver, batch);
-        write(&mut controller, &mut journal, &mut driver, receipt);
-        sync_apply(&mut controller, &mut journal, &mut driver);
+        commit(&mut controller, &mut journal, &mut driver, batch);
         if first < 6 {
             super::retention::roll(&mut controller, &mut journal);
         }

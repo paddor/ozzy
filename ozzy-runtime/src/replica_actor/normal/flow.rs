@@ -262,11 +262,11 @@ impl ReplicaActor {
         message: FlowMessage<'_>,
         now: Duration,
     ) -> Result<(), ActorError> {
-        let from = self.configuration.voters()[voter];
+        let from = self.peer(voter);
         if !self.application_ready() {
             return Ok(());
         }
-        let primary = self.configuration.primary(self.driver.scope().view);
+        let primary = self.primary();
         match message {
             FlowMessage::Probe(probe) if from == primary && probe.scope == self.driver.scope() => {
                 let report = self.work.receive.ledger.report();
@@ -345,7 +345,7 @@ impl ReplicaActor {
         accepted: Prefix,
         now: Duration,
     ) -> Result<(), ActorError> {
-        let to = self.configuration.voters()[voter];
+        let to = self.peer(voter);
         let Some(session) = self.session(to) else {
             return Ok(());
         };

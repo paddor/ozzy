@@ -2,21 +2,8 @@ use super::super::proposal::dedup::{copy, resolved};
 use super::*;
 use crate::replica_journal::AppendAdmissionError;
 use crate::replica_journal::owned::StorageCleanup;
-use ozzy_journal::operation::{DedupWatermark, OperationKind, ProducerResultFloor};
+use ozzy_journal::operation::{DedupWatermark, ProducerResultFloor};
 use ozzy_proto::{CheckpointId, ProducerSequence};
-
-fn commit(
-    controller: &mut Controller,
-    journal: &mut OwnedJournal,
-    driver: &mut Driver,
-    body: &(OperationKind, Vec<u8>),
-) {
-    let mut buffer = journal.lease_proposal_buffer().unwrap();
-    buffer.push(body.0, &body.1).unwrap();
-    let receipt = admit(controller, journal, driver, buffer);
-    write(controller, journal, driver, receipt);
-    sync_apply(controller, journal, driver);
-}
 
 fn retire(
     controller: &mut Controller,
@@ -73,15 +60,13 @@ fn duplicate_retry_survives_payload_deletion_checkpoint_restart_and_time_advance
     .unwrap();
     initialize(&mut controller, &mut journal, &mut driver);
     let buffer = append(&journal, 12, 0);
-    let receipt = admit(&mut controller, &mut journal, &mut driver, buffer);
-    write(&mut controller, &mut journal, &mut driver, receipt);
-    sync_apply(&mut controller, &mut journal, &mut driver);
+    commit(&mut controller, &mut journal, &mut driver, buffer);
     let work = journal.begin_roll(8).unwrap();
     let done = drive(&mut controller, work.publish());
     journal.complete_roll(done).unwrap();
     let mut attempted = request(30, 0, 1);
     attempted.records[0].parts = vec![b"copy".as_slice(), b"\0\xff".as_slice()].into();
-    commit(
+    commit_body(
         &mut controller,
         &mut journal,
         &mut driver,
@@ -100,15 +85,13 @@ fn duplicate_retry_survives_payload_deletion_checkpoint_restart_and_time_advance
         )
         .unwrap()
         .unwrap();
-    let receipt = admit(&mut controller, &mut journal, &mut driver, buffer);
-    write(&mut controller, &mut journal, &mut driver, receipt);
-    sync_apply(&mut controller, &mut journal, &mut driver);
+    commit(&mut controller, &mut journal, &mut driver, buffer);
     let body = OperationBody::DedupWatermark(DedupWatermark {
         partition: partition(),
         owner_epoch: OwnerEpoch::INITIAL,
         logical_time: 600_001,
     });
-    commit(
+    commit_body(
         &mut controller,
         &mut journal,
         &mut driver,
@@ -179,7 +162,7 @@ fn expire_retry(
         new_floor: ProducerSequence::new(1),
         operation_id: OperationId::from_bytes([95; 16]),
     });
-    commit(
+    commit_body(
         controller,
         journal,
         driver,
@@ -189,7 +172,7 @@ fn expire_retry(
         ),
     );
     let trim = operation_floor_trim(journal, 97);
-    commit(controller, journal, driver, &trim);
+    commit_body(controller, journal, driver, &trim);
     assert_eq!(retire(controller, journal, driver, 96), [2]);
     drive(
         controller,

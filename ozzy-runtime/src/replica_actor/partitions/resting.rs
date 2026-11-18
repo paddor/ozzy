@@ -6,6 +6,9 @@ use super::{PartitionActor, PartitionActors};
 use crate::frontend::Beats;
 use std::time::Duration;
 
+// `ShardBeats::withdraw` holds one bit per part.
+const _: () = assert!(Beats::PARTS <= u32::BITS);
+
 #[derive(Debug)]
 pub(super) struct ShardBeats {
     beats: Beats,
@@ -41,7 +44,7 @@ impl PartitionActors {
             withdraw: 0,
             withdrew: None,
         });
-        for slot in 0..self.actors.len() {
+        for slot in 0..self.slots.len() {
             self.install_beats(slot);
         }
         self
@@ -50,7 +53,7 @@ impl PartitionActors {
     /// Whether broker beats stand in for the heartbeats or votes of a
     /// known replicated group. A diagnostic.
     pub fn resting(&self, group: ozzy_proto::GroupId) -> Option<bool> {
-        match &self.actors[*self.index.get(&group)?] {
+        match &self.slots[*self.index.get(&group)?].actor {
             PartitionActor::Replicated(actor) => Some(actor.resting()),
             PartitionActor::Local(_) | PartitionActor::Recovering(_) => None,
         }
@@ -59,7 +62,7 @@ impl PartitionActors {
     /// Hand the beats to the replicated actor in `slot`.
     pub(super) fn install_beats(&mut self, slot: usize) {
         if let Some(state) = &self.beats
-            && let PartitionActor::Replicated(actor) = &mut self.actors[slot]
+            && let PartitionActor::Replicated(actor) = &mut self.slots[slot].actor
         {
             actor.install_beats(state.beats.clone(), state.shard);
         }
@@ -84,7 +87,7 @@ impl PartitionActors {
     /// Ask the actor in `slot` whether it left a view a peer may still
     /// trust it in.
     pub(super) fn collect_withdrawal(&mut self, slot: usize) {
-        if let PartitionActor::Replicated(actor) = &mut self.actors[slot]
+        if let PartitionActor::Replicated(actor) = &mut self.slots[slot].actor
             && actor.take_withdrawal()
         {
             let group = actor.group();
@@ -119,8 +122,8 @@ impl PartitionActors {
     /// Visit the groups that rest on an agreement the beats no longer
     /// carry. The others have nothing to look at.
     fn wake_broken(&self) {
-        for (slot, actor) in self.actors.iter().enumerate() {
-            if let PartitionActor::Replicated(actor) = actor
+        for (slot, held) in self.slots.iter().enumerate() {
+            if let PartitionActor::Replicated(actor) = &held.actor
                 && actor.rest_broken()
             {
                 self.touch(slot);

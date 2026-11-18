@@ -37,9 +37,7 @@ fn trim(controller: &mut Controller, journal: &mut OwnedJournal, driver: &mut Dr
         )
         .unwrap()
         .unwrap();
-    let receipt = admit(controller, journal, driver, proposal);
-    write(controller, journal, driver, receipt);
-    sync_apply(controller, journal, driver);
+    commit(controller, journal, driver, proposal);
 }
 
 fn retire(controller: &mut Controller, journal: &mut OwnedJournal, driver: &Driver, id: u8) {
@@ -242,9 +240,7 @@ async fn empty_identity_checkpoint_keeps_the_confirmed_clock_and_record_end() {
     .unwrap()
     .proposal
     .unwrap();
-    let receipt = admit(&mut controller, &mut journal, &mut driver, proposal);
-    write(&mut controller, &mut journal, &mut driver, receipt);
-    sync_apply(&mut controller, &mut journal, &mut driver);
+    commit(&mut controller, &mut journal, &mut driver, proposal);
     retire(&mut controller, &mut journal, &driver, 82);
     drive(&mut controller, journal.shutdown()).unwrap();
     let (mut journal, driver) = drive(

@@ -50,10 +50,10 @@ pub struct Appended {
     pub time_millis: u64,
 }
 
-/// Why an append did not commit. Every one but `NotLeader` in doubt or
-/// during a step-down that then fails ends
-/// the writer's term: its later appends fail too, so it rebuilds from the
-/// log.
+/// Why an append did not commit. The writer's term goes on after
+/// `NotLeader` from a leader in doubt or from one whose step-down then
+/// fails. Every other error ends the term: the writer's later appends fail
+/// too, so it rebuilds from the log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum AppendError {
@@ -177,10 +177,11 @@ pub enum SubmitError {
     /// request completes.
     #[error("log queue is full")]
     Busy,
-    /// The request exceeds the service's bounds.
+    /// The batch is empty or exceeds the append bound. Only `append`
+    /// returns this.
     #[error("request exceeds the log bounds")]
     TooLarge,
-    /// A record has a zero ID or no part.
+    /// A record has a zero ID or no part. Only `append` returns this.
     #[error("record without ID or parts")]
     Invalid,
     /// The service stopped.
@@ -390,18 +391,15 @@ impl Log {
         if records.is_empty() || bytes + BATCH_BYTES > self.limits.append_bytes {
             return Err(SubmitError::TooLarge);
         }
-        let (reply, pending) = oneshot::channel();
-        self.submit(
+        self.submit(bytes, |reply| {
             Command::Append(AppendRequest {
                 view,
                 expected,
                 records,
                 bytes,
                 reply,
-            }),
-            bytes,
-        )?;
-        Ok(Pending(pending))
+            })
+        })
     }
 
     /// Read committed records in `[from, end)`, at most `max_records` and
@@ -418,18 +416,15 @@ impl Log {
         max_records: usize,
         max_bytes: usize,
     ) -> Result<Pending<ReadBatch, ReadError>, SubmitError> {
-        let (reply, pending) = oneshot::channel();
-        self.submit(
+        self.submit(0, |reply| {
             Command::Read(ReadRequest {
                 from,
                 end,
                 max_records: max_records.clamp(1, self.limits.read_records),
                 max_bytes: max_bytes.clamp(1, self.limits.read_bytes),
                 reply,
-            }),
-            0,
-        )?;
-        Ok(Pending(pending))
+            })
+        })
     }
 
     /// Hand the log to `target`, another broker holding a copy. The leader
@@ -447,19 +442,22 @@ impl Log {
         view: u64,
         target: NodeId,
     ) -> Result<Pending<u64, StepDownError>, SubmitError> {
-        let (reply, pending) = oneshot::channel();
-        self.submit(
+        self.submit(0, |reply| {
             Command::StepDown(StepDownRequest {
                 view,
                 target,
                 reply,
-            }),
-            0,
-        )?;
-        Ok(Pending(pending))
+            })
+        })
     }
 
-    fn submit(&self, command: Command, bytes: usize) -> Result<(), SubmitError> {
+    /// Queue the command `request` builds around its reply sender,
+    /// charging `bytes` to the queue.
+    fn submit<T, E>(
+        &self,
+        bytes: usize,
+        request: impl FnOnce(oneshot::Sender<Result<T, E>>) -> Command,
+    ) -> Result<Pending<T, E>, SubmitError> {
         // A failed reservation is undone below, so the service never sees
         // more than the limit. Relaxed: the counter guards no other memory.
         let before = self.queued.fetch_add(bytes, Ordering::Relaxed);
@@ -468,13 +466,17 @@ impl Log {
             undo();
             return Err(SubmitError::Busy);
         }
-        self.commands.try_send(command).map_err(|error| {
-            undo();
-            match error {
-                mpsc::error::TrySendError::Full(_) => SubmitError::Busy,
-                mpsc::error::TrySendError::Closed(_) => SubmitError::Stopped,
+        let (reply, pending) = oneshot::channel();
+        match self.commands.try_send(request(reply)) {
+            Ok(()) => Ok(Pending(pending)),
+            Err(error) => {
+                undo();
+                Err(match error {
+                    mpsc::error::TrySendError::Full(_) => SubmitError::Busy,
+                    mpsc::error::TrySendError::Closed(_) => SubmitError::Stopped,
+                })
             }
-        })
+        }
     }
 }
 
@@ -518,34 +520,29 @@ impl LogPort {
 #[derive(Debug)]
 pub struct Pending<T, E>(oneshot::Receiver<Result<T, E>>);
 
-impl<T, E> Pending<T, E> {
-    fn poll_reply(&mut self, cx: &mut Context<'_>, stopped: E) -> Poll<Result<T, E>> {
+/// A request error with a value for a service that stopped.
+trait Stopped {
+    /// The answer to a request whose service went away.
+    const STOPPED: Self;
+}
+
+/// Give each error its `Stopped` variant as the stopped value.
+macro_rules! stopped {
+    ($($error:ty),+) => {$(
+        impl Stopped for $error {
+            const STOPPED: Self = Self::Stopped;
+        }
+    )+};
+}
+
+stopped!(AppendError, ReadError, StepDownError, TrimError);
+
+impl<T, E: Stopped> Future for Pending<T, E> {
+    type Output = Result<T, E>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         Pin::new(&mut self.0)
             .poll(cx)
-            .map(|result| result.unwrap_or(Err(stopped)))
-    }
-}
-
-impl Future for Pending<Appended, AppendError> {
-    type Output = Result<Appended, AppendError>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.poll_reply(cx, AppendError::Stopped)
-    }
-}
-
-impl Future for Pending<ReadBatch, ReadError> {
-    type Output = Result<ReadBatch, ReadError>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.poll_reply(cx, ReadError::Stopped)
-    }
-}
-
-impl Future for Pending<u64, StepDownError> {
-    type Output = Result<u64, StepDownError>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.poll_reply(cx, StepDownError::Stopped)
+            .map(|result| result.unwrap_or(Err(E::STOPPED)))
     }
 }

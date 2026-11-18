@@ -295,9 +295,7 @@ fn seed(
         )
         .unwrap()
         .unwrap();
-    let receipt = admit(controller, &mut journal, &mut driver, proposal);
-    write(controller, &mut journal, &mut driver, receipt);
-    sync_apply(controller, &mut journal, &mut driver);
+    commit(controller, &mut journal, &mut driver, proposal);
     (journal, driver)
 }
 

@@ -112,8 +112,7 @@ impl ReplicaActor {
             // A nonvoting primary never installs the view this copy elects.
             // A startup probe still votes.
             if request.nonvoting {
-                self.driver
-                    .observe_recovering(self.configuration.voters()[index], now)?;
+                self.driver.observe_recovering(self.peer(index), now)?;
             }
             return Ok(());
         }
@@ -192,7 +191,7 @@ impl ReplicaActor {
         }
         for (index, reply) in replies.into_iter().enumerate() {
             if let Some(reply) = reply {
-                let to = self.configuration.voters()[index];
+                let to = self.peer(index);
                 let Some(session) = self.session(to) else {
                     continue; // Recovery requester owns its retry schedule.
                 };
@@ -217,12 +216,7 @@ impl ReplicaActor {
         let Some(donors) = &mut self.donors else {
             return false;
         };
-        let Some(index) = self
-            .configuration
-            .voters()
-            .iter()
-            .position(|voter| *voter == from)
-        else {
+        let Some(index) = super::voter_slot(self.configuration, from) else {
             return false;
         };
         let slot = &mut donors.slots[index];
@@ -341,10 +335,7 @@ impl ReplicaActor {
         release: bool,
     ) -> Result<(), ActorError> {
         let index = self
-            .configuration
-            .voters()
-            .iter()
-            .position(|voter| *voter == pin.requester())
+            .voter_slot(pin.requester())
             .ok_or_else(|| ActorError::donor_pin(pin))?;
         let slot = &mut self
             .donors
@@ -385,7 +376,7 @@ impl ReplicaActor {
         let current = self.application_ready()
             && self.donors.as_ref().is_some_and(|donors| {
                 donors.slots.iter().enumerate().any(|(index, slot)| {
-                    self.configuration.voters()[index] == to
+                    self.peer(index) == to
                         && slot.pin.held().is_some_and(|pin| {
                             pin.response().nonce == nonce
                                 && pin.source() == fetched.request().source
@@ -416,12 +407,7 @@ impl ReplicaActor {
         let Some(donors) = &mut self.donors else {
             return;
         };
-        let Some(index) = self
-            .configuration
-            .voters()
-            .iter()
-            .position(|&voter| voter == from)
-        else {
+        let Some(index) = super::voter_slot(self.configuration, from) else {
             return;
         };
         let slot = &mut donors.slots[index];
@@ -446,12 +432,7 @@ impl ReplicaActor {
         to: NodeId,
         chunk: crate::replica_journal::RecoveryCheckpointRead,
     ) -> Result<(), ActorError> {
-        let Some(index) = self
-            .configuration
-            .voters()
-            .iter()
-            .position(|&voter| voter == to)
-        else {
+        let Some(index) = self.voter_slot(to) else {
             return Ok(());
         };
         if !self.application_ready()

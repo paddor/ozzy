@@ -2,10 +2,10 @@
 //!
 //! A settled primary's heartbeat offers a rest and names its beat source,
 //! the part of its shard the group belongs to and that part's epoch. A
-//! settled backup accepts
-//! with its own. Each side then trusts the other while that broker's beats
-//! still name the source it agreed on, and sends nothing for the group. A
-//! primary rests once every backup agreed or has no link.
+//! settled backup accepts with its own. Each side then trusts the other
+//! while that broker's beats still name the source it agreed on, and sends
+//! nothing for the group. A primary rests once every backup agreed or has
+//! no link.
 //!
 //! Either side ends the rest by speaking: any other message from the peer
 //! drops the agreement, and so does a beat that no longer covers it. A voter
@@ -17,6 +17,16 @@ use crate::frontend::Beats;
 use ozzy_proto::LinkSessionId;
 use ozzy_replication::{BeatSource, Scope};
 use std::time::Duration;
+
+/// The broker's beats and where this actor reports in them.
+#[derive(Debug)]
+struct Installed {
+    beats: Beats,
+    /// This actor's shard.
+    shard: u32,
+    /// The part of the shard this actor's group belongs to.
+    part: u32,
+}
 
 /// One agreement with a peer voter.
 #[derive(Debug, Clone, Copy)]
@@ -30,9 +40,8 @@ struct Held {
 
 #[derive(Debug, Default)]
 pub(super) struct Rest {
-    /// The broker's beats, this actor's shard and its part of the shard,
-    /// once its shard has them.
-    beats: Option<(Beats, u32, u32)>,
+    /// The broker's beats, once this actor's shard has them.
+    beats: Option<Installed>,
     held: [Option<Held>; 3],
     /// The view and epoch this voter last offered or accepted a rest in.
     spoke: Option<(Scope, u64)>,
@@ -43,26 +52,31 @@ pub(super) struct Rest {
 
 impl Rest {
     fn source(&self) -> Option<BeatSource> {
-        let (beats, shard, part) = self.beats.as_ref()?;
-        beats.source(*shard, *part)
+        let installed = self.beats.as_ref()?;
+        installed.beats.source(installed.shard, installed.part)
+    }
+
+    /// This shard's epoch for the actor's part.
+    fn epoch(&self) -> Option<u64> {
+        self.source().map(|source| source.epoch)
     }
 
     /// Whether `held` still stands: the same local epoch, the same link,
     /// and a peer whose beats still name its source.
     fn trusted(&self, held: Held, peer: ozzy_proto::NodeId, session: LinkSessionId) -> bool {
-        self.beats.as_ref().is_some_and(|(beats, ..)| {
-            self.source().map(|source| source.epoch) == Some(held.local)
+        self.beats.as_ref().is_some_and(|installed| {
+            self.epoch() == Some(held.local)
                 && held.session == session
-                && beats.covers(peer, session, held.peer)
+                && installed.beats.covers(peer, session, held.peer)
         })
     }
 
     /// When `peer`'s beats last proved it alive, on the actor's clock.
     fn heard(&self, peer: ozzy_proto::NodeId, now: Duration) -> Duration {
-        let age = self
-            .beats
-            .as_ref()
-            .and_then(|(beats, ..)| beats.heard(peer).map(|age| age.min(beats.timing().timeout)));
+        let age = self.beats.as_ref().and_then(|installed| {
+            let beats = &installed.beats;
+            beats.heard(peer).map(|age| age.min(beats.timing().timeout))
+        });
         age.map_or(now, |age| now.saturating_sub(age))
     }
 }
@@ -71,7 +85,7 @@ impl ReplicaActor {
     /// Let this actor rest on `beats`, which report `shard`.
     pub(super) fn install_beats(&mut self, beats: Beats, shard: u32) {
         let part = Beats::part(self.driver.scope().group_id);
-        self.rest.beats = Some((beats, shard, part));
+        self.rest.beats = Some(Installed { beats, shard, part });
     }
 
     /// Whether an agreement this voter holds no longer stands on the
@@ -79,7 +93,7 @@ impl ReplicaActor {
     pub(super) fn rest_broken(&self) -> bool {
         (0..3).any(|voter| {
             self.rest.held[voter].is_some_and(|held| {
-                let peer = self.configuration.voters()[voter];
+                let peer = self.peer(voter);
                 !self.rest.trusted(held, peer, self.config.sessions[voter])
             })
         })
@@ -105,16 +119,9 @@ impl ReplicaActor {
     /// Whether the backup's agreement with its primary stands, so it sends
     /// no vote.
     pub(super) fn resting_backup(&self) -> bool {
-        let primary = self.configuration.primary(self.driver.scope().view);
+        let primary = self.primary();
         self.voter_slot(primary)
             .is_some_and(|voter| primary != self.local && self.rest.held[voter].is_some())
-    }
-
-    fn voter_slot(&self, node: ozzy_proto::NodeId) -> Option<usize> {
-        self.configuration
-            .voters()
-            .iter()
-            .position(|voter| *voter == node)
     }
 
     /// Check every agreement before the round acts on it.
@@ -124,14 +131,14 @@ impl ReplicaActor {
             && spoken != scope
         {
             self.rest.spoke = None;
-            self.rest.withdraw |= self.rest.source().map(|source| source.epoch) == Some(epoch);
+            self.rest.withdraw |= self.rest.epoch() == Some(epoch);
         }
         let settled = self.driver.settled();
         for voter in 0..3 {
             let Some(held) = self.rest.held[voter] else {
                 continue;
             };
-            let peer = self.configuration.voters()[voter];
+            let peer = self.peer(voter);
             let trusted = self.driver.covered(peer)
                 && self.rest.trusted(held, peer, self.config.sessions[voter]);
             if trusted && settled {
@@ -155,10 +162,10 @@ impl ReplicaActor {
             return;
         }
         crate::profiling::event(crate::profiling::Event::ReplicaRestEnd);
-        let peer = self.configuration.voters()[voter];
+        let peer = self.peer(voter);
         // A view change already uncovered every voter.
         let _ = self.driver.uncover(peer, heard);
-        if self.configuration.primary(self.driver.scope().view) == peer {
+        if self.primary() == peer {
             // The backup votes again.
             self.ack_at = now;
         }
@@ -167,12 +174,12 @@ impl ReplicaActor {
 
     /// A primary rests while every backup agreed or has no link.
     fn rest_primary(&mut self) {
-        let primary = self.configuration.primary(self.driver.scope().view) == self.local;
+        let primary = self.primary() == self.local;
         let resting = primary
             && self.resting()
             && self.driver.normal().is_some()
             && (0..3).all(|voter| {
-                let peer = self.configuration.voters()[voter];
+                let peer = self.peer(voter);
                 peer == self.local
                     || self.rest.held[voter].is_some()
                     || self.session(peer).is_none()
@@ -196,7 +203,7 @@ impl ReplicaActor {
         let Some(source) = self.rest.source().filter(|_| self.driver.settled()) else {
             return self.announce(voter, commit, true);
         };
-        let to = self.configuration.voters()[voter];
+        let to = self.peer(voter);
         self.rest.spoke = Some((commit.scope, source.epoch));
         self.control(to, Control::Rest { commit, source })
     }
@@ -223,7 +230,7 @@ impl ReplicaActor {
                 let ack = normal.acknowledgment().map_err(|error| {
                     ActorError::from(ozzy_replication::driver::DriverError::from(error))
                 })?;
-                let to = self.configuration.voters()[voter];
+                let to = self.peer(voter);
                 self.control(to, Control::RestOk { ack, source })?;
             }
             (Control::RestOk { .. }, Some(_)) => {}
@@ -249,8 +256,8 @@ impl ReplicaActor {
         source: BeatSource,
     ) -> Option<BeatSource> {
         let local = self.rest.source()?;
-        let (beats, ..) = self.rest.beats.as_ref()?;
-        let peer = self.configuration.voters()[voter];
+        let beats = &self.rest.beats.as_ref()?.beats;
+        let peer = self.peer(voter);
         let session = self.session(peer)?;
         let snapshot = self.driver.normal()?.snapshot();
         if scope != snapshot.scope

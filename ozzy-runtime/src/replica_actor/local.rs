@@ -132,11 +132,7 @@ impl LocalActor {
         let configuration = self.driver.configuration();
         let scope = configuration.scope();
         ozzy_proto::nack::AuthorityHint {
-            authority: ozzy_proto::append::Authority {
-                group_id: scope.group_id,
-                config_epoch: scope.configuration_epoch,
-                view: scope.view,
-            },
+            authority: super::response::authority(scope),
             primary: configuration.broker(),
         }
     }

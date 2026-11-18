@@ -2,21 +2,8 @@ use super::super::{dedup::limits, proposal::dedup::resolved};
 use super::*;
 use ozzy_core::dedup::Match;
 use ozzy_io::simulation::Stage;
-use ozzy_journal::operation::{DedupWatermark, OperationKind};
+use ozzy_journal::operation::DedupWatermark;
 use ozzy_proto::MessageId;
-
-fn commit(
-    controller: &mut Controller,
-    journal: &mut OwnedJournal,
-    driver: &mut Driver,
-    body: &(OperationKind, Vec<u8>),
-) {
-    let mut buffer = journal.lease_proposal_buffer().unwrap();
-    buffer.push(body.0, &body.1).unwrap();
-    let receipt = admit(controller, journal, driver, buffer);
-    write(controller, journal, driver, receipt);
-    sync_apply(controller, journal, driver);
-}
 
 fn found(journal: &OwnedJournal) -> Option<Match> {
     journal
@@ -39,14 +26,14 @@ fn local_reopen_restores_original_id_time_and_duplicates_never_refresh_it() {
     )
     .unwrap();
     initialize(&mut controller, &mut journal, &mut driver);
-    commit(
+    commit_body(
         &mut controller,
         &mut journal,
         &mut driver,
         &resolved(&request(12, 0, 1), Offset::ZERO, &[None], 0),
     );
     assert_eq!(found(&journal), Some(Match::Committed(Offset::ZERO)));
-    commit(
+    commit_body(
         &mut controller,
         &mut journal,
         &mut driver,
@@ -83,7 +70,7 @@ fn local_reopen_restores_original_id_time_and_duplicates_never_refresh_it() {
         encode_operation_body(&watermark, journal.limits.operations).unwrap(),
     );
     let identity_capacity = journal.identity_capacity().unwrap();
-    commit(&mut controller, &mut journal, &mut driver, &watermark);
+    commit_body(&mut controller, &mut journal, &mut driver, &watermark);
     assert_eq!(
         journal.identity_capacity().unwrap(),
         identity_capacity,
@@ -96,7 +83,7 @@ fn local_reopen_restores_original_id_time_and_duplicates_never_refresh_it() {
     );
     let mut repeated = request(30, 1, 1);
     repeated.records[0].message_id = MessageId::from_bytes([1; 16]);
-    commit(
+    commit_body(
         &mut controller,
         &mut journal,
         &mut driver,

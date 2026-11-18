@@ -103,8 +103,7 @@ impl ReplicaActor {
         if opened {
             // Old-incarnation packets keep their old epochs.
             if !same_channel {
-                self.outbox
-                    .discard(self.configuration.voters()[voter], SendClass::Data);
+                self.outbox.discard(self.peer(voter), SendClass::Data);
             }
             self.release_received_prefix(voter)?;
         }
@@ -199,7 +198,7 @@ impl ReplicaActor {
             self.adopt_flow(voter, request, [base, received], now)?;
         } else if positions.requested[0] < positions.retained_predecessor.op {
             self.notify_retired(
-                self.configuration.voters()[voter],
+                self.peer(voter),
                 snapshot.scope,
                 wire::HistoryFence::Receive(request.report().channel.epoch),
                 positions.retained_predecessor,
