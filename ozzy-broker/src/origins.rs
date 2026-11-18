@@ -6,9 +6,8 @@
 
 use std::{
     collections::BTreeMap,
-    fs, io,
-    io::Write,
-    path::{Path, PathBuf},
+    io,
+    path::PathBuf,
     sync::{Arc, Mutex},
 };
 
@@ -17,7 +16,7 @@ use ozzy_proto::NodeId;
 use ozzy_runtime::frontend::Service;
 use uuid::Uuid;
 
-use crate::{CheckedConfig, StartupError, io_error, provisioning};
+use crate::{CheckedConfig, StartupError, files, io_error, provisioning};
 
 const RECORD: &str = "OZZY_PEERS";
 const MAX_RECORD_BYTES: u64 = 64 * 1024;
@@ -42,29 +41,27 @@ impl PeerOrigins {
         if checked.identity.brokers.len() < 2 {
             return Ok(None);
         }
-        let Some(device) = checked.local_broker()?.devices.values().next() else {
+        let Some(root) = checked.first_device_root()? else {
             return Ok(None);
         };
-        let path = device.root.join(RECORD);
+        let path = root.join(RECORD);
         let empty = PeerRecord {
             cluster: local.cluster,
             broker: local.broker,
             origins: BTreeMap::new(),
         };
-        let record = match fs::symlink_metadata(&path) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => empty,
-            Err(error) => return Err(io_error(path, error)),
-            Ok(_) => {
-                let text = provisioning::read_bounded(&path, MAX_RECORD_BYTES)?;
-                let record = PeerRecord::decode(&text)?;
-                if (record.cluster, record.broker) != (empty.cluster, empty.broker) {
-                    return Err(io_error(
-                        path,
-                        io::Error::new(io::ErrorKind::InvalidData, "peer record of another broker"),
-                    ));
-                }
-                record
+        let record = if files::exists(&path)? {
+            let text = provisioning::read_bounded(&path, MAX_RECORD_BYTES)?;
+            let record = PeerRecord::decode(&text)?;
+            if (record.cluster, record.broker) != (empty.cluster, empty.broker) {
+                return Err(io_error(
+                    path,
+                    io::Error::new(io::ErrorKind::InvalidData, "peer record of another broker"),
+                ));
             }
+            record
+        } else {
+            empty
         };
         Ok(Some(Self {
             local: local.origin().as_u128(),
@@ -103,25 +100,8 @@ impl PeerOrigins {
         let mut next = record.clone();
         next.origins
             .insert(Uuid::from_bytes(*peer.as_bytes()), Uuid::from_u128(origin));
-        replace(&self.path, &next.encode()?)?;
+        files::publish(&self.path, &next.encode()?, true)?;
         *record = next;
         Ok(())
     }
-}
-
-/// Publish `text` at `path` in place of what is there.
-fn replace(path: &Path, text: &str) -> Result<(), StartupError> {
-    let parent = crate::parent_directory(path)?;
-    let mut staging =
-        tempfile::NamedTempFile::new_in(parent).map_err(|error| io_error(parent, error))?;
-    staging
-        .write_all(text.as_bytes())
-        .and_then(|()| staging.as_file().sync_all())
-        .map_err(|error| io_error(staging.path(), error))?;
-    staging
-        .persist(path)
-        .map_err(|error| io_error(path, error.error))?;
-    fs::File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| io_error(parent, error))
 }

@@ -4,13 +4,16 @@
 use super::install::{self, Reopened};
 use super::{Binding, State, failure};
 use crate::StartupError;
-use crate::logs::{Command, CreateError, DeleteError, LogSetup, LogTable, registry, stops::Stops};
+use crate::logs::{
+    Command, CreateError, DeleteError, LogSetup, LogTable, group, registry, stops::Stops,
+};
+use crate::replacement::Replacement;
 use futures::{StreamExt, stream::FuturesUnordered};
 use ozzy_config::{LogRecord, LogState};
 use ozzy_io::Local;
 use ozzy_proto::GroupId;
-use ozzy_replication::{JournalGeneration, driver::CleanStop};
-use ozzy_runtime::{frontend::RuntimeRoutes, replica_actor::PartitionActor};
+use ozzy_replication::driver::CleanStop;
+use ozzy_runtime::{frontend::RuntimeRoutes, log::Log, replica_actor::PartitionActor};
 use std::{
     collections::BTreeMap,
     future::Future,
@@ -65,10 +68,13 @@ pub(super) struct RuntimeLogs {
     /// log directory guards them as a whole.
     io: Local,
     commands: mpsc::Receiver<Command>,
-    pub(super) table: LogTable,
+    /// Every log of this broker and its state, for the broker handle.
+    table: LogTable,
     pub(super) routes: RuntimeRoutes,
+    /// Whether this broker replaces one that lost its stores.
+    replacement: Replacement,
     /// Every log of this shard, tombstones included.
-    pub(super) records: BTreeMap<GroupId, LogRecord>,
+    records: BTreeMap<GroupId, LogRecord>,
     jobs: FuturesUnordered<Pin<Box<dyn Future<Output = Done>>>>,
     /// Ready logs found at start that wait for their turn to open.
     unopened: Vec<LogRecord>,
@@ -101,8 +107,9 @@ impl RuntimeLogs {
             directory,
             setup,
             commands,
-            table: config.log_table.clone(),
-            routes: config.runtime_routes.clone(),
+            table: config.logs.table.clone(),
+            routes: config.logs.routes.clone(),
+            replacement: config.logs.replacement.clone(),
             records: BTreeMap::new(),
             jobs,
             unopened: Vec::new(),
@@ -115,6 +122,21 @@ impl RuntimeLogs {
     /// Whether every log recorded at start is open again or gone.
     pub(super) fn settled(&self) -> bool {
         self.starting == 0 && self.unopened.is_empty()
+    }
+
+    /// Move log `id` to `state`, for the broker handle and in the shard's
+    /// own record of it. `log` is its handle while it serves.
+    pub(super) fn mark(&mut self, id: GroupId, state: LogState, log: Option<Log>) {
+        self.table.set(id, state, log);
+        if let Some(record) = self.records.get_mut(&id) {
+            record.state = state;
+        }
+    }
+
+    /// What a storage job of this shard works with: the lane for log
+    /// stores, the setup, and the directory of records and stores.
+    fn job(&self) -> (Local, Arc<LogSetup>, PathBuf) {
+        (self.io.clone(), self.setup.clone(), self.directory.clone())
     }
 
     /// Keep the clean stops of this shard's logs for the next start.
@@ -141,13 +163,10 @@ async fn load(io: &Local, setup: &LogSetup, directory: &Path) -> Result<Loaded, 
     Ok((guarded, records, stops))
 }
 
-pub(super) fn group(record: &LogRecord) -> GroupId {
-    GroupId::from_bytes(*record.log.as_bytes())
-}
-
-/// The store directory of a log, and where it waits for removal.
-pub(super) fn stores(directory: &Path, record: &LogRecord) -> (PathBuf, PathBuf) {
-    let label = record.log.simple().to_string();
+/// The store directory of a log, where its placement puts it, and where
+/// it waits for removal.
+fn stores(directory: &Path, record: &LogRecord) -> (PathBuf, PathBuf) {
+    let label = ozzy_config::log_label(record.log);
     (
         directory.join(&label),
         directory.join(format!("{label}.trash")),
@@ -158,24 +177,20 @@ pub(super) fn stores(directory: &Path, record: &LogRecord) -> (PathBuf, PathBuf)
 /// that replaces a lost one makes a replicated log's store as a nonvoting
 /// copy instead: it cannot know that it never voted in the log.
 async fn create(
-    io: &Local,
-    setup: &LogSetup,
-    directory: &Path,
+    (io, setup, directory): &(Local, Arc<LogSetup>, PathBuf),
+    replacement: &Replacement,
     record: &LogRecord,
 ) -> Result<Reopened, StartupError> {
     crate::format::initialize_directory(io, directory).await?;
     registry::publish(io, directory, record).await?;
-    let opened = if setup.replacing() && record.members.len() == 3 {
+    let opened = if replacement.on() && record.members.len() == 3 {
         install::replace(io, setup, record).await?
     } else {
-        let generation = JournalGeneration(uuid::Uuid::now_v7().as_u128());
+        let generation = crate::journals::generation();
         let journal = setup.journal(record)?;
         Reopened::Serving(Box::new(journal.format(io.clone(), generation).await?))
     };
-    let ready = LogRecord {
-        state: LogState::Ready,
-        ..record.clone()
-    };
+    let ready = record.with_state(LogState::Ready);
     registry::publish(io, directory, &ready).await?;
     Ok(opened)
 }
@@ -194,11 +209,7 @@ async fn erase(io: &Local, directory: &Path, record: &LogRecord) -> Result<(), S
         Err(error) => return Err(crate::io_error(store, error)),
     }
     registry::remove_tree(io, directory, &trash).await?;
-    let deleted = LogRecord {
-        state: LogState::Deleted,
-        ..record.clone()
-    };
-    registry::publish(io, directory, &deleted).await
+    registry::publish(io, directory, &record.with_state(LogState::Deleted)).await
 }
 
 /// Mark deleting, drain the actor, then erase.
@@ -233,7 +244,7 @@ impl State {
             let record = record.clone();
             runtime.setup.check(&record)?;
             runtime.table.set(id, record.state, None);
-            let (io, directory) = (runtime.io.clone(), runtime.directory.clone());
+            let (io, _, directory) = runtime.job();
             match record.state {
                 LogState::Creating => {
                     // It never served or voted: nothing depends on it.
@@ -276,12 +287,11 @@ impl State {
             && runtime.settling.room(runtime.starting)
             && let Some(record) = runtime.unopened.pop()
         {
-            let (io, setup) = (runtime.io.clone(), runtime.setup.clone());
-            let directory = runtime.directory.clone();
+            let (io, setup, _) = runtime.job();
             let stop = runtime.stops.get(&group(&record)).copied();
             runtime.starting += 1;
             runtime.jobs.push(Box::pin(async move {
-                let opened = install::reopen(&io, &setup, &directory, &record).await;
+                let opened = install::reopen(&io, &setup, &record).await;
                 // The evidence left the disk before this log opened.
                 let opened = opened.map(|opened| match opened {
                     Reopened::Serving(opened) => {
@@ -390,14 +400,10 @@ impl State {
             return;
         }
         runtime.records.insert(spec.id, record.clone());
-        runtime.table.set(spec.id, LogState::Creating, None);
-        let (io, setup, directory) = (
-            runtime.io.clone(),
-            runtime.setup.clone(),
-            runtime.directory.clone(),
-        );
+        runtime.mark(spec.id, LogState::Creating, None);
+        let (job, replacement) = (runtime.job(), runtime.replacement.clone());
         runtime.jobs.push(Box::pin(async move {
-            let opened = Box::pin(create(&io, &setup, &directory, &record)).await;
+            let opened = Box::pin(create(&job, &replacement, &record)).await;
             Done::Created {
                 record,
                 opened,
@@ -432,16 +438,11 @@ impl State {
                 return;
             }
         };
-        runtime.table.set(id, LogState::Deleting, None);
-        let Some(record) = runtime.records.get_mut(&id) else {
+        runtime.mark(id, LogState::Deleting, None);
+        let Some(record) = runtime.records.get(&id).cloned() else {
             return;
         };
-        record.state = LogState::Deleting;
-        let (io, directory, record) = (
-            runtime.io.clone(),
-            runtime.directory.clone(),
-            record.clone(),
-        );
+        let (io, _, directory) = runtime.job();
         runtime.jobs.push(Box::pin(async move {
             let removed = delete(&io, &directory, &record, actor).await;
             Done::Deleted {
@@ -492,22 +493,20 @@ impl State {
                     reply.send(installed.map_err(|error| CreateError::Failed(error.to_string())));
             }
             Done::Deleted { id, removed, reply } => {
-                let Some(reply) = reply else {
+                if reply.is_none() {
                     runtime.starting -= 1;
-                    removed?;
-                    runtime.table.set(id, LogState::Deleted, None);
-                    if let Some(record) = runtime.records.get_mut(&id) {
-                        record.state = LogState::Deleted;
-                    }
-                    return Ok(());
-                };
-                if removed.is_ok() {
-                    runtime.table.set(id, LogState::Deleted, None);
-                    if let Some(record) = runtime.records.get_mut(&id) {
-                        record.state = LogState::Deleted;
-                    }
                 }
-                let _ = reply.send(removed.map_err(|error| DeleteError::Failed(error.to_string())));
+                if removed.is_ok() {
+                    runtime.mark(id, LogState::Deleted, None);
+                }
+                match reply {
+                    Some(reply) => {
+                        let failed = |error: StartupError| DeleteError::Failed(error.to_string());
+                        let _ = reply.send(removed.map_err(failed));
+                    }
+                    // A deletion resumed at start must finish.
+                    None => removed?,
+                }
             }
         }
         Ok(())

@@ -56,7 +56,7 @@ impl State {
     /// expiry timers by the clock as it is now.
     fn sync_clock(&mut self) {
         let clock = self.config.clock.generation();
-        if self.synced_clock.replace(clock) != Some(clock) {
+        if self.synced.clock.replace(clock) != Some(clock) {
             self.actors.wake_all();
         }
     }
@@ -70,17 +70,17 @@ impl State {
         now: Duration,
     ) -> Result<(), StartupError> {
         let links = binding.links.generation();
-        if self.synced_links != Some(links) {
-            self.synced_links = Some(links);
-            self.unsynced = self.identities.len();
+        if self.synced.links != Some(links) {
+            self.synced.links = Some(links);
+            self.synced.unsynced = self.identities.len();
         }
-        for _ in 0..self.unsynced.min(16) {
-            self.unsynced -= 1;
-            if let Some(&(group, _)) = self.identities.get(self.unsynced) {
+        for _ in 0..self.synced.unsynced.min(16) {
+            self.synced.unsynced -= 1;
+            if let Some(&(group, _)) = self.identities.get(self.synced.unsynced) {
                 self.sync_group(group, binding, now)?;
             }
         }
-        if self.unsynced != 0 {
+        if self.synced.unsynced != 0 {
             cx.waker().wake_by_ref();
         }
         Ok(())
@@ -106,7 +106,7 @@ impl State {
         }
         for &peer in self.config.remote.control.keys() {
             let key = (group, peer);
-            let old = self.sessions.get(&key).copied();
+            let old = self.synced.sessions.get(&key).copied();
             let new = binding.links.get(peer).map(|link| link.binding.session);
             if old == new {
                 continue;
@@ -120,13 +120,13 @@ impl State {
                     self.actors
                         .replace_session(group, peer, sessions, now)
                         .map_err(failure)?;
-                    self.sessions.insert(key, new);
+                    self.synced.sessions.insert(key, new);
                 }
                 (Some(old), None) => {
                     self.actors
                         .disconnect_session(group, peer, old, now)
                         .map_err(failure)?;
-                    self.sessions.remove(&key);
+                    self.synced.sessions.remove(&key);
                 }
                 (None, None) => {}
             }
@@ -187,7 +187,7 @@ impl State {
     fn install_recovered(&mut self, binding: &Binding) -> Result<(), StartupError> {
         while let Some(group) = self.actors.take_recovered() {
             // Its broker sessions were not applied while it recovered.
-            self.synced_links = None;
+            self.synced.links = None;
             let index = *self
                 .indices
                 .get(&group)
@@ -202,7 +202,7 @@ impl State {
                 .map_err(failure)?
                 .ok_or_else(|| failure("unpublished recovery handoff"))?;
             actor
-                .bind_receive_owner(&self.replica_memory)
+                .bind_receive_owner(&self.memory.replica)
                 .map_err(failure)?;
             actor.enable_publication();
             if index >= self.fixed {
@@ -217,13 +217,7 @@ impl State {
                 native,
                 coordinator,
                 lane,
-            } = super::build::recovered_services(
-                actor,
-                plan,
-                &self.config,
-                &self.data_memory,
-                &self.control_memory,
-            )?;
+            } = super::build::recovered_services(actor, plan, &self.config, &self.memory)?;
             self.actors
                 .install_native(native, binding.links.clone())
                 .map_err(failure)?;
@@ -322,7 +316,8 @@ impl State {
                 cx.waker().wake_by_ref();
                 return Ok(());
             }
-            let (pending, queue) = (&mut self.pending[lane], &mut self.incoming[lane]);
+            let lanes = &mut self.lanes;
+            let (pending, queue) = (&mut lanes.pending[lane], &mut lanes.incoming[lane]);
             let input = if let Some(input) = pending.take() {
                 input
             } else if let Some(input) = queue.try_recv().map_err(failure)? {
@@ -340,7 +335,7 @@ impl State {
             }
             let result = self.dispatch(&input, binding, now)?;
             if result == NativeReceive::Busy {
-                self.pending[lane] = Some(input);
+                self.lanes.pending[lane] = Some(input);
                 return Ok(());
             }
             if bytes >= 2 * 1024 * 1024 {

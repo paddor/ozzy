@@ -150,6 +150,9 @@
   `ozzy_replication::BeatSource` is that type under its old name.
   `ozzy_journal_segment::is_recovery_marker` tells the marker of an
   unfinished recovery from a group configuration.
+- `ozzy_config::LOG_DIRECTORY` and `ozzy_config::log_label` name where a
+  runtime log lives on a device, and `LogRecord::with_state` copies a
+  record into another state.
 
 ### Changed
 

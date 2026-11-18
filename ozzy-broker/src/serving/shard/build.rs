@@ -1,8 +1,11 @@
+use super::parts::{
+    log_channel, log_lane, prepare_serving, profile, recovering_actor, serving_actor,
+};
 use super::{
-    ActorIds, Arc, BTreeMap, Bootstrap, COORDINATOR_PLANS, Config, DataReceiver, GroupCoordinator,
-    GroupCoordinatorConfig, GroupId, JournalConfig, JournalGeneration, JournalPlan, NativeAccess,
-    NativeIntake, NativeIntakeConfig, Outbound, PartitionActors, Policy, ShardContext,
-    StartupError, State, TopicTopology, WRITER_WINDOW, WRITERS, failure, frontend,
+    Arc, BTreeMap, Bootstrap, COORDINATOR_PLANS, Config, DataReceiver, GroupCoordinator,
+    GroupCoordinatorConfig, GroupId, JournalConfig, JournalPlan, Lanes, NativeAccess, NativeIntake,
+    NativeIntakeConfig, Outbound, PartitionActors, Policy, Services, ShardContext, ShardMemory,
+    StartupError, State, Synced, TopicTopology, WRITER_WINDOW, WRITERS, failure, frontend,
 };
 use ozzy_runtime::replica_actor::PartitionActor;
 use std::time::Duration;
@@ -25,10 +28,7 @@ pub(super) async fn build(
     }
     let Opening {
         actors,
-        natives,
-        logs,
-        handles,
-        coordinators,
+        services,
         bootstrap,
         recoveries,
         identities,
@@ -45,22 +45,20 @@ pub(super) async fn build(
         .collect();
     Ok(State {
         actors,
-        natives,
-        logs,
-        handles,
-        coordinators,
+        services,
         identities,
         bootstrap,
         recoveries,
-        incoming,
-        pending: std::array::from_fn(|_| None),
-        replica_memory: shard.memory.replica.clone(),
-        data_memory: shard.memory.data.clone(),
-        control_memory: shard.memory.control.clone(),
-        sessions: BTreeMap::new(),
-        synced_links: None,
-        unsynced: 0,
-        synced_clock: None,
+        lanes: Lanes {
+            incoming,
+            pending: std::array::from_fn(|_| None),
+        },
+        memory: ShardMemory {
+            data: shard.memory.data.clone(),
+            replica: shard.memory.replica.clone(),
+            control: shard.memory.control.clone(),
+        },
+        synced: Synced::default(),
         routes,
         publisher: None,
         outbound: outbound(&config),
@@ -121,10 +119,7 @@ struct Opening<'a> {
     config: &'a Config,
     topologies: &'a BTreeMap<String, Arc<TopicTopology>>,
     actors: Vec<PartitionActor>,
-    natives: Vec<NativeIntake>,
-    logs: Vec<super::LogInstall>,
-    handles: Vec<(String, u32, ozzy_runtime::log::Log)>,
-    coordinators: Vec<GroupCoordinator>,
+    services: Services,
     bootstrap: Vec<Option<Bootstrap>>,
     recoveries: BTreeMap<GroupId, crate::PartitionJournal>,
     identities: Vec<(GroupId, ozzy_proto::PartitionIncarnation)>,
@@ -141,10 +136,7 @@ impl<'a> Opening<'a> {
             config,
             topologies,
             actors: Vec::new(),
-            natives: Vec::new(),
-            logs: Vec::new(),
-            handles: Vec::new(),
-            coordinators: Vec::new(),
+            services: Services::default(),
             bootstrap: Vec::new(),
             recoveries: BTreeMap::new(),
             identities: Vec::new(),
@@ -166,10 +158,10 @@ impl<'a> Opening<'a> {
                 // history. Keep their service recipe for every later rejoin.
                 self.recoveries.insert(group, plan.clone());
             }
-            let port = self.open_log(plan, group)?;
+            let port = self.open_log(plan)?;
             if let Some(&intent) = journals.recovery.get(&group) {
                 self.open_recovering(plan, intent).await?;
-                self.logs.push(super::LogInstall {
+                self.services.logs.push(super::LogInstall {
                     group,
                     port,
                     lane: None,
@@ -203,14 +195,12 @@ impl<'a> Opening<'a> {
     fn open_log(
         &mut self,
         plan: &crate::PartitionJournal,
-        group: GroupId,
     ) -> Result<ozzy_runtime::log::LogPort, StartupError> {
-        let (_, body_bytes, _) = profile(&plan.config);
-        let limits = super::super::config::log_limits(body_bytes);
-        let (log, port) = ozzy_runtime::log::log_channel(plan.incarnation, limits)
-            .ok_or_else(|| failure(format!("invalid log limits for group {group}")))?;
-        self.handles
-            .push((plan.placement.topic.clone(), plan.placement.partition, log));
+        let (log, port) = log_channel(plan)?;
+        let placement = &plan.placement;
+        self.services
+            .handles
+            .push((placement.topic.clone(), placement.partition, log));
         Ok(port)
     }
 
@@ -223,17 +213,13 @@ impl<'a> Opening<'a> {
         port: ozzy_runtime::log::LogPort,
     ) -> Result<(), StartupError> {
         let mut started = Box::pin(open_actor(self.shard, plan, self.config)).await?;
-        let limits = port.limits();
         match initialize_started(&mut started, self.shard, self.config, plan, self.topologies)
-            .and_then(|services| {
-                let lane = ozzy_runtime::replica_actor::LogLane::new(&mut started.actor, limits)
-                    .map_err(failure)?;
-                Ok((services, lane))
-            }) {
+            .and_then(|services| Ok((services, log_lane(&mut started.actor, plan)?)))
+        {
             Ok(((native, coordinator), lane)) => {
-                self.natives.push(native);
-                self.coordinators.push(coordinator);
-                self.logs.push(super::LogInstall {
+                self.services.natives.push(native);
+                self.services.coordinators.push(coordinator);
+                self.services.logs.push(super::LogInstall {
                     group,
                     port,
                     lane: Some(lane),
@@ -244,22 +230,24 @@ impl<'a> Opening<'a> {
                 return Err(error);
             }
         }
-        self.bootstrap.push(Some(Bootstrap {
-            group,
-            submitter: started.proposal,
-            buffer: Some(started.buffer),
-            pending: None,
-            done: false,
-        }));
+        let bootstrap = Bootstrap::new(group, started.proposal, started.buffer);
+        self.bootstrap.push(Some(bootstrap));
         self.actors.push(started.actor);
         Ok(())
     }
 
     /// Release the services before their actors, then drain every actor.
     async fn shut_down(self) {
-        drop(self.natives);
-        drop(self.logs);
-        drop(self.coordinators);
+        // The handles go last, once the actors drained.
+        let Services {
+            natives,
+            logs,
+            coordinators,
+            handles: _handles,
+        } = self.services;
+        drop(natives);
+        drop(logs);
+        drop(coordinators);
         drop(self.bootstrap);
         for actor in self.actors {
             let _ = actor.shutdown().await;
@@ -275,12 +263,7 @@ fn initialize_started(
     topologies: &BTreeMap<String, Arc<TopicTopology>>,
 ) -> Result<(NativeIntake, GroupCoordinator), StartupError> {
     let (policy, _, group) = profile(&plan.config);
-    started
-        .actor
-        .bind_receive_owner(&shard.memory.replica)
-        .map_err(failure)?;
-    started.actor.enable_publication();
-    started.prepare_partition()?;
+    prepare_serving(started, &shard.memory)?;
     let native = native_config(config, plan, group, policy);
     let native = native_intake(
         &mut started.actor,
@@ -340,23 +323,8 @@ fn routing(
         identities.len().max(1),
         config.envelope,
     )
-    .map(|table| table.with_runtime(config.runtime_routes.clone()))
+    .map(|table| table.with_runtime(config.logs.routes.clone()))
     .map_err(failure)
-}
-
-fn profile(config: &JournalConfig) -> (Policy, usize, GroupId) {
-    match config {
-        JournalConfig::Local(config) => (
-            Policy::LocalDurable,
-            config.append_limits.max_body_bytes,
-            config.identity.group_id,
-        ),
-        JournalConfig::Replicated(config) => (
-            Policy::QuorumDurable,
-            config.append_limits.max_body_bytes,
-            config.identity.group_id,
-        ),
-    }
 }
 
 async fn open_actor(
@@ -366,14 +334,9 @@ async fn open_actor(
 ) -> Result<crate::StartedPartition, StartupError> {
     let opened = tokio::select! {
         () = shard.shutdown.closed() => return Err(failure("partition startup stopped")),
-        opened = plan.clone().open(shard.io.clone(), JournalGeneration(uuid::Uuid::now_v7().as_u128())) => opened?,
+        opened = plan.clone().open(shard.io.clone(), crate::journals::generation()) => opened?,
     };
-    opened.into_actor(
-        &shard.memory.data,
-        &BTreeMap::new(),
-        ActorIds::random(config.receipt_handles.clone()),
-        config.journal_clock(),
-    )
+    serving_actor(opened, &shard.memory, config)
 }
 
 async fn open_recovery(
@@ -382,20 +345,12 @@ async fn open_recovery(
     intent: crate::RecoveryIntent,
     config: &Config,
 ) -> Result<ozzy_runtime::replica_actor::PartitionActor, StartupError> {
-    let generations = ozzy_runtime::replica_journal::OwnedRecoveryGenerations {
-        attempt: JournalGeneration(uuid::Uuid::now_v7().as_u128()),
-        temporary: JournalGeneration(uuid::Uuid::now_v7().as_u128()),
-    };
+    let generations = crate::journals::recovery_generations();
     let opened = tokio::select! {
         () = shard.shutdown.closed() => return Err(failure("partition recovery startup stopped")),
         opened = plan.clone().recover(shard.io.clone(), generations, intent) => opened?,
     };
-    opened.into_actor(
-        &shard.memory.data,
-        &BTreeMap::new(),
-        ActorIds::random(config.receipt_handles.clone()),
-        config.journal_clock(),
-    )
+    recovering_actor(opened, &shard.memory, config)
 }
 
 /// Immutable topic shapes shared by every coordinator of a topic.

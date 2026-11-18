@@ -1,5 +1,5 @@
-use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::fs::OpenOptions;
+use std::io::{self, Read};
 use std::path::Path;
 
 use ozzy_config::{
@@ -9,7 +9,7 @@ use ozzy_proto::{GroupId, NodeId, PartitionIncarnation, TopicId, directory};
 use ozzy_runtime::{frontend::TopicCatalog, replicated::BrokerAddress};
 use uuid::Uuid;
 
-use crate::{StartupError, io_error};
+use crate::{StartupError, files, io_error};
 
 const MAX_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -28,6 +28,13 @@ impl CheckedConfig {
     /// This broker's entry in the checked deployment.
     pub fn local_broker(&self) -> Result<&ozzy_config::Broker, StartupError> {
         Ok(self.deployment.deployment().broker(&self.plan.name)?)
+    }
+
+    /// The root of this broker's first device, which holds the broker's
+    /// own markers and records.
+    pub(crate) fn first_device_root(&self) -> Result<Option<&Path>, StartupError> {
+        let devices = &self.local_broker()?.devices;
+        Ok(devices.values().next().map(|device| device.root.as_path()))
     }
 
     /// SDK addresses of every configured broker, in persistent order.
@@ -128,7 +135,7 @@ pub fn initialize_identity(
     next_id: impl FnMut() -> Uuid,
 ) -> Result<DeploymentIdentity, StartupError> {
     let identity = deployment.initialize(next_id)?;
-    publish_identity(path, &identity.encode()?)?;
+    files::publish(path, &identity.encode()?, false)?;
     Ok(identity)
 }
 
@@ -144,7 +151,7 @@ pub fn initialize_broker_identity(
         &checked.plan.name,
         next_id,
     )?;
-    publish_identity(path, &identity.encode()?)?;
+    files::publish(path, &identity.encode()?, false)?;
     Ok(identity)
 }
 
@@ -159,35 +166,6 @@ pub fn load_broker_identity(
         .deployment
         .check_broker_identity(&checked.identity, &checked.plan.name, &identity)?;
     Ok(identity)
-}
-
-pub(crate) fn publish_identity(path: &Path, encoded: &str) -> Result<(), StartupError> {
-    let parent = path
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let directory = File::open(parent).map_err(|error| io_error(parent, error))?;
-    let mut staging =
-        tempfile::NamedTempFile::new_in(parent).map_err(|error| io_error(parent, error))?;
-    staging
-        .write_all(encoded.as_bytes())
-        .map_err(|error| io_error(staging.path(), error))?;
-    staging
-        .as_file()
-        .sync_all()
-        .map_err(|error| io_error(staging.path(), error))?;
-    // persist_noclobber atomically refuses an existing destination. A preflight
-    // exists() check would race another initializer and could replace authority.
-    let published = staging
-        .persist_noclobber(path)
-        .map_err(|error| io_error(path, error.error))?;
-    published
-        .sync_all()
-        .map_err(|error| io_error(path, error))?;
-    directory
-        .sync_all()
-        .map_err(|error| io_error(parent, error))?;
-    Ok(())
 }
 
 /// Read established identity and validate selected placement. Missing, corrupt or

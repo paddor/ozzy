@@ -1,6 +1,7 @@
 mod build;
 mod install;
 mod logs;
+mod parts;
 mod scheduler;
 mod waves;
 use build::build;
@@ -11,17 +12,15 @@ use super::{
     failure,
     outbound::Outbound,
 };
-use crate::{JournalConfig, JournalPlan, ShardContext, StartupError};
+use crate::{JournalConfig, JournalPlan, ShardContext, ShardMemory, StartupError};
 use ozzy_proto::{GroupId, LinkSessionId, NodeId, append::Policy};
-use ozzy_replication::JournalGeneration;
 use ozzy_runtime::{
     dispatch::Class,
     frontend::{self, DataInput, DataLaneLimits, DataReceiver, DataSender, Kind},
-    memory::Owner,
     replica_actor::{
-        ActorIds, GroupCoordinator, GroupCoordinatorConfig, NativeAccess, NativeIntake,
-        NativeIntakeConfig, NativeReceive, PartitionActors, PartitionStatus, PendingProposal,
-        ProposalOutcome, ProposalSubmitter, RoutePublisher, TopicTopology,
+        GroupCoordinator, GroupCoordinatorConfig, NativeAccess, NativeIntake, NativeIntakeConfig,
+        NativeReceive, PartitionActors, PartitionStatus, PendingProposal, ProposalOutcome,
+        ProposalSubmitter, RoutePublisher, TopicTopology,
     },
     replica_journal::ProposalBuffer,
 };
@@ -47,6 +46,20 @@ struct Bootstrap {
     done: bool,
 }
 
+impl Bootstrap {
+    /// The bootstrap of `group`, with its proposal in `buffer` not yet
+    /// submitted.
+    const fn new(group: GroupId, submitter: ProposalSubmitter, buffer: ProposalBuffer) -> Self {
+        Self {
+            group,
+            submitter,
+            buffer: Some(buffer),
+            pending: None,
+            done: false,
+        }
+    }
+}
+
 /// One partition's log until the frontend binding installs it.
 struct LogInstall {
     group: GroupId,
@@ -54,39 +67,56 @@ struct LogInstall {
     lane: Option<ozzy_runtime::replica_actor::LogLane>,
 }
 
-struct State {
-    actors: PartitionActors,
+/// What the shard opened at start and hands over once: the handles at
+/// registration, the services when the frontend binding arrives.
+#[derive(Default)]
+struct Services {
     natives: Vec<NativeIntake>,
     logs: Vec<LogInstall>,
     coordinators: Vec<GroupCoordinator>,
+    /// Log handles by topic and partition number.
+    handles: Vec<(String, u32, ozzy_runtime::log::Log)>,
+}
+
+/// The shard's inbound lanes: data, replica, control, replica control.
+struct Lanes {
+    incoming: [DataReceiver; 4],
+    /// One input per lane that its actor could not take yet.
+    pending: [Option<DataInput>; 4],
+}
+
+/// How far the partitions follow the frontend's links and the clock guard.
+#[derive(Default)]
+struct Synced {
+    /// The broker session each partition last applied, by peer.
+    sessions: BTreeMap<(GroupId, NodeId), LinkSessionId>,
+    /// Frontend link generation that every partition's sessions reflect.
+    links: Option<u64>,
+    /// Partitions not yet compared with `links`.
+    unsynced: usize,
+    /// Clock guard generation every partition's timers reflect.
+    clock: Option<u64>,
+}
+
+struct State {
+    actors: PartitionActors,
+    services: Services,
     identities: Vec<(GroupId, ozzy_proto::PartitionIncarnation)>,
     bootstrap: Vec<Option<Bootstrap>>,
     recoveries: BTreeMap<GroupId, crate::PartitionJournal>,
-    incoming: [DataReceiver; 4],
-    pending: [Option<DataInput>; 4],
-    data_memory: Owner,
-    replica_memory: Owner,
-    control_memory: Owner,
-    sessions: BTreeMap<(GroupId, NodeId), LinkSessionId>,
-    /// Frontend link generation that every partition's sessions reflect.
-    synced_links: Option<u64>,
-    /// Partitions not yet compared with `synced_links`.
-    unsynced: usize,
-    /// Clock guard generation every partition's timers reflect.
-    synced_clock: Option<u64>,
+    lanes: Lanes,
+    memory: ShardMemory,
+    synced: Synced,
     routes: frontend::RoutingTable,
     publisher: Option<RoutePublisher>,
     outbound: Outbound,
     group_cursor: usize,
     indices: BTreeMap<GroupId, usize>,
-    /// Reservation slots whose deferred input its actor can take now.
     config: Arc<Config>,
     /// Partition status queries from the admin owner, when one runs.
     admin: Option<crate::admin::ShardLane>,
     /// This shard's reader grants, which the reader PUB admits by.
     grants: Option<ozzy_runtime::frontend::ShardGrants>,
-    /// Log handles by topic and partition number, until registration.
-    handles: Vec<(String, u32, ozzy_runtime::log::Log)>,
     /// This shard's ID.
     shard: u32,
     /// Configured partitions: the first entries of `identities`. Runtime
@@ -113,7 +143,7 @@ pub(super) async fn run(
     let (senders, incoming) = open_lanes(shard.plan.id, &config)?;
     let mut state = Box::pin(build(&shard, &journals, config, incoming)).await?;
     let routes = state.route_states()?;
-    let logs = std::mem::take(&mut state.handles);
+    let logs = std::mem::take(&mut state.services.handles);
     let (serving, observed) = tokio::sync::watch::channel(false);
     let result = async {
         let (handoff, binding) = oneshot::channel();
@@ -141,9 +171,7 @@ pub(super) async fn run(
         serve(&shard, &mut state, &mut binding, &serving).await
     }
     .await;
-    drop(state.natives);
-    drop(state.logs);
-    drop(state.coordinators);
+    drop(state.services);
     drop(state.bootstrap);
     drop(state.outbound);
     let runtime = state.runtime.take();
@@ -220,17 +248,17 @@ impl State {
     /// Install the native intakes, logs, coordinators, readers, and route
     /// publisher on the frontend links of `binding`.
     fn install_services(&mut self, binding: &Binding) -> Result<(), StartupError> {
-        for native in self.natives.drain(..) {
+        for native in self.services.natives.drain(..) {
             self.actors
                 .install_native(native, binding.links.clone())
                 .map_err(failure)?;
         }
-        for log in self.logs.drain(..) {
+        for log in self.services.logs.drain(..) {
             self.actors
                 .install_log(log.group, log.port, log.lane)
                 .map_err(failure)?;
         }
-        for coordinator in self.coordinators.drain(..) {
+        for coordinator in self.services.coordinators.drain(..) {
             self.actors
                 .install_coordinator(coordinator, binding.links.clone())
                 .map_err(failure)?;
@@ -308,7 +336,7 @@ struct Waits {
 impl Waits {
     /// Start a receive on every lane without one, and follow the admin lane.
     fn arm(&mut self, state: &State) {
-        for (input, incoming) in self.inputs.iter_mut().zip(&state.incoming) {
+        for (input, incoming) in self.inputs.iter_mut().zip(&state.lanes.incoming) {
             if input.is_none() {
                 *input = Some(Box::pin(incoming.ready()));
             }
@@ -336,12 +364,12 @@ impl Waits {
             return Poll::Ready(Ok(()));
         }
         for lane in [3, 2, 1, 0] {
-            if state.pending[lane].is_none()
+            if state.lanes.pending[lane].is_none()
                 && let Some(input) = self.inputs[lane].as_mut()
                 && let Poll::Ready(input) = input.as_mut().poll(cx)
             {
                 self.inputs[lane] = None;
-                state.pending[lane] = Some(input.map_err(failure)?);
+                state.lanes.pending[lane] = Some(input.map_err(failure)?);
                 return Poll::Ready(Ok(()));
             }
         }

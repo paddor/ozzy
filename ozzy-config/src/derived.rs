@@ -46,7 +46,5 @@ fn derive(cluster: Uuid, purpose: Purpose<'_>) -> Uuid {
     hasher.update(&number.to_le_bytes());
     // The name comes last and nothing follows it, so it needs no length.
     hasher.update(name.as_bytes());
-    let mut bytes = [0; 16];
-    bytes.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
-    uuid::Builder::from_custom_bytes(bytes).into_uuid()
+    crate::hashed_id(&hasher)
 }

@@ -43,8 +43,16 @@ impl LogClass {
     /// Whether a log of this class may have segments of `bytes`: at least
     /// 1 MiB, aligned to 4 KiB, and twice the class's append bound.
     pub const fn segment_fits(&self, bytes: u64) -> bool {
-        bytes >= 1024 * 1024 && bytes.is_multiple_of(4096) && self.max_append_bytes <= bytes / 2
+        segment_fits(bytes, self.max_append_bytes)
     }
+}
+
+/// Whether segments of `segment_bytes` suit appends of `max_append_bytes`:
+/// at least 1 MiB, aligned to 4 KiB, and twice the append bound.
+pub(crate) const fn segment_fits(segment_bytes: u64, max_append_bytes: u64) -> bool {
+    segment_bytes >= 1024 * 1024
+        && segment_bytes.is_multiple_of(4096)
+        && max_append_bytes <= segment_bytes / 2
 }
 
 /// Deployment authority, independent of local topology.

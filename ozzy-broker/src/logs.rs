@@ -9,6 +9,7 @@ pub(crate) mod stops;
 pub use ozzy_config::LogState;
 pub(crate) use setup::LogSetup;
 
+use ozzy_config::LogRecord;
 use ozzy_proto::{GroupId, NodeId, PartitionIncarnation};
 use ozzy_runtime::log::Log;
 use std::{
@@ -81,6 +82,11 @@ pub enum DeleteError {
     /// The broker stopped.
     #[error("the broker stopped")]
     Stopped,
+}
+
+/// The ID and replication group of a recorded log.
+pub(crate) fn group(record: &LogRecord) -> GroupId {
+    GroupId::from_bytes(*record.log.as_bytes())
 }
 
 /// One request from the broker handle to the shard that owns the log.

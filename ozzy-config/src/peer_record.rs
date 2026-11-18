@@ -47,9 +47,6 @@ impl BrokerIdentity {
             hasher.update(&(device.len() as u64).to_le_bytes());
             hasher.update(device.as_bytes());
         }
-        let mut bytes = [0; 16];
-        bytes.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
-        // The version bits make it nonzero.
-        uuid::Builder::from_custom_bytes(bytes).into_uuid()
+        crate::hashed_id(&hasher)
     }
 }

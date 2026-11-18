@@ -21,6 +21,7 @@
 mod actors;
 mod admin;
 mod devices;
+mod files;
 mod format;
 mod frontend;
 mod host;
@@ -119,6 +120,11 @@ pub(crate) fn io_error(path: impl Into<PathBuf>, source: std::io::Error) -> Star
         path: path.into(),
         source,
     }
+}
+
+/// A runtime failure that says `reason`.
+pub(crate) fn failure(reason: impl std::fmt::Display) -> StartupError {
+    StartupError::Runtime(reason.to_string())
 }
 
 /// The directory holding a configured path; a root has none.

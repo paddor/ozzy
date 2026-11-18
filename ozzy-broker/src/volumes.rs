@@ -3,7 +3,7 @@
 use ozzy_config::{BrokerIdentity, VolumeIdentity};
 use std::{collections::BTreeSet, fs, io, path::PathBuf};
 
-use crate::{CheckedConfig, StartupError, io_error, provisioning};
+use crate::{CheckedConfig, StartupError, files, io_error, provisioning};
 
 const MARKER: &str = "OZZY_VOLUME";
 
@@ -19,16 +19,12 @@ pub fn initialize_volumes(
     // reject a concurrent initializer after this preflight.
     for (root, _) in &roots {
         let marker = root.join(MARKER);
-        match fs::symlink_metadata(&marker) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(io_error(marker, error)),
-            Ok(_) => {
-                return Err(io_error(marker, io::ErrorKind::AlreadyExists.into()));
-            }
+        if files::exists(&marker)? {
+            return Err(io_error(marker, io::ErrorKind::AlreadyExists.into()));
         }
     }
     for (root, expected) in roots {
-        provisioning::publish_identity(&root.join(MARKER), &expected.encode()?)?;
+        files::publish(&root.join(MARKER), &expected.encode()?, false)?;
     }
     Ok(())
 }
@@ -47,13 +43,9 @@ pub(crate) fn prepare_volumes(
     let broker = checked.local_broker()?;
     for (root, expected) in roots(checked, identity)? {
         let marker = root.join(MARKER);
-        match fs::symlink_metadata(&marker) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                provisioning::publish_identity(&marker, &expected.encode()?)?;
-                continue;
-            }
-            Err(error) => return Err(io_error(marker, error)),
-            Ok(_) => {}
+        if !files::exists(&marker)? {
+            files::publish(&marker, &expected.encode()?, false)?;
+            continue;
         }
         let actual = VolumeIdentity::decode(&provisioning::read_bounded(&marker, 4096)?)?;
         if actual != expected {
@@ -103,13 +95,7 @@ pub(crate) fn create_durable(directory: &std::path::Path) -> Result<(), StartupE
             }
             _ => {}
         }
-        let parent = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| std::path::Path::new("."));
-        fs::File::open(parent)
-            .and_then(|parent| parent.sync_all())
-            .map_err(|error| io_error(parent, error))?;
+        files::sync_directory(files::parent_or_dot(path))?;
     }
     Ok(())
 }

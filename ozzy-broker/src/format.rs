@@ -1,7 +1,6 @@
 //! Explicit segment initialization using the configured shared execution pools.
 
 use ozzy_config::BrokerIdentity;
-use ozzy_replication::JournalGeneration;
 use std::{collections::BTreeSet, fs, io, sync::Arc};
 
 use crate::{
@@ -75,7 +74,7 @@ pub(crate) async fn format_journals(
                 }
                 let mut opened = tokio::select! {
                     () = context.shutdown.closed() => return Ok(()),
-                    result = partition.clone().format(context.io.clone(), JournalGeneration(uuid::Uuid::now_v7().as_u128())) => result?,
+                    result = partition.clone().format(context.io.clone(), crate::journals::generation()) => result?,
                 };
                 let journal_error = |source| StartupError::Journal { path: path.clone(), source };
                 // A new partition's first appends skip the slow writes into
@@ -118,10 +117,8 @@ fn keep_unreplicated(journals: &mut JournalPlan) -> Result<(), StartupError> {
 fn preflight(journals: &JournalPlan) -> Result<(), StartupError> {
     for partition in &journals.partitions {
         let path = &partition.placement.directory;
-        match fs::symlink_metadata(path) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(io_error(path, error)),
-            Ok(_) => return Err(io_error(path, io::ErrorKind::AlreadyExists.into())),
+        if crate::files::exists(path)? {
+            return Err(io_error(path, io::ErrorKind::AlreadyExists.into()));
         }
         let parent = crate::parent_directory(path)?;
         match fs::symlink_metadata(parent) {

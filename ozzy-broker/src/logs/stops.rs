@@ -3,14 +3,13 @@
 //! durable. The next start takes the evidence of a whole device at once and
 //! removes it before any log opens, so no later start finds it again.
 
-use super::registry::{list, open, remove_file, run, sync_directory};
-use crate::{StartupError, io_error};
-use ozzy_io::{FileKind, Local, OpenMode, Operation, Outcome, SyncMode, WriteBuffer};
+use super::registry::{list, read_whole, remove_file, sync_directory, write_atomic};
+use crate::StartupError;
+use ozzy_io::{FileKind, Local};
 use ozzy_proto::GroupId;
 use ozzy_replication::{Digest, OpNumber, Prefix, driver::CleanStop};
 use std::{
     collections::BTreeMap,
-    io,
     path::{Path, PathBuf},
 };
 
@@ -81,8 +80,7 @@ fn prefix(bytes: &[u8]) -> Option<Prefix> {
     })
 }
 
-/// Publish the clean stops of `shard` below `directory`: staged, synced,
-/// renamed, and the directory synced.
+/// Publish the clean stops of `shard` below `directory`, whole.
 pub(crate) async fn publish(
     io: &Local,
     directory: &Path,
@@ -93,64 +91,7 @@ pub(crate) async fn publish(
     crate::format::initialize_directory(io, &directory).await?;
     let path = directory.join(shard.to_string());
     let staged = directory.join(format!("{shard}.{STAGED}"));
-    remove_file(io, &staged).await?;
-    let create = Operation::Open {
-        path: staged.clone(),
-        mode: OpenMode::CreateNew,
-        direct: false,
-        data_sync: false,
-    };
-    let handle = open(io, &staged, create).await?;
-    let encoded = encode(stops);
-    let length = encoded.len();
-    let write = Operation::Write {
-        handle: handle.clone(),
-        offset: 0,
-        data: WriteBuffer::from_vec(encoded),
-    };
-    let written = match run(io, &staged, write).await {
-        Ok(completed) if matches!(*completed, Outcome::Written(bytes) if bytes == length) => {
-            let sync = Operation::Sync {
-                handle: handle.clone(),
-                mode: SyncMode::All,
-            };
-            run(io, &staged, sync).await.map(|_| ())
-        }
-        Ok(_) => Err(io_error(&staged, io::ErrorKind::WriteZero.into())),
-        Err(error) => Err(error),
-    };
-    run(io, &staged, Operation::Close { handle }).await?;
-    written?;
-    let rename = Operation::Rename {
-        source: staged,
-        destination: path.clone(),
-    };
-    run(io, &path, rename).await?;
-    sync_directory(io, &directory).await
-}
-
-/// Read one evidence file of at most `limit` bytes. A longer one is cut,
-/// and then holds nothing.
-async fn read(io: &Local, path: &Path, limit: usize) -> Result<Vec<u8>, StartupError> {
-    let operation = Operation::Open {
-        path: path.into(),
-        mode: OpenMode::Read,
-        direct: false,
-        data_sync: false,
-    };
-    let handle = open(io, path, operation).await?;
-    let read = Operation::Read {
-        handle: handle.clone(),
-        offset: 0,
-        length: limit + 1,
-    };
-    // Copy the bytes out and release the read before the close.
-    let bytes = run(io, path, read).await.and_then(|read| match &*read {
-        Outcome::Read(buffer) => Ok(buffer.as_slice().to_vec()),
-        _ => Err(io_error(path, io::ErrorKind::InvalidData.into())),
-    });
-    run(io, path, Operation::Close { handle }).await?;
-    bytes
+    write_atomic(io, &directory, staged, &path, encode(stops)).await
 }
 
 /// Take every clean stop recorded below `directory`, from at most
@@ -178,7 +119,8 @@ pub(crate) async fn take(
     let limit = MAGIC.len() + max_logs.saturating_mul(ENTRY_BYTES);
     for path in &files {
         if path.extension().is_none() {
-            decode(&read(io, path, limit).await?, &mut stops);
+            // A longer file comes back cut, and then holds nothing.
+            decode(&read_whole(io, path, limit).await?, &mut stops);
         }
     }
     for path in &files {

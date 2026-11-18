@@ -1,9 +1,9 @@
 //! What a broker needs to turn a log spec into a record and a journal.
 
 use super::stops::Stops;
-use super::{CreateError, LogSpec};
+use super::{CreateError, LogSpec, group};
 use crate::journals::limits::{Settings, Shape};
-use crate::{ActorSettings, CheckedConfig, JournalConfig, PartitionJournal, StartupError};
+use crate::{ActorSettings, CheckedConfig, JournalConfig, PartitionJournal, StartupError, failure};
 use ozzy_config::{BrokerIdentity, DeploymentMode, LogClass, LogRecord, LogState};
 use ozzy_journal_segment::GroupIdentity;
 use ozzy_proto::{GroupId, NodeId, PartitionIncarnation, StoreId, VolumeId};
@@ -11,11 +11,9 @@ use ozzy_replication::{ConfigurationRecord, ConfiguredVoter, Digest, local};
 use ozzy_runtime::frontend::{Placement, RuntimeRoute};
 use std::{
     collections::BTreeMap,
+    future::Future,
     path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex},
 };
 use tokio::sync::OnceCell;
 use uuid::Uuid;
@@ -28,31 +26,48 @@ pub(crate) struct LogSetup {
     volumes: BTreeMap<String, Uuid>,
     principals: BTreeMap<Uuid, Digest>,
     pub(crate) class: LogClass,
-    /// The lock of each device's log directory, taken by the first shard
-    /// that starts on the device and held while the broker runs.
-    locks: Arc<Mutex<BTreeMap<PathBuf, Arc<OnceCell<ozzy_io::Handle>>>>>,
-    /// The clean stops found on each device, taken off it by the first
-    /// shard that starts there.
-    stops: Arc<Mutex<BTreeMap<PathBuf, Taken>>>,
-    /// The records found on each device, read by the first shard that
-    /// starts there.
-    records: Arc<Mutex<BTreeMap<PathBuf, Found>>>,
-    /// Whether this broker replaces one that lost its stores.
-    replacing: Arc<AtomicBool>,
+    /// The lock of each device's log directory, held while the broker runs.
+    locks: PerDevice<ozzy_io::Handle>,
+    /// The clean stops found on each device, taken off it.
+    stops: PerDevice<Arc<Stops>>,
+    /// The records found on each device.
+    records: PerDevice<Arc<[LogRecord]>>,
 }
 
-/// The clean stops of one device, once a shard took them.
-type Taken = Arc<OnceCell<Arc<Stops>>>;
+/// One value per device log directory, made by the first shard that
+/// starts on the device and shared with the others.
+#[derive(Debug)]
+struct PerDevice<T>(Arc<Mutex<BTreeMap<PathBuf, Arc<OnceCell<T>>>>>);
 
-/// The log records of one device, once a shard read them.
-type Found = Arc<OnceCell<Arc<[LogRecord]>>>;
+impl<T> Default for PerDevice<T> {
+    fn default() -> Self {
+        Self(Arc::default())
+    }
+}
+
+impl<T> Clone for PerDevice<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<T: Clone> PerDevice<T> {
+    /// The value of `directory`, from `make` for the first caller.
+    async fn get<F>(&self, directory: &Path, make: impl FnOnce() -> F) -> Result<T, StartupError>
+    where
+        F: Future<Output = Result<T, StartupError>>,
+    {
+        // The map is released before the wait for the value.
+        let cell = {
+            let mut cells = ozzy_io::lock_unpoisoned(&self.0);
+            cells.entry(directory.to_path_buf()).or_default().clone()
+        };
+        cell.get_or_try_init(make).await.cloned()
+    }
+}
 
 /// The file whose lock keeps other processes off a device's log stores.
 const VOLUME_LOCK: &str = "volume.lock";
-
-fn failure(reason: impl std::fmt::Display) -> StartupError {
-    StartupError::Runtime(reason.to_string())
-}
 
 impl LogSetup {
     /// `None` when the deployment configures no log class.
@@ -67,24 +82,10 @@ impl LogSetup {
             broker: local.broker,
             volumes: local.volumes.clone(),
             principals: principals.clone(),
-            locks: Arc::default(),
-            stops: Arc::default(),
-            records: Arc::default(),
-            replacing: Arc::default(),
+            locks: PerDevice::default(),
+            stops: PerDevice::default(),
+            records: PerDevice::default(),
         })
-    }
-
-    /// Whether this broker replaces one that lost its stores. It then
-    /// makes every replicated log as a nonvoting copy.
-    pub(crate) fn replacing(&self) -> bool {
-        // A create that misses the end of the replacement only makes one
-        // more nonvoting copy.
-        self.replacing.load(Ordering::Relaxed)
-    }
-
-    /// The switch behind [`Self::replacing`], shared with the broker.
-    pub(crate) fn replacement(&self) -> Arc<AtomicBool> {
-        self.replacing.clone()
     }
 
     /// The lane of `io` for the log stores below `directory`, which one
@@ -96,14 +97,8 @@ impl LogSetup {
         io: &ozzy_io::Local,
         directory: &Path,
     ) -> Result<ozzy_io::Local, StartupError> {
-        let cell = {
-            let mut locks = ozzy_io::lock_unpoisoned(&self.locks);
-            locks.entry(directory.to_path_buf()).or_default().clone()
-        };
-        let lock = cell
-            .get_or_try_init(|| super::registry::lock(io, directory.join(VOLUME_LOCK)))
-            .await?;
-        Ok(io.guarded_by(lock.clone()))
+        let lock = || super::registry::lock(io, directory.join(VOLUME_LOCK));
+        Ok(io.guarded_by(self.locks.get(directory, lock).await?))
     }
 
     /// The clean stops the last run left below `directory`, taken off the
@@ -113,18 +108,12 @@ impl LogSetup {
         io: &ozzy_io::Local,
         directory: &Path,
     ) -> Result<Arc<Stops>, StartupError> {
-        let cell = {
-            let mut stops = ozzy_io::lock_unpoisoned(&self.stops);
-            stops.entry(directory.to_path_buf()).or_default().clone()
+        let take = || async {
+            super::stops::take(io, directory, self.class.max_logs)
+                .await
+                .map(Arc::new)
         };
-        let taken = cell
-            .get_or_try_init(|| async {
-                super::stops::take(io, directory, self.class.max_logs)
-                    .await
-                    .map(Arc::new)
-            })
-            .await?;
-        Ok(taken.clone())
+        self.stops.get(directory, take).await
     }
 
     /// The log records the last run left below `directory`, read once for
@@ -136,14 +125,8 @@ impl LogSetup {
         io: &ozzy_io::Local,
         directory: &Path,
     ) -> Result<Arc<[LogRecord]>, StartupError> {
-        let cell = {
-            let mut records = ozzy_io::lock_unpoisoned(&self.records);
-            records.entry(directory.to_path_buf()).or_default().clone()
-        };
-        let found = cell
-            .get_or_try_init(|| async { super::registry::load(io, directory).await.map(Arc::from) })
-            .await?;
-        Ok(found.clone())
+        let load = || async { super::registry::load(io, directory).await.map(Arc::from) };
+        self.records.get(directory, load).await
     }
 
     /// The shard of this broker that owns log `id`.
@@ -169,7 +152,7 @@ impl LogSetup {
             .local_broker()?
             .device(device)?
             .root
-            .join("logs"))
+            .join(ozzy_config::LOG_DIRECTORY))
     }
 
     /// The `creating` record of `spec` with a fresh store, once the spec
@@ -231,8 +214,7 @@ impl LogSetup {
     /// Whether `record` is one of this broker's, on the volume its
     /// placement names, within the bounds the transport was sized for.
     pub(crate) fn check(&self, record: &LogRecord) -> Result<(), StartupError> {
-        let id = GroupId::from_bytes(*record.log.as_bytes());
-        let placement = self.placement(&self.checked.plan.name, id)?;
+        let placement = self.placement(&self.checked.plan.name, group(record))?;
         if record.cluster != self.checked.identity.cluster
             || record.broker != self.broker
             || self.volumes.get(&placement.device) != Some(&record.volume)
@@ -252,7 +234,7 @@ impl LogSetup {
     pub(crate) fn journal(&self, record: &LogRecord) -> Result<PartitionJournal, StartupError> {
         self.check(record)?;
         let checked = &self.checked;
-        let group = GroupId::from_bytes(*record.log.as_bytes());
+        let group = group(record);
         let placement = self.placement(&checked.plan.name, group)?;
         let shape = Shape {
             max_append_bytes: record.max_append_bytes,
@@ -302,7 +284,7 @@ impl LogSetup {
         if record.members.len() != 3 {
             return Ok(None);
         }
-        let group = GroupId::from_bytes(*record.log.as_bytes());
+        let group = group(record);
         let mut remote = Vec::with_capacity(2);
         for (name, id) in &self.checked.identity.brokers {
             if *id != self.broker && record.members.contains(id) {

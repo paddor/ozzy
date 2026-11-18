@@ -31,7 +31,7 @@ mod validate;
 
 pub use broker_identity::{BrokerIdentity, PartitionStore, VolumeIdentity};
 pub use identity::{DeploymentIdentity, PartitionIdentity, TopicIdentity};
-pub use log_record::{LogRecord, LogState};
+pub use log_record::{LOG_DIRECTORY, LogRecord, LogState, log_label};
 pub use peer_record::PeerRecord;
 pub use placement::{BrokerPlan, ControllerPlan, HostResources, PartitionPlacement, ShardPlan};
 pub use schema::{
@@ -59,6 +59,14 @@ pub enum ConfigError {
     /// Identity serialization failed.
     #[error("cannot encode deployment identity: {0}")]
     Encode(#[from] toml::ser::Error),
+}
+
+/// A version 8 UUID of the first 16 bytes `hasher` yields. The version
+/// bits make it nonzero.
+pub(crate) fn hashed_id(hasher: &blake3::Hasher) -> uuid::Uuid {
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    uuid::Builder::from_custom_bytes(bytes).into_uuid()
 }
 
 pub(crate) fn invalid(path: impl Into<String>, reason: impl Into<String>) -> ConfigError {

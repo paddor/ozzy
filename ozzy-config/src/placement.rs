@@ -201,7 +201,7 @@ impl ValidatedDeployment {
         let shard = shards
             .get(index as usize)
             .ok_or_else(|| invalid(name, "broker has no shards"))?;
-        let label = id.simple().to_string();
+        let label = crate::log_label(id);
         Ok(PartitionPlacement {
             topic: format!("l-{label}"),
             partition: 0,
@@ -211,7 +211,11 @@ impl ValidatedDeployment {
             producer_idle_secs: crate::schema::default_producer_idle(),
             shard: shard.id,
             device: shard.device.clone(),
-            directory: broker.device(&shard.device)?.root.join("logs").join(label),
+            directory: broker
+                .device(&shard.device)?
+                .root
+                .join(crate::LOG_DIRECTORY)
+                .join(label),
         })
     }
 

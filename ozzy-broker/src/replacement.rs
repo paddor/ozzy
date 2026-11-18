@@ -8,7 +8,6 @@
 //! keeps this up across restarts until the embedder ends it.
 
 use std::{
-    fs, io,
     path::PathBuf,
     sync::{
         Arc,
@@ -17,12 +16,14 @@ use std::{
 };
 
 use crate::{
-    CheckedConfig, JournalConfig, JournalPlan, RecoveryIntent, StartupError, io_error, provisioning,
+    CheckedConfig, JournalConfig, JournalPlan, RecoveryIntent, StartupError, failure, files,
+    io_error,
 };
 
 const MARKER: &str = "OZZY_REPLACING";
 
 /// Whether this broker replaces a lost one, and the marker that says so.
+/// Clones share one flag: the broker handle ends what its shards read.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Replacement {
     on: Arc<AtomicBool>,
@@ -30,19 +31,7 @@ pub(crate) struct Replacement {
 }
 
 fn marker(checked: &CheckedConfig) -> Result<Option<PathBuf>, StartupError> {
-    let devices = &checked.local_broker()?.devices;
-    Ok(devices
-        .values()
-        .next()
-        .map(|device| device.root.join(MARKER)))
-}
-
-fn exists(path: &std::path::Path) -> Result<bool, StartupError> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => Ok(true),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(io_error(path, error)),
-    }
+    Ok(checked.first_device_root()?.map(|root| root.join(MARKER)))
 }
 
 impl Replacement {
@@ -59,7 +48,7 @@ impl Replacement {
     pub(crate) fn load(checked: &CheckedConfig) -> Result<Self, StartupError> {
         let marker = marker(checked)?;
         let on = match &marker {
-            Some(marker) => exists(marker)?,
+            Some(marker) => files::exists(marker)?,
             None => false,
         };
         Ok(Self {
@@ -71,43 +60,28 @@ impl Replacement {
     /// Put the marker on the first device, durably. Its root exists.
     pub(crate) fn begin(checked: &CheckedConfig) -> Result<(), StartupError> {
         let Some(marker) = marker(checked)? else {
-            return Err(StartupError::Runtime("a replacement needs a device".into()));
+            return Err(failure("a replacement needs a device"));
         };
-        if exists(&marker)? {
+        if files::exists(&marker)? {
             return Ok(());
         }
-        provisioning::publish_identity(&marker, "replacing\n")
-    }
-
-    /// Tell the runtime logs of `journals` what this says.
-    #[must_use]
-    pub(crate) fn armed(self, journals: &JournalPlan) -> Self {
-        if let (true, Some(logs)) = (self.on(), &journals.logs) {
-            logs.replacement().store(true, Ordering::Relaxed);
-        }
-        self
+        files::publish(&marker, "replacing\n", false)
     }
 
     pub(crate) fn on(&self) -> bool {
-        // Read at start and by creations, which may miss the end by one
-        // more nonvoting copy.
+        // Relaxed: the flag orders nothing else. A creation that misses
+        // the end only makes one more nonvoting copy.
         self.on.load(Ordering::Relaxed)
     }
 
     /// Remove the marker, durably, then stop making nonvoting copies.
     pub(crate) fn end(&self) -> Result<(), StartupError> {
         if let Some(marker) = &self.marker {
-            match fs::remove_file(marker) {
-                Err(error) if error.kind() != io::ErrorKind::NotFound => {
-                    return Err(io_error(marker, error));
-                }
-                _ => {}
-            }
-            let parent = crate::parent_directory(marker)?;
-            fs::File::open(parent)
-                .and_then(|directory| directory.sync_all())
-                .map_err(|error| io_error(parent, error))?;
+            files::remove_if_present(marker)?;
+            files::sync_directory(crate::parent_directory(marker)?)?;
         }
+        // Relaxed, as the load: only the marker must be gone first, and
+        // this thread removed it.
         self.on.store(false, Ordering::Relaxed);
         Ok(())
     }
@@ -126,7 +100,7 @@ impl JournalPlan {
             if self.recovery.contains_key(&group) {
                 continue;
             }
-            let intent = if !exists(&config.root)? {
+            let intent = if !files::exists(&config.root)? {
                 RecoveryIntent::Replace
             } else if ozzy_journal_segment::recovery_unfinished(&config.root)
                 .map_err(|error| io_error(&config.root, error))?

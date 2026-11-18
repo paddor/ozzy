@@ -94,8 +94,10 @@ async fn cli_replacement_and_quarantine_start_nonvoting_without_donors() {
         processes.ready(0).await;
         let replacement_marker = fs::read(replaced.join("CONFIGURATION")).unwrap();
         let quarantine_marker = fs::read(quarantined.join("CONFIGURATION")).unwrap();
-        assert!(replacement_marker.starts_with(b"OZYRECOV"));
-        assert!(quarantine_marker.starts_with(b"OZYRECOV"));
+        assert!(ozzy_journal_segment::is_recovery_marker(
+            &replacement_marker
+        ));
+        assert!(ozzy_journal_segment::is_recovery_marker(&quarantine_marker));
         assert_ne!(quarantine_marker, configuration);
         for (path, bytes) in segments {
             assert_eq!(
@@ -154,7 +156,7 @@ async fn interrupted() {
         );
     }
     let marker = fs::read(replaced.join("CONFIGURATION")).unwrap();
-    assert!(marker.starts_with(b"OZYRECOV"));
+    assert!(ozzy_journal_segment::is_recovery_marker(&marker));
     processes.stop(0, "KILL").await;
     refused(cluster.serve(0));
     let selections = after_crash(&cluster);
@@ -165,11 +167,9 @@ async fn interrupted() {
     processes.restart_recovering(&cluster, 0, 2, &selections);
     processes.ready(0).await;
     assert_eq!(fs::read(replaced.join("CONFIGURATION")).unwrap(), marker);
-    assert!(
-        fs::read(quarantined.join("CONFIGURATION"))
-            .unwrap()
-            .starts_with(b"OZYRECOV")
-    );
+    assert!(ozzy_journal_segment::is_recovery_marker(
+        &fs::read(quarantined.join("CONFIGURATION")).unwrap()
+    ));
     processes.restart(&cluster, 1, 1);
     processes.restart(&cluster, 2, 1);
     receive_and_interrupt(&mut processes, &replaced, &marker, &probe).await;
@@ -249,7 +249,7 @@ async fn receive_and_interrupt(
 fn after_crash(cluster: &Cluster) -> Vec<&'static str> {
     // Disk-quorum neighbors restart intact.
     let configuration = fs::read(cluster.partition(0, 1).join("CONFIGURATION")).unwrap();
-    let flag = if configuration.starts_with(b"OZYRECOV") {
+    let flag = if ozzy_journal_segment::is_recovery_marker(&configuration) {
         "--resume-full"
     } else {
         "--quarantine"

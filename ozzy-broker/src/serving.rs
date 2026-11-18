@@ -16,7 +16,7 @@ use crate::admin::Admin;
 use crate::shards::lifecycle::startup_groups;
 use crate::{
     ApplicationShards, CheckedConfig, DevicePools, Frontend, JournalPlan, RecoverySelection,
-    StartupError,
+    StartupError, failure,
 };
 pub(crate) use config::native_arenas;
 use drain::DeviceDrain;
@@ -178,7 +178,7 @@ impl Broker {
         context: ServingContext,
         storage: ShardStorage<B, impl StorageOwner>,
     ) -> Result<Self, StartupError> {
-        let replacement = context.replacement.clone().armed(&journals);
+        let replacement = context.replacement.clone();
         let (config, admin) = bound_config(&checked, context)?;
         let checked = Arc::new(checked);
         let logs = config.log_handles(journals.logs.clone());
@@ -280,13 +280,7 @@ impl Broker {
     /// Fails when the marker of the replacement cannot be removed. The
     /// replacement then goes on.
     pub fn end_replacement(&self) -> Result<(), StartupError> {
-        self.replacement.end()?;
-        if let Some(setup) = &self.logs.setup {
-            setup
-                .replacement()
-                .store(false, std::sync::atomic::Ordering::Relaxed);
-        }
-        Ok(())
+        self.replacement.end()
     }
 
     /// What the clock guard last concluded about this broker's clock.
@@ -411,10 +405,6 @@ async fn start_frontend(
     Frontend::start_registered(plan, Some(config.omq.clone()), factory, startup)
         .await
         .map(|frontend| (frontend, Registered { serving, logs }))
-}
-
-fn failure(error: impl std::fmt::Display) -> StartupError {
-    StartupError::Runtime(error.to_string())
 }
 
 #[cfg(test)]
