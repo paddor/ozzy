@@ -2172,7 +2172,7 @@ checksum = "7e036b411754132fd6b74e94b74e9a13c5cf606fa93d1885c35860d3060820b1"
 
 [[package]]
 name = "ozzy"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "omq-tokio",
  "ozzy-proto",
@@ -2182,7 +2182,7 @@ dependencies = [
 
 [[package]]
 name = "ozzy-bench"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "bytes",
  "clap",
@@ -2218,14 +2218,14 @@ dependencies = [
 
 [[package]]
 name = "ozzy-bindings"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "ozzy",
 ]
 
 [[package]]
 name = "ozzy-broker"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -2254,7 +2254,7 @@ dependencies = [
 
 [[package]]
 name = "ozzy-config"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "blake3",
  "ozzy-proto",
@@ -2267,7 +2267,7 @@ dependencies = [
 
 [[package]]
 name = "ozzy-core"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "ahash",
  "bytes",
@@ -2280,7 +2280,7 @@ dependencies = [
 
 [[package]]
 name = "ozzy-io"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "bytes",
  "fanring",
@@ -2293,7 +2293,7 @@ dependencies = [
 
 [[package]]
 name = "ozzy-io-aio"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "libc",
  "ozzy-io",
@@ -2305,7 +2305,7 @@ dependencies = [
 
 [[package]]
 name = "ozzy-io-pool"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "bytes",
  "fanring",
@@ -2321,7 +2321,7 @@ dependencies = [
 
 [[package]]
 name = "ozzy-java"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "bytes",
  "futures",
@@ -2337,7 +2337,7 @@ dependencies = [
 
 [[package]]
 name = "ozzy-journal"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "blake3",
  "bytes",
@@ -2351,7 +2351,7 @@ dependencies = [
 
 [[package]]
 name = "ozzy-journal-segment"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "ahash",
  "bytes",
@@ -2373,7 +2373,7 @@ dependencies = [
 
 [[package]]
 name = "ozzy-proto"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "bytes",
  "lz4rip",
@@ -2384,7 +2384,7 @@ dependencies = [
 
 [[package]]
 name = "ozzy-python"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "bytes",
  "clap",
@@ -2402,7 +2402,7 @@ dependencies = [
 
 [[package]]
 name = "ozzy-replication"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "bytes",
  "ozzy-core",
@@ -2414,7 +2414,7 @@ dependencies = [
 
 [[package]]
 name = "ozzy-runtime"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -2444,7 +2444,7 @@ dependencies = [
 
 [[package]]
 name = "ozzy-sim"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "bytes",
  "clap",
@@ -2469,7 +2469,7 @@ dependencies = [
 
 [[package]]
 name = "ozzy-telemetry"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "omq-tokio",
  "serde_json",
@@ -2478,11 +2478,11 @@ dependencies = [
 
 [[package]]
 name = "ozzy-test-alloc"
-version = "0.11.1"
+version = "0.12.0"
 
 [[package]]
 name = "ozzy-ui"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "bytes",
  "clap",
