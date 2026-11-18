@@ -113,7 +113,7 @@ pub struct NormalReplica {
 impl NormalReplica {
     /// Give the unused part of the reserved operation ring back. It grows
     /// again as operations are prepared.
-    pub fn trim(&mut self) {
+    pub fn shrink(&mut self) {
         self.operations.shrink_to_fit();
     }
 

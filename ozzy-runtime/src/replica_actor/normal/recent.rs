@@ -30,7 +30,7 @@ pub(super) struct Recent {
 }
 
 impl Recent {
-    pub(super) fn trim(&mut self) {
+    pub(super) fn shrink(&mut self) {
         self.entries.shrink_to_fit();
     }
 

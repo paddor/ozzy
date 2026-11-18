@@ -147,9 +147,9 @@ pub struct ReplicaDriver {
 impl ReplicaDriver {
     /// Give a normal replica's unused reserved capacity back. It grows again
     /// with use. For a replica that expects to stay idle.
-    pub fn trim(&mut self) {
+    pub fn shrink(&mut self) {
         if let Role::Normal(replica) = &mut self.role {
-            replica.trim();
+            replica.shrink();
         }
     }
 

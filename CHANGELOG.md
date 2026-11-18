@@ -173,10 +173,11 @@
   With these, the CPU time of idle replicated logs no longer grows with
   their count.
 - A runtime log reserves its pipeline at first use, not at start. The
-  broker trims each log actor it installs (`ReplicaActor::trim`,
-  `ScheduledReplica::trim`, `PartitionActor::trim`, `ProposalBuffer::trim`,
-  `AppendBuffer::trim`, and `trim` on the `ozzy_replication` driver, normal
-  replica, flow transmitter and receiver): queues, ledgers and arena
+  broker shrinks each log actor it installs (`ReplicaActor::shrink`,
+  `ScheduledReplica::shrink`, `PartitionActor::shrink`,
+  `ProposalBuffer::shrink`, `AppendBuffer::shrink`, and `shrink` on the
+  `ozzy_replication` driver, normal replica, flow transmitter and
+  receiver): queues, ledgers and arena
   descriptors sized for a full pipeline are given back and grow again
   with use, so the first writes to a log allocate. Topics still reserve
   at start. A log reserves its read descriptors at its first read.

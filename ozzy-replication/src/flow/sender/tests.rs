@@ -98,7 +98,7 @@ fn reopening_after_lost_data_reuses_the_send_ledger() {
 }
 
 #[test]
-fn trimmed_ledgers_hold_nothing_and_fill_their_window_again() {
+fn shrunk_ledgers_hold_nothing_and_fill_their_window_again() {
     let limits = PipelineLimits {
         max_operations: 4,
         max_body_bytes: 100,
@@ -114,8 +114,8 @@ fn trimmed_ledgers_hold_nothing_and_fill_their_window_again() {
     };
     let mut receiver = Receiver::new(channel, Prefix::GENESIS, limits).unwrap();
     let mut sender = Sender::open(receiver.report(), limits, Prefix::GENESIS).unwrap();
-    receiver.trim();
-    sender.trim();
+    receiver.shrink();
+    sender.shrink();
     assert_eq!(sender.pending.capacity(), 0);
     let mut previous = sender.sent();
     let operations: [_; 4] = std::array::from_fn(|_| {

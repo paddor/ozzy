@@ -69,11 +69,11 @@ pub(in crate::replica_actor) fn remote_transmitters(
 }
 
 impl Flow {
-    pub(super) fn trim(&mut self) {
+    pub(super) fn shrink(&mut self) {
         self.history.shrink_to_fit();
         self.scratch.shrink_to_fit();
         for peer in self.peers.iter_mut().flatten() {
-            peer.trim();
+            peer.shrink();
         }
     }
 

@@ -89,10 +89,10 @@ pub struct Transmitter {
 impl Transmitter {
     /// Give the unused part of the reserved window back. It grows again as
     /// operations are sent. For a replica that expects to stay idle.
-    pub fn trim(&mut self) {
+    pub fn shrink(&mut self) {
         self.spare.shrink_to_fit();
         if let Some(sender) = &mut self.sender {
-            sender.trim();
+            sender.shrink();
         }
     }
 

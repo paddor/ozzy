@@ -121,8 +121,8 @@ impl State {
         let mut started = serving_actor(opened, &self.memory, &self.config)?;
         prepare_serving(&mut started, &self.memory)?;
         // Most logs idle: each keeps only what it uses.
-        started.actor.trim();
-        started.buffer.trim();
+        started.actor.shrink();
+        started.buffer.shrink();
         let lane = LogLane::new(&mut started.actor, fitting.port.limits()).map_err(failure)?;
         let bootstrap = Bootstrap::new(fitting.id, started.proposal, started.buffer);
         let parts = (started.actor, Some(lane), Some(bootstrap));

@@ -34,9 +34,9 @@ pub(in crate::replica_actor) struct Receive {
 }
 
 impl Receive {
-    pub(super) fn trim(&mut self) {
-        self.queued.trim();
-        self.ledger.trim();
+    pub(super) fn shrink(&mut self) {
+        self.queued.shrink();
+        self.ledger.shrink();
         self.operations.shrink_to_fit();
     }
 

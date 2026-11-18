@@ -270,7 +270,7 @@ pub(super) struct Ingress {
 }
 
 impl Ingress {
-    pub(super) fn trim(&mut self) {
+    pub(super) fn shrink(&mut self) {
         self.queue.submissions.borrow_mut().shrink_to_fit();
     }
 

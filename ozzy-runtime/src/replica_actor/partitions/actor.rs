@@ -87,10 +87,10 @@ impl PartitionActor {
     }
 
     /// Give a replicated actor's reserved but unused capacity back. See
-    /// [`ReplicaActor::trim`](crate::replica_actor::ReplicaActor::trim).
-    pub fn trim(&mut self) {
+    /// [`ReplicaActor::shrink`](crate::replica_actor::ReplicaActor::shrink).
+    pub fn shrink(&mut self) {
         if let Self::Replicated(actor) = self {
-            actor.trim();
+            actor.shrink();
         }
     }
 
