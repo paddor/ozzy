@@ -44,7 +44,7 @@ async fn scenario() {
     processes.restart_recovering(&cluster, 0, 1, &["--replace", "orders/0"]);
     processes.ready(0).await;
     let marker = fs::read(replaced.join("CONFIGURATION")).unwrap();
-    assert!(marker.starts_with(b"OZYRECOV"));
+    assert!(ozzy_journal_segment::is_recovery_marker(&marker));
     processes.restart(&cluster, 1, 1);
     processes.ready(1).await;
     let first = processes

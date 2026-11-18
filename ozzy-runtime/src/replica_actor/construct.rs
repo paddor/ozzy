@@ -16,13 +16,13 @@ impl ReplicaActor {
     /// descriptors sized for a full pipeline. All of it grows again with
     /// use, so the first writes allocate. For a replica that expects to
     /// stay idle, where many of them share a process.
-    pub fn trim(&mut self) {
-        self.driver.trim();
-        self.work.trim();
-        self.ingress.trim();
+    pub fn shrink(&mut self) {
+        self.driver.shrink();
+        self.work.shrink();
+        self.ingress.shrink();
         self.pending_persistence.shrink_to_fit();
         for buffer in [&mut self.buffer, &mut self.spare].into_iter().flatten() {
-            buffer.trim();
+            buffer.shrink();
         }
     }
 

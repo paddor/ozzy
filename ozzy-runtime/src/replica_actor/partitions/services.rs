@@ -19,16 +19,16 @@ impl PartitionActors {
     ) -> Result<Option<&mut PartitionActor>, PartitionError> {
         let slot = *self.index.get(&group).ok_or(PartitionError::Unknown)?;
         if self.stopped
-            || self.native[slot].is_some()
-            || self.coordinators[slot].is_some()
-            || self.readers[slot].is_some()
+            || self.slots[slot].native.is_some()
+            || self.slots[slot].coordinator.is_some()
+            || self.slots[slot].readers.is_some()
         {
             return Err(PartitionError::NativeConfiguration);
         }
-        if matches!(self.actors[slot], PartitionActor::Recovering(_)) {
+        if matches!(self.slots[slot].actor, PartitionActor::Recovering(_)) {
             return Ok(None);
         }
-        Ok(Some(&mut self.actors[slot]))
+        Ok(Some(&mut self.slots[slot].actor))
     }
 
     /// Attach the consumer-group coordinator of this partition. It uses the
@@ -41,12 +41,12 @@ impl PartitionActors {
         let (group, local) = coordinator.identity();
         let slot = *self.index.get(&group).ok_or(PartitionError::Unknown)?;
         if self.stopped
-            || self.coordinators[slot].is_some()
-            || self.actors[slot].native_identity().1 != local
+            || self.slots[slot].coordinator.is_some()
+            || self.slots[slot].actor.native_identity().1 != local
         {
             return Err(PartitionError::NativeConfiguration);
         }
-        self.coordinators[slot] = Some(NativeCoordinator { coordinator, links });
+        self.slots[slot].coordinator = Some(NativeCoordinator { coordinator, links });
         self.touch(slot);
         Ok(())
     }
@@ -62,12 +62,12 @@ impl PartitionActors {
         let identity = intake.identity();
         let slot = *self.index.get(&identity.0).ok_or(PartitionError::Unknown)?;
         if self.stopped
-            || self.native[slot].is_some()
-            || self.actors[slot].native_identity() != identity
+            || self.slots[slot].native.is_some()
+            || self.slots[slot].actor.native_identity() != identity
         {
             return Err(PartitionError::NativeConfiguration);
         }
-        self.native[slot] = Some(NativeService { intake, links });
+        self.slots[slot].native = Some(NativeService { intake, links });
         self.touch(slot);
         Ok(())
     }
@@ -83,12 +83,12 @@ impl PartitionActors {
         grants: Option<crate::frontend::ShardGrants>,
     ) -> Result<(), PartitionError> {
         let slot = *self.index.get(&group).ok_or(PartitionError::Unknown)?;
-        if self.stopped || self.readers[slot].is_some() {
+        if self.stopped || self.slots[slot].readers.is_some() {
             return Err(PartitionError::NativeConfiguration);
         }
-        let readers = SharedReaders::new(&mut self.actors[slot], config, links, grants)
+        let readers = SharedReaders::new(&mut self.slots[slot].actor, config, links, grants)
             .map_err(|source| PartitionError::Actor { group, source })?;
-        self.readers[slot] = Some(readers);
+        self.slots[slot].readers = Some(readers);
         self.touch(slot);
         Ok(())
     }
@@ -102,10 +102,10 @@ impl PartitionActors {
         lane: Option<crate::replica_actor::LogLane>,
     ) -> Result<(), PartitionError> {
         let slot = *self.index.get(&group).ok_or(PartitionError::Unknown)?;
-        if self.stopped || self.logs[slot].is_some() {
+        if self.stopped || self.slots[slot].log.is_some() {
             return Err(PartitionError::NativeConfiguration);
         }
-        self.logs[slot] = Some(crate::replica_actor::log_service::LogService::new(
+        self.slots[slot].log = Some(crate::replica_actor::log_service::LogService::new(
             port, lane,
         ));
         self.touch(slot);
@@ -119,7 +119,8 @@ impl PartitionActors {
         lane: crate::replica_actor::LogLane,
     ) -> Result<(), PartitionError> {
         let slot = *self.index.get(&group).ok_or(PartitionError::Unknown)?;
-        let log = self.logs[slot]
+        let log = self.slots[slot]
+            .log
             .as_mut()
             .filter(|_| !self.stopped)
             .ok_or(PartitionError::NativeConfiguration)?;
@@ -133,10 +134,11 @@ impl PartitionActors {
     /// buffer release. Unknown groups or missing native adapters fail closed.
     pub fn native_has_work(&self, group: GroupId) -> Result<bool, PartitionError> {
         let slot = *self.index.get(&group).ok_or(PartitionError::Unknown)?;
-        if matches!(self.actors[slot], PartitionActor::Recovering(_)) {
+        if matches!(self.slots[slot].actor, PartitionActor::Recovering(_)) {
             return Ok(false);
         }
-        self.native[slot]
+        self.slots[slot]
+            .native
             .as_ref()
             .map(|native| native.intake.has_work())
             .ok_or(PartitionError::NativeConfiguration)
@@ -151,18 +153,21 @@ impl PartitionActors {
         node: NodeId,
     ) -> Result<usize, PartitionError> {
         let slot = *self.index.get(&group).ok_or(PartitionError::Unknown)?;
-        if matches!(self.actors[slot], PartitionActor::Recovering(_)) {
+        if matches!(self.slots[slot].actor, PartitionActor::Recovering(_)) {
             return Ok(0);
         }
-        let native = self.native[slot]
+        let native = self.slots[slot]
+            .native
             .as_ref()
             .ok_or(PartitionError::NativeConfiguration)?
             .intake
             .client_work(node);
-        let readers = self.readers[slot]
+        let readers = self.slots[slot]
+            .readers
             .as_ref()
             .map_or(0, |readers| readers.client_work(node));
-        let coordinator = self.coordinators[slot]
+        let coordinator = self.slots[slot]
+            .coordinator
             .as_ref()
             .map_or(0, |service| service.coordinator.client_work(node));
         Ok(native + readers + coordinator)
@@ -178,10 +183,11 @@ impl PartitionActors {
         producer: ozzy_proto::ProducerId,
     ) -> Result<usize, PartitionError> {
         let slot = *self.index.get(&group).ok_or(PartitionError::Unknown)?;
-        if matches!(self.actors[slot], PartitionActor::Recovering(_)) {
+        if matches!(self.slots[slot].actor, PartitionActor::Recovering(_)) {
             return Ok(0);
         }
-        self.native[slot]
+        self.slots[slot]
+            .native
             .as_ref()
             .map(|native| native.intake.writer_work(node, producer))
             .ok_or(PartitionError::NativeConfiguration)
@@ -219,11 +225,14 @@ impl PartitionActors {
     ) -> Result<NativeReceive, PartitionError> {
         self.observe(now)?;
         let slot = *self.index.get(&group).ok_or(PartitionError::Unknown)?;
-        if matches!(self.actors[slot], PartitionActor::Recovering(_)) {
+        if matches!(self.slots[slot].actor, PartitionActor::Recovering(_)) {
             return Ok(NativeReceive::Ignored);
         }
         self.touch(slot);
-        let native = self.native[slot]
+        let count = self.slots.len();
+        let held = &mut self.slots[slot];
+        let native = held
+            .native
             .as_mut()
             .ok_or(PartitionError::NativeConfiguration)?;
         let Some(peer) = message
@@ -238,10 +247,10 @@ impl PartitionActors {
         };
         // Admission does not carry a wakeup itself. Poll every actor again even
         // when the new request targets an earlier point in the current scan.
-        self.remaining = self.actors.len();
-        let hint = self.actors[slot].authority_hint();
+        self.remaining = count;
+        let hint = held.actor.authority_hint();
         if GroupCoordinator::supports(message)
-            && let Some(service) = &mut self.coordinators[slot]
+            && let Some(service) = &mut held.coordinator
         {
             if deferred {
                 return Ok(NativeReceive::Busy);
@@ -251,21 +260,22 @@ impl PartitionActors {
             };
             return service
                 .coordinator
-                .receive(message, link, &mut self.actors[slot], now)
+                .receive(message, link, &mut held.actor, now)
                 .map_err(|source| PartitionError::Native { group, source });
         }
         if SharedReaders::supports(message)
-            && let Some(readers) = &mut self.readers[slot]
+            && let Some(readers) = &mut held.readers
         {
             let ready = !deferred
-                && self.actors[slot]
+                && held
+                    .actor
                     .read_access()
                     .is_some_and(|access| access.0.is_some());
             return readers
                 .receive(message, hint, ready)
                 .map_err(|source| PartitionError::Actor { group, source });
         }
-        if !deferred && publishing(self.readers[slot].as_ref(), &mut self.actors[slot]) {
+        if !deferred && publishing(held.readers.as_ref(), &mut held.actor) {
             return Ok(NativeReceive::Busy);
         }
         let received = if deferred {

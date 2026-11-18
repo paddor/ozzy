@@ -1,7 +1,6 @@
 //! First-start provisioning from a deployment built in code.
 
 use super::*;
-use ozzy_broker::log::LogRole;
 use ozzy_broker::{StartupError, provision};
 use ozzy_config::{
     Broker as BrokerConfig, Cluster, Device, Endpoints, ResourceLimits, Topic, ValidatedDeployment,
@@ -93,18 +92,14 @@ pub(super) async fn provisioned(
 }
 
 async fn led(brokers: &[Broker]) {
-    let leads = |broker: &Broker| {
-        broker
-            .log(TOPIC, 0)
-            .is_some_and(|log| log.status().borrow().role == LogRole::Leader)
-    };
-    tokio::time::timeout(Duration::from_secs(30), async {
-        while !brokers.iter().any(leads) {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("the topic gets a leader");
+    let led = || brokers.iter().any(|broker| leads(broker.log(TOPIC, 0)));
+    eventually("the topic gets a leader", led).await;
+}
+
+/// What broker `index` below `root` recorded of the stores of its peers.
+pub(super) fn peer_record(root: &Path, index: usize) -> ozzy_config::PeerRecord {
+    let path = root.join(format!("broker-{index}/data/OZZY_PEERS"));
+    ozzy_config::PeerRecord::decode(&std::fs::read_to_string(path).unwrap()).unwrap()
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -120,12 +115,7 @@ async fn three_brokers_provision_themselves_and_agree_without_a_shared_file() {
             let (checked, local) = provisioned(&deployment, root.path(), index).await.unwrap();
             assert_eq!(checked.identity, deployment.derive_identity().unwrap());
             locals.push(local.clone());
-            let context = runtime.context().clone();
-            brokers.push(
-                Broker::start_trusted_with_context(checked, local, context)
-                    .await
-                    .unwrap(),
-            );
+            brokers.push(start_broker(&runtime, checked, local).await);
         }
         led(&brokers).await;
         for broker in brokers {
@@ -230,13 +220,8 @@ fn role(broker: &Broker) -> LogRole {
 }
 
 pub(super) async fn joined(broker: &Broker) {
-    tokio::time::timeout(Duration::from_secs(30), async {
-        while !matches!(role(broker), LogRole::Leader | LogRole::Follower) {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("the copy joins a view");
+    let joined = || votes(Some(broker.log(TOPIC, 0).unwrap()));
+    eventually("the copy joins a view", joined).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -247,11 +232,7 @@ async fn peers_refuse_a_broker_that_comes_back_on_new_stores() {
     let start = async |index: usize| {
         let (checked, local) = provisioned(&deployment, root.path(), index).await.unwrap();
         let origin = local.origin();
-        let context = runtime.context().clone();
-        let broker = Broker::start_trusted_with_context(checked, local, context)
-            .await
-            .unwrap();
-        (broker, origin)
+        (start_broker(&runtime, checked, local).await, origin)
     };
     let mut brokers = Vec::new();
     for index in 0..3 {
@@ -260,10 +241,7 @@ async fn peers_refuse_a_broker_that_comes_back_on_new_stores() {
     for (broker, _) in &brokers {
         joined(broker).await;
     }
-    let record = |index: usize| {
-        let path = root.path().join(format!("broker-{index}/data/OZZY_PEERS"));
-        ozzy_config::PeerRecord::decode(&std::fs::read_to_string(path).unwrap()).unwrap()
-    };
+    let record = |index: usize| peer_record(root.path(), index);
     let id = |name: &str| deployment.derive_identity().unwrap().brokers[name];
     for index in 0..2 {
         assert_eq!(record(index).origins[&id("broker-2")], brokers[2].1);
@@ -290,13 +268,8 @@ async fn peers_refuse_a_broker_that_comes_back_on_new_stores() {
     let (follower, _) = brokers.pop().unwrap();
     follower.shutdown().await.unwrap();
     let (leader, _) = brokers.pop().unwrap();
-    tokio::time::timeout(Duration::from_secs(30), async {
-        while role(&leader) == LogRole::Leader {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("the leader notices it is alone");
+    let alone = || role(&leader) != LogRole::Leader;
+    eventually("the leader notices it is alone", alone).await;
     for _ in 0..300 {
         assert_ne!(role(&leader), LogRole::Leader);
         assert_ne!(role(&wiped), LogRole::Leader);

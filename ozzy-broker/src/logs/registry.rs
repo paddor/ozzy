@@ -19,7 +19,7 @@ fn record_path(directory: &Path, label: &str) -> PathBuf {
     directory.join(format!("{label}.{RECORD}"))
 }
 
-pub(super) async fn run(
+async fn run(
     io: &Local,
     path: &Path,
     operation: Operation,
@@ -29,7 +29,7 @@ pub(super) async fn run(
         .map_err(|error| io_error(path, error))
 }
 
-pub(super) async fn open(
+async fn open(
     io: &Local,
     path: &Path,
     operation: Operation,
@@ -113,21 +113,16 @@ pub(super) async fn remove_file(io: &Local, path: &Path) -> Result<(), StartupEr
     }
 }
 
-/// Publish `record` in place of the log's previous record: staged, synced,
-/// renamed, and the directory synced. A crash leaves the old or the new
-/// record whole.
-pub(crate) async fn publish(
+/// Put `bytes` at `path` in `directory` whole: `staged` is written, synced,
+/// and renamed over it, and the directory synced. A crash leaves the old or
+/// the new file whole.
+pub(super) async fn write_atomic(
     io: &Local,
     directory: &Path,
-    record: &LogRecord,
+    staged: PathBuf,
+    path: &Path,
+    bytes: Vec<u8>,
 ) -> Result<(), StartupError> {
-    let label = record.log.simple().to_string();
-    let path = record_path(directory, &label);
-    let staged = directory.join(format!("{label}.{STAGED}"));
-    let encoded = record.encode()?.into_bytes();
-    if encoded.len() > RECORD_BYTES {
-        return Err(io_error(path, io::ErrorKind::InvalidInput.into()));
-    }
     remove_file(io, &staged).await?;
     let create = Operation::Open {
         path: staged.clone(),
@@ -136,25 +131,19 @@ pub(crate) async fn publish(
         data_sync: false,
     };
     let handle = open(io, &staged, create).await?;
-    let length = encoded.len();
+    let length = bytes.len();
     let write = Operation::Write {
         handle: handle.clone(),
         offset: 0,
-        data: WriteBuffer::from_vec(encoded),
+        data: WriteBuffer::from_vec(bytes),
     };
     let written = match run(io, &staged, write).await {
         Ok(completed) if matches!(*completed, Outcome::Written(bytes) if bytes == length) => {
-            let mode = SyncMode::All;
-            run(
-                io,
-                &staged,
-                Operation::Sync {
-                    handle: handle.clone(),
-                    mode,
-                },
-            )
-            .await
-            .map(|_| ())
+            let sync = Operation::Sync {
+                handle: handle.clone(),
+                mode: SyncMode::All,
+            };
+            run(io, &staged, sync).await.map(|_| ())
         }
         Ok(_) => Err(io_error(&staged, io::ErrorKind::WriteZero.into())),
         Err(error) => Err(error),
@@ -163,14 +152,19 @@ pub(crate) async fn publish(
     written?;
     let rename = Operation::Rename {
         source: staged,
-        destination: path.clone(),
+        destination: path.to_path_buf(),
     };
-    run(io, &path, rename).await?;
+    run(io, path, rename).await?;
     sync_directory(io, directory).await
 }
 
-/// Read one record file whole.
-async fn read(io: &Local, path: &Path) -> Result<LogRecord, StartupError> {
+/// The first `limit + 1` bytes of the file at `path`, so a caller tells a
+/// file within `limit` from a longer one.
+pub(super) async fn read_whole(
+    io: &Local,
+    path: &Path,
+    limit: usize,
+) -> Result<Vec<u8>, StartupError> {
     let operation = Operation::Open {
         path: path.into(),
         mode: OpenMode::Read,
@@ -181,7 +175,7 @@ async fn read(io: &Local, path: &Path) -> Result<LogRecord, StartupError> {
     let read = Operation::Read {
         handle: handle.clone(),
         offset: 0,
-        length: RECORD_BYTES + 1,
+        length: limit + 1,
     };
     // A lane may run as few as two jobs at once: copy the bytes out and
     // release the read before the close.
@@ -190,7 +184,29 @@ async fn read(io: &Local, path: &Path) -> Result<LogRecord, StartupError> {
         _ => Err(io_error(path, io::ErrorKind::InvalidData.into())),
     });
     run(io, path, Operation::Close { handle }).await?;
-    let bytes = bytes?;
+    bytes
+}
+
+/// Publish `record` in place of the log's previous record. A crash leaves
+/// the old or the new record whole.
+pub(crate) async fn publish(
+    io: &Local,
+    directory: &Path,
+    record: &LogRecord,
+) -> Result<(), StartupError> {
+    let label = ozzy_config::log_label(record.log);
+    let path = record_path(directory, &label);
+    let staged = directory.join(format!("{label}.{STAGED}"));
+    let encoded = record.encode()?.into_bytes();
+    if encoded.len() > RECORD_BYTES {
+        return Err(io_error(path, io::ErrorKind::InvalidInput.into()));
+    }
+    write_atomic(io, directory, staged, &path, encoded).await
+}
+
+/// Read one record file whole.
+async fn read(io: &Local, path: &Path) -> Result<LogRecord, StartupError> {
+    let bytes = read_whole(io, path, RECORD_BYTES).await?;
     let text = std::str::from_utf8(&bytes)
         .ok()
         .filter(|text| text.len() <= RECORD_BYTES)
@@ -198,18 +214,16 @@ async fn read(io: &Local, path: &Path) -> Result<LogRecord, StartupError> {
     Ok(LogRecord::decode(text)?)
 }
 
-/// The entries of `directory`, owned, with the listing job released. `None`
-/// for a missing directory.
-pub(super) async fn list(
+/// Names and kinds in a directory.
+type Entries = Vec<(std::ffi::OsString, FileKind)>;
+
+/// What `listing` yields for `directory`, owned, with the listing job
+/// released. `None` for a missing directory.
+async fn entries(
     io: &Local,
     directory: &Path,
-    max_entries: usize,
-) -> Result<Option<Vec<(std::ffi::OsString, FileKind)>>, StartupError> {
-    let listing = Operation::ReadDirectory {
-        path: directory.into(),
-        max_entries,
-        max_name_bytes: max_entries.saturating_mul(64),
-    };
+    listing: Operation,
+) -> Result<Option<Entries>, StartupError> {
     let entries = match io.execute(Class::Progress, listing).await {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -226,35 +240,38 @@ pub(super) async fn list(
     ))
 }
 
+/// The entries of `directory`, at most `max_entries`. `None` for a missing
+/// directory.
+pub(super) async fn list(
+    io: &Local,
+    directory: &Path,
+    max_entries: usize,
+) -> Result<Option<Entries>, StartupError> {
+    let listing = Operation::ReadDirectory {
+        path: directory.into(),
+        max_entries,
+        max_name_bytes: max_entries.saturating_mul(64),
+    };
+    entries(io, directory, listing).await
+}
+
 /// Entries one listing job of [`load`] holds.
 const PAGE: usize = 1024;
 
 /// The entries of `directory` right after `after` by name, at most
-/// [`PAGE`], with the listing job released. Empty at the end and for a
-/// missing directory.
+/// [`PAGE`]. Empty at the end and for a missing directory.
 async fn page(
     io: &Local,
     directory: &Path,
     after: Option<std::ffi::OsString>,
-) -> Result<Vec<(std::ffi::OsString, FileKind)>, StartupError> {
+) -> Result<Entries, StartupError> {
     let listing = Operation::ReadDirectoryPage {
         path: directory.into(),
         after,
         max_entries: PAGE,
         max_name_bytes: PAGE * 64,
     };
-    let entries = match io.execute(Class::Progress, listing).await {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(io_error(directory, error)),
-    };
-    let Outcome::Directory(entries) = &*entries else {
-        return Err(io_error(directory, io::ErrorKind::InvalidData.into()));
-    };
-    Ok(entries
-        .iter()
-        .map(|entry| (entry.name.clone(), entry.kind))
-        .collect())
+    Ok(entries(io, directory, listing).await?.unwrap_or_default())
 }
 
 /// Every record in `directory`, however many it holds, a page at a time. A
@@ -320,10 +337,7 @@ pub(crate) async fn discard(
     directory: &Path,
     record: &LogRecord,
 ) -> Result<(), StartupError> {
-    remove_file(
-        io,
-        &record_path(directory, &record.log.simple().to_string()),
-    )
-    .await?;
+    let path = record_path(directory, &ozzy_config::log_label(record.log));
+    remove_file(io, &path).await?;
     sync_directory(io, directory).await
 }

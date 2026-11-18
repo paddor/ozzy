@@ -19,7 +19,7 @@ pub struct Sender {
 }
 
 impl Sender {
-    pub(super) fn trim(&mut self) {
+    pub(super) fn shrink(&mut self) {
         self.pending.shrink_to_fit();
     }
 

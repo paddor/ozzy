@@ -34,11 +34,7 @@ pub use membership::Uninserted;
 /// are spawned here. All file futures use the actors' shared backend clients.
 #[derive(Debug)]
 pub struct PartitionActors {
-    actors: Vec<PartitionActor>,
-    native: Vec<Option<NativeService>>,
-    coordinators: Vec<Option<NativeCoordinator>>,
-    readers: Vec<Option<SharedReaders>>,
-    logs: Vec<Option<super::log_service::LogService>>,
+    slots: Vec<Slot>,
     recovered: VecDeque<GroupId>,
     index: BTreeMap<GroupId, usize>,
     /// Most actors this shard may hold at once.
@@ -51,6 +47,40 @@ pub struct PartitionActors {
     wakeups: Option<Box<Wakeups>>,
     turns: u64,
     beats: Option<resting::ShardBeats>,
+}
+
+/// One partition's actor and the services attached to it.
+#[derive(Debug)]
+struct Slot {
+    actor: PartitionActor,
+    native: Option<NativeService>,
+    coordinator: Option<NativeCoordinator>,
+    readers: Option<SharedReaders>,
+    log: Option<super::log_service::LogService>,
+}
+
+impl Slot {
+    /// `actor` without services.
+    const fn new(actor: PartitionActor) -> Self {
+        Self {
+            actor,
+            native: None,
+            coordinator: None,
+            readers: None,
+            log: None,
+        }
+    }
+
+    /// Drop the client services of an actor that recovers again. Its log
+    /// stays and loses its lane.
+    fn quarantine(&mut self) {
+        self.native = None;
+        self.coordinator = None;
+        self.readers = None;
+        if let Some(log) = &mut self.log {
+            log.detach();
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -85,11 +115,7 @@ impl PartitionActors {
         }
         Ok(Self {
             recovered: VecDeque::with_capacity(actors.len()),
-            native: actors.iter().map(|_| None).collect(),
-            coordinators: actors.iter().map(|_| None).collect(),
-            readers: actors.iter().map(|_| None).collect(),
-            logs: actors.iter().map(|_| None).collect(),
-            actors,
+            slots: actors.into_iter().map(Slot::new).collect(),
             index,
             maximum,
             turn_actors,
@@ -110,11 +136,11 @@ impl PartitionActors {
 
     /// Number of configured partition actors.
     pub fn len(&self) -> usize {
-        self.actors.len()
+        self.slots.len()
     }
     /// Whether this shard has no assigned partitions.
     pub fn is_empty(&self) -> bool {
-        self.actors.is_empty()
+        self.slots.is_empty()
     }
 
     /// Observe one newly published recovery handoff. A scheduling turn creates
@@ -128,14 +154,14 @@ impl PartitionActors {
     pub fn status(&self, group: GroupId) -> Option<PartitionStatus> {
         self.index
             .get(&group)
-            .map(|&slot| self.actors[slot].status())
+            .map(|&slot| self.slots[slot].actor.status())
     }
 
     /// Whether a known replicated partition's role suspects stalled storage.
     #[cfg(test)]
     pub(crate) fn storage_stalled(&self, group: GroupId) -> Option<bool> {
         let slot = *self.index.get(&group)?;
-        Some(self.actors[slot].storage_moved().is_some())
+        Some(self.slots[slot].actor.storage_moved().is_some())
     }
 
     /// Whether a known local partition has no write or durable evidence outstanding.
@@ -143,7 +169,7 @@ impl PartitionActors {
     pub(crate) fn storage_idle(&self, group: GroupId) -> Option<bool> {
         self.index
             .get(&group)
-            .and_then(|&slot| self.actors[slot].storage_idle())
+            .and_then(|&slot| self.slots[slot].actor.storage_idle())
     }
 
     /// Committed facts of one known partition, for diagnostics.
@@ -154,7 +180,7 @@ impl PartitionActors {
     ) -> Option<crate::replica_journal::PartitionFacts> {
         self.index
             .get(&group)
-            .and_then(|&slot| self.actors[slot].facts(partition))
+            .and_then(|&slot| self.slots[slot].actor.facts(partition))
     }
 
     /// Initial watch identity. This observation cannot activate write authority.
@@ -165,7 +191,7 @@ impl PartitionActors {
     ) -> Option<RouteState> {
         self.index
             .get(&group)
-            .map(|&slot| self.actors[slot].route_state(partition))
+            .map(|&slot| self.slots[slot].actor.route_state(partition))
     }
 
     pub(super) fn observe_route(&self, route: &mut RouteState) -> bool {
@@ -173,7 +199,7 @@ impl PartitionActors {
             && self
                 .index
                 .get(&route.group)
-                .is_some_and(|&slot| self.actors[slot].observe_route(route))
+                .is_some_and(|&slot| self.slots[slot].actor.observe_route(route))
     }
 
     /// Poll at most `turn_actors` partition turns. Pending file work never blocks
@@ -202,18 +228,18 @@ impl PartitionActors {
             };
         }
         if self.remaining == 0 {
-            self.remaining = self.actors.len();
+            self.remaining = self.slots.len();
             // A complete scan ends where it began. Start the next one a
             // partition later, so a shared bounded transport serves every
             // partition first in turn. A shard may host no partition.
-            if !self.actors.is_empty() {
-                self.next = (self.next + 1) % self.actors.len();
+            if !self.slots.is_empty() {
+                self.next = (self.next + 1) % self.slots.len();
             }
         }
         let mut changed = false;
         for _ in 0..self.turn_actors.min(self.remaining) {
             let slot = self.next;
-            self.next = (self.next + 1) % self.actors.len();
+            self.next = (self.next + 1) % self.slots.len();
             self.remaining -= 1;
             match self.visit(slot, cx, now, &mut try_send) {
                 Ok(progress) => changed |= progress,
@@ -234,34 +260,30 @@ impl PartitionActors {
         try_send: &mut impl FnMut(&mut Context<'_>, Message) -> Result<(), TrySendError>,
     ) -> Result<bool, PartitionError> {
         self.turns = self.turns.wrapping_add(1);
-        if matches!(&self.actors[slot], PartitionActor::Replicated(normal) if normal.needs_checkpoint_recovery())
+        if matches!(&self.slots[slot].actor, PartitionActor::Replicated(normal) if normal.needs_checkpoint_recovery())
         {
-            let actor = match self.actors.swap_remove(slot) {
+            let mut taken = self.slots.swap_remove(slot);
+            taken.actor = match taken.actor {
                 PartitionActor::Replicated(normal) => {
                     PartitionActor::Recovering(Box::new(ScheduledRecovery::quarantine(normal)))
                 }
                 actor => actor,
             };
-            self.native[slot] = None;
-            self.coordinators[slot] = None;
-            self.readers[slot] = None;
-            if let Some(log) = &mut self.logs[slot] {
-                log.detach();
-            }
+            taken.quarantine();
             // Its peers may still trust the role it had.
-            self.request_withdrawal(actor.group());
-            self.actors.push(actor);
-            let last = self.actors.len() - 1;
-            self.actors.swap(slot, last);
+            self.request_withdrawal(taken.actor.group());
+            self.slots.push(taken);
+            let last = self.slots.len() - 1;
+            self.slots.swap(slot, last);
         }
-        let recovering = matches!(self.actors[slot], PartitionActor::Recovering(_));
+        let recovering = matches!(self.slots[slot].actor, PartitionActor::Recovering(_));
         let result =
-            poll_actor(&mut self.actors[slot], cx, now, &mut *try_send).and_then(|changed| {
+            poll_actor(&mut self.slots[slot].actor, cx, now, &mut *try_send).and_then(|changed| {
                 let served = self.poll_services(slot, cx, now, try_send)?;
                 Ok(changed || served)
             });
-        if recovering && matches!(self.actors[slot], PartitionActor::Replicated(_)) {
-            self.recovered.push_back(self.actors[slot].group());
+        if recovering && matches!(self.slots[slot].actor, PartitionActor::Replicated(_)) {
+            self.recovered.push_back(self.slots[slot].actor.group());
             self.install_beats(slot);
         }
         self.collect_withdrawal(slot);
@@ -282,33 +304,32 @@ impl PartitionActors {
         now: Duration,
         try_send: &mut impl FnMut(&mut Context<'_>, Message) -> Result<(), TrySendError>,
     ) -> Result<bool, PartitionError> {
-        let group = self.actors[slot].group();
+        let held = &mut self.slots[slot];
+        let group = held.actor.group();
         let mut changed = false;
-        if let Some(readers) = &mut self.readers[slot] {
+        if let Some(readers) = &mut held.readers {
             changed |= readers
-                .poll(&mut self.actors[slot], cx, &mut *try_send)
+                .poll(&mut held.actor, cx, &mut *try_send)
                 .map_err(|source| PartitionError::Actor { group, source })?;
         }
-        if let Some(service) = &mut self.coordinators[slot] {
+        if let Some(service) = &mut held.coordinator {
             let (coordinator, links) = (&mut service.coordinator, &service.links);
             changed |= coordinator
                 .flush_replies(cx, |peer| links.get(peer), &mut *try_send)
-                .and_then(|sent| {
-                    Ok(coordinator.poll_progress(cx, now, &mut self.actors[slot])? | sent)
-                })
+                .and_then(|sent| Ok(coordinator.poll_progress(cx, now, &mut held.actor)? | sent))
                 .map_err(|source| PartitionError::Native { group, source })?;
         }
-        if let Some(log) = &mut self.logs[slot] {
-            changed |= log.poll(&mut self.actors[slot], cx, now);
+        if let Some(log) = &mut held.log {
+            changed |= log.poll(&mut held.actor, cx, now);
         }
-        let Some(native) = &mut self.native[slot] else {
+        let Some(native) = &mut held.native else {
             return Ok(changed);
         };
         native
             .intake
             .poll_progress(
                 cx,
-                self.actors[slot].authority_hint(),
+                held.actor.authority_hint(),
                 |peer| native.links.get(peer),
                 &mut *try_send,
             )
@@ -327,12 +348,9 @@ impl PartitionActors {
     pub async fn stop(self) -> Result<Vec<(GroupId, CleanStop)>, PartitionError> {
         // Drop protocol observers and unused proposal arenas before draining.
         // Already admitted work stays owned by the partition actors.
-        drop(self.native);
-        drop(self.coordinators);
-        drop(self.readers);
-        drop(self.logs);
+        let actors: Vec<_> = self.slots.into_iter().map(|slot| slot.actor).collect();
         let mut drains = FuturesUnordered::new();
-        for actor in self.actors {
+        for actor in actors {
             drains.push(async move {
                 let group = actor.group();
                 actor

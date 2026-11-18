@@ -1,7 +1,7 @@
 //! Local storage completions and failures: promise publication, writes,
 //! barriers, application, and uncertain I/O.
 
-use super::{DriverError, ReplicaDriver, Role, VoterIndex};
+use super::{DriverError, ReplicaDriver, Role};
 use crate::{
     JournalGeneration, Prefix, PromiseTicket, ReplicationError, SyncTicket, ViewChangeError,
     WriteTicket,
@@ -19,7 +19,7 @@ impl ReplicaDriver {
         now: Duration,
     ) -> Result<(), DriverError> {
         self.observe_time(now)?;
-        self.storage_busy_since = busy_since;
+        self.timers.storage_busy_since = busy_since;
         Ok(())
     }
 
@@ -40,18 +40,20 @@ impl ReplicaDriver {
         };
         let snapshot = normal.snapshot();
         snapshot.ready_for_appends
-            && VoterIndex::primary(snapshot.scope.view) == self.local
+            && self.leads(snapshot.scope.view)
             && self.covered.is_empty()
             && self.now >= self.doubt_at()
     }
 
     pub(super) fn doubt_at(&self) -> Duration {
-        self.backup_heard_at
+        self.timers
+            .backup_heard_at
             .saturating_add(self.timing.primary_timeout)
     }
 
     pub(super) fn storage_timed_out(&self) -> bool {
-        self.storage_busy_since
+        self.timers
+            .storage_busy_since
             .is_some_and(|since| self.now >= since.saturating_add(self.timing.primary_timeout))
     }
 
@@ -109,8 +111,8 @@ impl ReplicaDriver {
         let was_ready = normal.snapshot().ready_for_appends;
         normal.apply_through(through)?;
         if !was_ready && normal.snapshot().ready_for_appends {
-            self.progress_deadline = self.now.saturating_add(self.timing.primary_timeout);
-            self.election_delay = self.timing.election_timeout;
+            self.timers.progress_deadline = self.now.saturating_add(self.timing.primary_timeout);
+            self.timers.election_delay = self.timing.election_timeout;
         }
         Ok(())
     }

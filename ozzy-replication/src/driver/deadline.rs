@@ -1,6 +1,6 @@
 //! The next instant at which polling the driver acts without new input.
 
-use super::{ReplicaDriver, Role, VoterIndex};
+use super::{ReplicaDriver, Role};
 use std::time::Duration;
 
 impl ReplicaDriver {
@@ -9,48 +9,41 @@ impl ReplicaDriver {
     /// persistence, storage, doubt, or election timeout. Instants that already
     /// passed were handled by the last poll.
     pub fn next_deadline(&self) -> Option<Duration> {
-        let candidates = match &self.role {
-            Role::Fenced(_) => [None; 7],
-            Role::Installing(_) => [
-                Some(self.election_deadline),
+        let timers = &self.timers;
+        match &self.role {
+            Role::Fenced(_) => None,
+            Role::Installing(_) => {
+                self.soonest(&[Some(timers.election_deadline), self.exit_retry_at])
+            }
+            Role::ViewChanging(_) => self.soonest(&[
+                Some(timers.election_deadline),
+                Some(timers.retry_at),
                 self.exit_retry_at,
-                None,
-                None,
-                None,
-                None,
-                None,
-            ],
-            Role::ViewChanging(_) => [
-                Some(self.election_deadline),
-                Some(self.retry_at),
-                self.exit_retry_at,
-                None,
-                None,
-                None,
-                None,
-            ],
+            ]),
             Role::Normal(normal) => {
                 let snapshot = normal.snapshot();
-                let primary = VoterIndex::primary(snapshot.scope.view) == self.local;
+                let primary = self.leads(snapshot.scope.view);
                 let outstanding =
                     snapshot.accepted != snapshot.committed || !snapshot.ready_for_appends;
                 let unpersisted = snapshot.accepted.op > snapshot.journal.durable;
-                [
-                    (primary && !self.resting()).then_some(self.retry_at),
+                self.soonest(&[
+                    (primary && !self.resting()).then_some(timers.retry_at),
                     (primary && self.covered.is_empty()).then(|| self.doubt_at()),
-                    (!primary && self.covered.is_empty()).then_some(self.contact_deadline),
-                    outstanding.then_some(self.progress_deadline),
-                    unpersisted.then_some(self.persistence_deadline),
-                    self.storage_busy_since
+                    (!primary && self.covered.is_empty()).then_some(timers.contact_deadline),
+                    outstanding.then_some(timers.progress_deadline),
+                    unpersisted.then_some(timers.persistence_deadline),
+                    timers
+                        .storage_busy_since
                         .map(|since| since.saturating_add(self.timing.primary_timeout)),
                     self.exit_retry_at,
-                ]
+                ])
             }
-        };
-        candidates
-            .into_iter()
-            .flatten()
-            .filter(|deadline| *deadline > self.now)
-            .min()
+        }
+    }
+
+    /// The earliest of `candidates` that is still ahead of the clock.
+    fn soonest(&self, candidates: &[Option<Duration>]) -> Option<Duration> {
+        let ahead = candidates.iter().flatten().copied();
+        ahead.filter(|deadline| *deadline > self.now).min()
     }
 }

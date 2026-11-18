@@ -57,12 +57,7 @@ impl ReplicaActor {
         if primary == self.local {
             return Ok(());
         }
-        let voter = self
-            .configuration
-            .voters()
-            .iter()
-            .position(|peer| *peer == primary)
-            .ok_or_else(no_channel)?;
+        let voter = self.voter_slot(primary).ok_or_else(no_channel)?;
         self.send_flow_state(voter, report, None, None)?;
         self.work.flow.published = Some(report);
         Ok(())
@@ -75,7 +70,7 @@ impl ReplicaActor {
         request_id: Option<ozzy_proto::RequestId>,
         repair_limit: Option<ozzy_replication::OpNumber>,
     ) -> Result<(), ActorError> {
-        let to = self.configuration.voters()[voter];
+        let to = self.peer(voter);
         let Some(session) = self.session(to) else {
             return Ok(());
         };
@@ -132,9 +127,7 @@ impl ReplicaActor {
         compact: wire::CompactState,
         now: Duration,
     ) -> Result<(), ActorError> {
-        if !self.application_ready()
-            || self.configuration.primary(self.driver.scope().view) != self.local
-        {
+        if !self.application_ready() || self.primary() != self.local {
             return Ok(());
         }
         let Some((channel, handle)) = self.work.flow.handles[voter] else {

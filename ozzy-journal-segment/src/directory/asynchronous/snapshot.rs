@@ -67,7 +67,7 @@ impl Journal {
             .manifest
             .segments
             .iter()
-            .map(|r| self.pins.protect_prepared_segment(r.segment_id))
+            .map(|r| self.run.pins.protect_prepared_segment(r.segment_id))
             .collect::<Result<Vec<_>, _>>()
             .map_err(DirectoryError::from)?;
         let snapshot = Snapshot {
@@ -107,7 +107,7 @@ impl Journal {
         limits: IndexBuildLimits,
     ) -> Result<Snapshot, JournalIndexError> {
         self.healthy()?;
-        let validated = self.validated_indexes.clone();
+        let validated = self.run.validated_indexes.clone();
         validated.retain(|id| {
             self.manifest
                 .segments
@@ -145,11 +145,11 @@ impl Journal {
             validated.record(source);
         }
         // The prefix is taken first: a canceled or failed build rescans next time.
-        let prefix = self.active_prefix.take().map(|prefix| *prefix);
+        let prefix = self.run.active_prefix.take().map(|prefix| *prefix);
         let (snapshot, prefix) = self
             .capture_index_snapshot(boundary, limits.file, true, prefix)
             .await?;
-        self.active_prefix = prefix.map(Box::new);
+        self.run.active_prefix = prefix.map(Box::new);
         Ok(snapshot)
     }
 

@@ -198,7 +198,11 @@ impl Journal {
         for index in run.clone() {
             let reference = segments[index];
             scopes.push(self.sealed_scope(reference, &segments[index + 1])?);
-            leases.push(self.pins.protect_prepared_segment(reference.segment_id)?);
+            leases.push(
+                self.run
+                    .pins
+                    .protect_prepared_segment(reference.segment_id)?,
+            );
             known.push(self.known_layout(&reference));
         }
         Ok(Some(PackJob {
@@ -225,7 +229,8 @@ impl Journal {
         if !self.manifest.segments.contains(reference) {
             return None;
         }
-        self.pack_layouts
+        self.run
+            .pack_layouts
             .borrow()
             .get(&layout_key(reference))
             .copied()
@@ -243,7 +248,7 @@ impl Journal {
 
     /// Remember the layouts a pack job measured, for later planning.
     pub fn record_pack_layouts(&self, outcome: &PackOutcome) {
-        let mut layouts = self.pack_layouts.borrow_mut();
+        let mut layouts = self.run.pack_layouts.borrow_mut();
         for (reference, layout) in &outcome.measured {
             layouts.insert(layout_key(reference), *layout);
         }
@@ -289,7 +294,7 @@ impl Journal {
         next.segments
             .splice(at..at + packed.replaced.len(), [packed.merged]);
         self.install_selected(next).await?;
-        let mut layouts = self.pack_layouts.borrow_mut();
+        let mut layouts = self.run.pack_layouts.borrow_mut();
         let selected = &self.manifest.segments;
         layouts.retain(|key, _| {
             selected

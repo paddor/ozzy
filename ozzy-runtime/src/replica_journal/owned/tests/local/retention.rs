@@ -89,9 +89,7 @@ fn append(
     buffer
         .prepare_append(request(producer, first, records))
         .unwrap();
-    let receipt = admit(controller, journal, driver, buffer);
-    write(controller, journal, driver, receipt);
-    sync_apply(controller, journal, driver);
+    commit(controller, journal, driver, buffer);
 }
 
 /// Run captured cleanup and retirement work and install it, as the shard does
@@ -155,9 +153,7 @@ pub(super) fn limit(
             &encode_operation_body(&body, local_config().limits.operations).unwrap(),
         )
         .unwrap();
-    let receipt = admit(controller, journal, driver, buffer);
-    write(controller, journal, driver, receipt);
-    sync_apply(controller, journal, driver);
+    commit(controller, journal, driver, buffer);
 }
 
 #[test]
@@ -298,9 +294,7 @@ fn a_released_pin_reopens_cleanup_without_a_manifest_publication() {
         )
         .unwrap();
         if let Some(buffer) = turn.proposal {
-            let receipt = admit(controller, journal, driver, buffer);
-            write(controller, journal, driver, receipt);
-            sync_apply(controller, journal, driver);
+            commit(controller, journal, driver, buffer);
         }
         run_retention_jobs(controller, journal);
     };
@@ -389,9 +383,7 @@ fn retention_confirms_retry_floors_before_checkpoint_retirement_and_identity_res
             &encode_operation_body(&body, config.limits.operations).unwrap(),
         )
         .unwrap();
-    let receipt = admit(&mut controller, &mut journal, &mut driver, buffer);
-    write(&mut controller, &mut journal, &mut driver, receipt);
-    sync_apply(&mut controller, &mut journal, &mut driver);
+    commit(&mut controller, &mut journal, &mut driver, buffer);
     let ticket = driver.begin_validation().unwrap();
     let (partition, plan) = drive(
         &mut controller,
@@ -517,9 +509,7 @@ fn retirement_restores_independent_retry_floors_for_interleaved_producers() {
         )
         .unwrap()
         .unwrap();
-    let receipt = admit(&mut controller, &mut journal, &mut driver, buffer);
-    write(&mut controller, &mut journal, &mut driver, receipt);
-    sync_apply(&mut controller, &mut journal, &mut driver);
+    commit(&mut controller, &mut journal, &mut driver, buffer);
     drive(
         &mut controller,
         journal.retire_confirmed_history(

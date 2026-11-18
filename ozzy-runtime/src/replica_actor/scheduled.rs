@@ -74,9 +74,9 @@ impl ScheduledReplica {
         Ok(())
     }
 
-    /// See [`ReplicaActor::trim`].
-    pub fn trim(&mut self) {
-        self.actor.trim();
+    /// See [`ReplicaActor::shrink`].
+    pub fn shrink(&mut self) {
+        self.actor.shrink();
     }
 
     /// The adapter provides group PUB delivery and bounded PEER gap repair.

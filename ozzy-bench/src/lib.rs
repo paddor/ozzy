@@ -18,6 +18,7 @@ pub mod automation;
 pub mod budget;
 pub mod control;
 pub mod dedup;
+pub mod measure;
 pub mod native;
 pub mod placement;
 pub mod provenance;

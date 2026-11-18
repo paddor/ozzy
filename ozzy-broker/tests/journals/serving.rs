@@ -1,4 +1,5 @@
 use super::*;
+use ozzy_broker::log::{Log, LogRole};
 use ozzy_broker::{Broker, format_partition_journals, initialize_volumes};
 use ozzy_proto::{EnvelopeLimits, MessageId, NodeId, data::DataLimits, handshake};
 use ozzy_runtime::replicated::{
@@ -358,14 +359,65 @@ async fn start_brokers(
         initialize_volumes(&checked, &local).unwrap();
         format_partition_journals(&checked, &local).await.unwrap();
         let expected_shards = checked.plan.shards.len();
-        let broker = Broker::start_trusted_with_context(checked, local, runtime.context().clone())
-            .await
-            .unwrap();
+        let broker = start_broker(runtime, checked, local).await;
         assert_eq!(broker.application_threads(), expected_shards);
         assert_eq!(broker.dispatcher_threads(), 1);
         brokers.push(broker);
     }
     brokers
+}
+
+/// Start one broker on the stores it has.
+async fn start_broker(
+    runtime: &WriterRuntime,
+    checked: CheckedConfig,
+    local: BrokerIdentity,
+) -> Broker {
+    Broker::start_trusted_with_context(checked, local, runtime.context().clone())
+        .await
+        .unwrap()
+}
+
+/// The node of each broker of `deployment`, in its order.
+fn nodes(deployment: &[(CheckedConfig, BrokerIdentity)]) -> Vec<NodeId> {
+    let node = |(checked, _): &(CheckedConfig, BrokerIdentity)| {
+        NodeId::from_bytes(*checked.identity.brokers[&checked.plan.name].as_bytes())
+    };
+    deployment.iter().map(node).collect()
+}
+
+/// A class of runtime logs.
+fn log_class(segment_bytes: u64, max_append_bytes: u64, max_logs: usize) -> ozzy_config::LogClass {
+    ozzy_config::LogClass {
+        segment_bytes,
+        max_append_bytes,
+        max_logs,
+    }
+}
+
+/// Look every 5 ms until `done` holds.
+async fn poll_until(mut done: impl FnMut() -> bool) {
+    while !done() {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// As [`poll_until`], for at most 30 seconds. Panics with `what` after.
+async fn eventually(what: &str, done: impl FnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(30), poll_until(done))
+        .await
+        .expect(what);
+}
+
+/// Whether `log` is there and leads.
+fn leads(log: Option<Log>) -> bool {
+    log.is_some_and(|log| log.status().borrow().role == LogRole::Leader)
+}
+
+/// Whether `log` is there and votes: it leads or follows.
+fn votes(log: Option<Log>) -> bool {
+    let role = log.map(|log| log.status().borrow().role);
+    matches!(role, Some(LogRole::Leader | LogRole::Follower))
 }
 
 async fn read_topic(

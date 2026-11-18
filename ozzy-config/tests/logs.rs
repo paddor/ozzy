@@ -89,6 +89,9 @@ fn a_log_is_placed_by_its_id_alone() {
                 .directory
                 .ends_with(format!("logs/{}", id.simple()))
         );
+        let store =
+            std::path::Path::new(ozzy_config::LOG_DIRECTORY).join(ozzy_config::log_label(id));
+        assert!(placement.directory.ends_with(store));
         assert!(placement.deduplication.is_none() && placement.delay.is_none());
         assert_eq!(placement.retention, ozzy_config::TopicRetention::default());
         used.insert(placement.shard);

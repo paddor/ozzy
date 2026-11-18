@@ -65,17 +65,6 @@ fn opened(
     buffer.producer_opened().unwrap()
 }
 
-fn commit(
-    controller: &mut Controller,
-    journal: &mut OwnedJournal,
-    driver: &mut Driver,
-    buffer: ProposalBuffer,
-) {
-    let receipt = admit(controller, journal, driver, buffer);
-    write(controller, journal, driver, receipt);
-    sync_apply(controller, journal, driver);
-}
-
 #[test]
 fn an_idle_session_retires_and_resumes_above_every_retired_epoch() {
     let (mut controller, io) = setup();

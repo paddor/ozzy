@@ -47,7 +47,7 @@ impl Shape {
         Ok(Self {
             max_append_bytes: topic.max_append_bytes,
             segment_bytes: topic.segment_bytes,
-            sharers: static_sharers(plan, placement.shard),
+            sharers: placed(plan, placement.shard).max(1),
             lazy_spare: false,
         })
     }
@@ -66,24 +66,19 @@ impl Shape {
         Ok(Self {
             max_append_bytes: logs.max_append_bytes,
             segment_bytes: logs.segment_bytes,
-            sharers: plan
-                .partitions
-                .iter()
-                .filter(|partition| partition.shard == placement.shard)
-                .count()
+            sharers: placed(plan, placement.shard)
                 + logs.max_logs.div_ceil(plan.shards.len().max(1)),
             lazy_spare: true,
         })
     }
 }
 
-/// Configured partitions on `shard`, at least one.
-fn static_sharers(plan: &BrokerPlan, shard: u32) -> usize {
+/// Configured partitions placed on `shard`.
+fn placed(plan: &BrokerPlan, shard: u32) -> usize {
     plan.partitions
         .iter()
         .filter(|partition| partition.shard == shard)
         .count()
-        .max(1)
 }
 
 impl Settings {
@@ -219,7 +214,7 @@ pub fn check_partition_limits(
 /// each run is a file that later merges must read and rewrite.
 const INDEX_ENTRY_BUFFER_BYTES: usize = 1024 * 1024;
 
-/// Checked write path sizes of one partition, from its topic and its share of
+/// Checked write path sizes of one partition, from its shape and its share of
 /// the device lane.
 #[derive(Debug, Clone, Copy)]
 struct Sizes {
@@ -235,13 +230,13 @@ struct Sizes {
 }
 
 impl Sizes {
-    fn check(topic: Shape, execution: &Execution) -> Result<Self, &'static str> {
+    fn check(shape: Shape, execution: &Execution) -> Result<Self, &'static str> {
         let native = |bytes| usize::try_from(bytes).map_err(|_| "byte limit overflow");
         let (data, progress) = share_bytes(execution.backend, execution.lane)
             .map_err(|_| "device lane outside its backend")?;
         let operations = execution.operations;
-        let body = native(topic.max_append_bytes)?;
-        let segment = native(topic.segment_bytes)?;
+        let body = native(shape.max_append_bytes)?;
+        let segment = native(shape.segment_bytes)?;
         if body < 1024 || operations == 0 {
             return Err("journal needs at least 1 KiB APPEND and one operation");
         }
@@ -262,7 +257,7 @@ impl Sizes {
 
     fn journal_limits(
         self,
-        topic: Shape,
+        shape: Shape,
         direct: bool,
         checkpoint: CheckpointLimits,
     ) -> JournalLimits {
@@ -287,7 +282,7 @@ impl Sizes {
             },
             checkpoint,
             io: SegmentOptions {
-                max_segment_bytes: topic.segment_bytes,
+                max_segment_bytes: shape.segment_bytes,
                 chunk_bytes: self.chunk,
                 direct,
                 write_mode: SegmentWriteMode::DataSync,

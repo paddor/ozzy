@@ -59,9 +59,7 @@ fn local_protected_corruption_is_refused_without_truncating_confirmed_history() 
     .unwrap();
     initialize(&mut controller, &mut journal, &mut driver);
     let buffer = append(&journal, 12, 0);
-    let receipt = admit(&mut controller, &mut journal, &mut driver, buffer);
-    write(&mut controller, &mut journal, &mut driver, receipt);
-    sync_apply(&mut controller, &mut journal, &mut driver);
+    commit(&mut controller, &mut journal, &mut driver, buffer);
     drive(&mut controller, journal.shutdown()).unwrap();
     let path = PathBuf::from("/local/segments/1.log");
     let offset = ozzy_journal_segment::SEGMENT_HEADER_BYTES + 16;

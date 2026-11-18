@@ -16,7 +16,7 @@ impl PartitionActors {
         if self.stopped {
             return None;
         }
-        match &self.actors[*self.index.get(&group)?] {
+        match &self.slots[*self.index.get(&group)?].actor {
             PartitionActor::Local(_) | PartitionActor::Recovering(_) => None,
             PartitionActor::Replicated(actor) => actor.receive_receipt(),
         }
@@ -28,7 +28,7 @@ impl PartitionActors {
         if self.stopped {
             return None;
         }
-        match &self.actors[*self.index.get(&group)?] {
+        match &self.slots[*self.index.get(&group)?].actor {
             PartitionActor::Local(_) | PartitionActor::Recovering(_) => None,
             PartitionActor::Replicated(actor) => actor.receive_channel(),
         }
@@ -40,7 +40,7 @@ impl PartitionActors {
         if self.stopped {
             return None;
         }
-        match &self.actors[*self.index.get(&group)?] {
+        match &self.slots[*self.index.get(&group)?].actor {
             PartitionActor::Local(_) | PartitionActor::Recovering(_) => None,
             PartitionActor::Replicated(actor) => actor.receive_capacity(),
         }
@@ -52,7 +52,7 @@ impl PartitionActors {
         if self.stopped {
             return None;
         }
-        match &self.actors[*self.index.get(&group)?] {
+        match &self.slots[*self.index.get(&group)?].actor {
             PartitionActor::Local(_) => None,
             PartitionActor::Replicated(actor) => actor.ops_receive_demand(),
             PartitionActor::Recovering(actor) => actor.ops_receive_demand(),
@@ -67,7 +67,7 @@ impl PartitionActors {
         if self.stopped {
             return None;
         }
-        match &self.actors[*self.index.get(&group)?] {
+        match &self.slots[*self.index.get(&group)?].actor {
             PartitionActor::Recovering(actor) => actor.checkpoint_receive_demand(),
             PartitionActor::Local(_) | PartitionActor::Replicated(_) => None,
         }
@@ -76,7 +76,7 @@ impl PartitionActors {
     /// Staged, validating, or installing data keeps its reservation until settled.
     pub fn receive_has_work(&self, group: GroupId) -> Result<bool, PartitionError> {
         let slot = *self.index.get(&group).ok_or(PartitionError::Unknown)?;
-        Ok(match &self.actors[slot] {
+        Ok(match &self.slots[slot].actor {
             PartitionActor::Local(_) => false,
             PartitionActor::Replicated(actor) => actor.receive_has_work(),
             PartitionActor::Recovering(actor) => actor.receive_has_work(),
@@ -95,7 +95,7 @@ impl PartitionActors {
         let slot = *self.index.get(&group).ok_or(PartitionError::Unknown)?;
         self.observe(now)?;
         self.touch(slot);
-        match &mut self.actors[slot] {
+        match &mut self.slots[slot].actor {
             PartitionActor::Local(_) => Err(PartitionError::Mode),
             PartitionActor::Replicated(actor) => actor
                 .receive(message, now)
@@ -115,7 +115,7 @@ impl PartitionActors {
     ) -> Result<bool, PartitionError> {
         let slot = *self.index.get(&group).ok_or(PartitionError::Unknown)?;
         self.observe(now)?;
-        let (consumed, changed) = match &mut self.actors[slot] {
+        let (consumed, changed) = match &mut self.slots[slot].actor {
             PartitionActor::Replicated(actor) => {
                 let committed = actor.status().normal.map(|normal| normal.committed);
                 let consumed = actor
@@ -148,7 +148,7 @@ impl PartitionActors {
         let slot = *self.index.get(&group).ok_or(PartitionError::Unknown)?;
         self.observe(now)?;
         self.touch(slot);
-        match &mut self.actors[slot] {
+        match &mut self.slots[slot].actor {
             PartitionActor::Local(_) => Err(PartitionError::Mode),
             PartitionActor::Replicated(actor) => actor
                 .replace_session(peer, expected, replacement, now)
@@ -170,7 +170,7 @@ impl PartitionActors {
         let slot = *self.index.get(&group).ok_or(PartitionError::Unknown)?;
         self.observe(now)?;
         self.touch(slot);
-        match &mut self.actors[slot] {
+        match &mut self.slots[slot].actor {
             PartitionActor::Local(_) => Err(PartitionError::Mode),
             PartitionActor::Replicated(actor) => actor
                 .disconnect_session(peer, expected, now)

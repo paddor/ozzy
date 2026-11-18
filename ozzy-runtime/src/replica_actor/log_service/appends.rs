@@ -1,9 +1,9 @@
 //! Owner appends: fence by the observed term, encode into a free arena,
 //! submit on the log's lane, and answer from the proposal outcome.
 
-use super::{LogService, Term};
-use crate::log::{AppendError, AppendRequest, Appended, LogRole, LogStatus};
-use crate::replica_actor::{PendingProposal, ProposalOutcome, ProposalStopped};
+use super::{LogService, Term, settle};
+use crate::log::{AppendError, AppendRequest, Appended, LogStatus};
+use crate::replica_actor::{PendingProposal, ProposalStopped, response};
 use crate::replica_journal::{
     AppendAdmissionError, JournalError, OwnerAppendError, ProposalBuffer,
 };
@@ -35,22 +35,18 @@ impl Flight {
 impl LogService {
     /// Submit `append`, or hand it back while every arena is in flight.
     pub(super) fn start_append(&mut self, append: AppendRequest) -> Option<AppendRequest> {
-        let term = match self.fence(append.view) {
+        let term = match self.admitting(append.view) {
             Ok(term) => term,
-            Err(error) => {
-                let _ = append.reply.send(Err(error));
+            Err(fenced) => {
+                let _ = append.reply.send(Err(fenced.into()));
                 return None;
             }
         };
-        if self.stepping.is_some() || self.port.published().role == LogRole::Doubt {
-            let _ = append.reply.send(Err(AppendError::NotLeader));
-            return None;
-        }
         let Some(lane) = &mut self.lane else {
             let _ = append.reply.send(Err(AppendError::NotLeader));
             return None;
         };
-        if append.records.len() > lane.max_records {
+        if append.records.len() > lane.operations.max_records {
             let _ = append.reply.send(Err(AppendError::TooLarge));
             return None;
         }
@@ -58,43 +54,22 @@ impl LogService {
             return Some(append);
         };
         let count = append.records.len() as u64;
-        let prepared = prepare(&mut buffer, &append, term, self.port.partition);
-        if let Err(error) = prepared {
-            buffer.clear();
-            lane.arenas.push(buffer);
+        if let Err(error) = prepare(&mut buffer, &append, term, self.port.partition) {
+            lane.recycle(buffer);
             let _ = append.reply.send(Err(error));
             return None;
         }
-        match lane.submitter.try_submit(buffer) {
-            Ok(pending) => {
-                self.appends.push(Flight {
-                    pending: Box::pin(pending),
-                    reply: append.reply,
-                    first: append.expected,
-                    end: Offset::new(append.expected.get().saturating_add(count)),
-                });
-                None
-            }
-            Err(unsubmitted) => {
-                let mut buffer = unsubmitted.buffer;
-                buffer.clear();
-                lane.arenas.push(buffer);
-                let _ = append.reply.send(Err(AppendError::NotLeader));
-                None
-            }
-        }
-    }
-
-    /// The term an append for `view` runs in.
-    fn fence(&self, view: u64) -> Result<Term, AppendError> {
-        match self.term {
-            Some(term) if term.scope.view == view => Ok(term),
-            Some(term) => Err(AppendError::View {
-                named: view,
-                current: term.scope.view,
-            }),
-            None => Err(AppendError::NotLeader),
-        }
+        let Some(pending) = lane.submit(buffer) else {
+            let _ = append.reply.send(Err(AppendError::NotLeader));
+            return None;
+        };
+        self.appends.push(Flight {
+            pending: Box::pin(pending),
+            reply: append.reply,
+            first: append.expected,
+            end: Offset::new(append.expected.get().saturating_add(count)),
+        });
+        None
     }
 
     /// Answer every append whose outcome is known and reuse its arena.
@@ -113,9 +88,8 @@ impl LogService {
                 self.committed(appended.end);
             }
             let _ = flight.reply.send(answer);
-            if let (Some(lane), Some(mut buffer)) = (&mut self.lane, buffer) {
-                buffer.clear();
-                lane.arenas.push(buffer);
+            if let (Some(lane), Some(buffer)) = (&mut self.lane, buffer) {
+                lane.recycle(buffer);
             }
         }
         progress
@@ -150,7 +124,12 @@ fn prepare(
         })
         .collect();
     buffer
-        .prepare_owner_append(term.authority(), partition, append.expected, records)
+        .prepare_owner_append(
+            response::authority(term.scope),
+            partition,
+            append.expected,
+            records,
+        )
         .map_err(|error| match error {
             JournalError::AppendCapacity | JournalError::Operation(_) => AppendError::TooLarge,
             _ => AppendError::Refused,
@@ -180,15 +159,10 @@ fn outcome(
     let Ok(reply) = result else {
         return (Err(AppendError::Unknown), None);
     };
-    let answer = match reply.outcome {
-        ProposalOutcome::Committed { .. } => Ok(Appended {
-            first: flight.first,
-            end: flight.end,
-            time_millis: reply.buffer.owner_timestamp().unwrap_or(0),
-        }),
-        ProposalOutcome::NotAdmitted => Err(AppendError::NotLeader),
-        ProposalOutcome::Unknown => Err(AppendError::Unknown),
-        ProposalOutcome::Invalid(error) => Err(refusal(&error)),
-    };
+    let answer = settle(reply.outcome, AppendError::Unknown, refusal).map(|()| Appended {
+        first: flight.first,
+        end: flight.end,
+        time_millis: reply.buffer.owner_timestamp().unwrap_or(0),
+    });
     (answer, Some(reply.buffer))
 }

@@ -313,7 +313,7 @@ impl AppendBuffer {
 
     /// Give the unused descriptor capacity back and keep the journal lease.
     /// It grows again with use. For a log that expects to stay idle.
-    pub fn trim(&mut self) {
+    pub fn shrink(&mut self) {
         self.progress_riders.shrink_to_fit();
         self.entries.shrink_to_fit();
         self.prepared.shrink_to_fit();

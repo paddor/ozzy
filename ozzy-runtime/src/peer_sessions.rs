@@ -120,6 +120,12 @@ impl Sessions {
         self.origin = Some(origin);
     }
 
+    /// Whether a handshake says its origin replaces a lost one: only with
+    /// an origin to name.
+    const fn replaces(&self) -> bool {
+        self.replacement && self.origin.is_some()
+    }
+
     /// Say in every later HELLO and WELCOME that the named origin replaces
     /// one that was lost.
     pub const fn set_replacement(&mut self) {
@@ -160,6 +166,7 @@ impl Sessions {
         }
         let parameters = self.profile(remote);
         self.capacity(remote)?;
+        let replacement = self.replaces();
         let peer = self.peers.entry(remote).or_default();
         let (id, hello) = if let Some(attempt) = peer.pending {
             attempt
@@ -173,7 +180,7 @@ impl Sessions {
                     instance_id: self.instance,
                     hello_nonce: u128::from(nonce),
                     origin: self.origin,
-                    replacement: self.replacement && self.origin.is_some(),
+                    replacement,
                     parameters,
                 },
             ))
@@ -248,6 +255,7 @@ impl Sessions {
             return Ok(Handled::default());
         }
         self.capacity(remote)?;
+        let replacement = self.replaces();
         let peer = self.peers.entry(remote).or_default();
         let old = peer.live.map(|l| l.id);
         let reply = match packet.envelope.opcode {
@@ -279,7 +287,7 @@ impl Sessions {
                         instance_id: self.instance,
                         hello_nonce: h.hello_nonce,
                         origin: self.origin,
-                        replacement: self.replacement && self.origin.is_some(),
+                        replacement,
                         parameters: selected,
                     },
                     h.parameters.receive,

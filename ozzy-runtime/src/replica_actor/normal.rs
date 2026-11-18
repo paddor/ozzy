@@ -69,12 +69,12 @@ pub(super) struct Work {
 
 impl Work {
     /// Give unused reserved capacity back. Everything grows again with use.
-    pub(super) fn trim(&mut self) {
+    pub(super) fn shrink(&mut self) {
         self.live.shrink_to_fit();
         self.persisting_bytes.shrink_to_fit();
-        self.receive.trim();
-        self.recent.trim();
-        self.flow.trim();
+        self.receive.shrink();
+        self.recent.shrink();
+        self.flow.shrink();
     }
 
     pub(super) fn new(
@@ -230,7 +230,7 @@ impl ReplicaActor {
         }
         let committed = require_normal(&self.driver)?.snapshot().committed;
         for voter in 0..3 {
-            if self.configuration.voters()[voter] != self.local {
+            if self.peer(voter) != self.local {
                 self.announce(
                     voter,
                     Commit {
@@ -253,7 +253,7 @@ impl ReplicaActor {
         commit: Commit,
         repeat: bool,
     ) -> Result<(), ActorError> {
-        let to = self.configuration.voters()[voter];
+        let to = self.peer(voter);
         if !repeat && self.work.announced[voter] == Some(commit) {
             return Ok(());
         }
@@ -295,14 +295,9 @@ impl ReplicaActor {
                 .is_some_and(|normal| normal.snapshot().scope == control.scope())
             && self.work.scope == control.scope()
         {
-            let index = self
-                .configuration
-                .voters()
-                .iter()
-                .position(|voter| *voter == from)
-                .ok_or_else(|| {
-                    DriverError::from(ozzy_replication::ReplicationError::UnknownVoter)
-                })?;
+            let index = self.voter_slot(from).ok_or_else(|| {
+                DriverError::from(ozzy_replication::ReplicationError::UnknownVoter)
+            })?;
             // Below the core's applied floor this is only a replay hint. Disk
             // or recent-cache lookup verifies its digest before a specific COMMIT.
             if self.work.cursors[index].is_none_or(|cursor| cursor.op < prefix.op) {

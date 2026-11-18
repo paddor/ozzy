@@ -69,7 +69,7 @@ impl Installer {
     ) -> Result<crate::Manifest, Error> {
         source.committed = import.position;
         source.checkpoint = None;
-        self.journal.interrupted = true;
+        self.journal.run.interrupted = true;
         let (source, digest) = self
             .journal
             .directory

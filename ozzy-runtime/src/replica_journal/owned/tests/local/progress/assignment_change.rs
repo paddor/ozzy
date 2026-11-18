@@ -134,9 +134,7 @@ fn source_handoff_captures_accepted_progress_and_retry_keeps_that_activation_cur
             Policy::LocalDurable,
         )
         .unwrap();
-    let receipt = admit(&mut controller, &mut journal, &mut driver, buffer);
-    write(&mut controller, &mut journal, &mut driver, receipt);
-    sync_apply(&mut controller, &mut journal, &mut driver);
+    commit(&mut controller, &mut journal, &mut driver, buffer);
     let before = driver.snapshot().accepted;
     for initial in [Start::Earliest, Start::Latest, Start::Offset(Offset::ZERO)] {
         let (through, state) = resolved(
@@ -162,9 +160,7 @@ fn source_handoff_rejects_changed_plans_stale_revisions_and_foreign_authority() 
     let (mut journal, mut driver) = initialized(&mut controller, io);
     let request = change(&driver);
     let buffer = prepared(&journal, request);
-    let receipt = admit(&mut controller, &mut journal, &mut driver, buffer);
-    write(&mut controller, &mut journal, &mut driver, receipt);
-    sync_apply(&mut controller, &mut journal, &mut driver);
+    commit(&mut controller, &mut journal, &mut driver, buffer);
     let before = driver.snapshot().accepted;
     for (request, expected) in [
         (
@@ -231,9 +227,7 @@ fn first_source_assignment_resolves_the_creation_selector_and_handoffs_never_res
         ..change(&driver)
     };
     let buffer = prepared(&journal, request);
-    let receipt = admit(&mut controller, &mut journal, &mut driver, buffer);
-    write(&mut controller, &mut journal, &mut driver, receipt);
-    sync_apply(&mut controller, &mut journal, &mut driver);
+    commit(&mut controller, &mut journal, &mut driver, buffer);
     assert_eq!(
         journal.images().unwrap().committed().progress(
             ProgressOwner::ConsumerGroup(request.group),
@@ -250,9 +244,7 @@ fn first_source_assignment_resolves_the_creation_selector_and_handoffs_never_res
         ..request
     };
     let buffer = prepared(&journal, handoff);
-    let receipt = admit(&mut controller, &mut journal, &mut driver, buffer);
-    write(&mut controller, &mut journal, &mut driver, receipt);
-    sync_apply(&mut controller, &mut journal, &mut driver);
+    commit(&mut controller, &mut journal, &mut driver, buffer);
     let state = journal
         .images()
         .unwrap()
@@ -287,9 +279,7 @@ fn first_source_assignment_resolves_the_creation_selector_and_handoffs_never_res
         ..request
     };
     let buffer = prepared(&journal, latest);
-    let receipt = admit(&mut controller, &mut journal, &mut driver, buffer);
-    write(&mut controller, &mut journal, &mut driver, receipt);
-    sync_apply(&mut controller, &mut journal, &mut driver);
+    commit(&mut controller, &mut journal, &mut driver, buffer);
     assert_eq!(
         journal
             .images()
@@ -316,14 +306,10 @@ fn source_assignment_preserves_expired_progress_and_new_groups_start_at_retentio
         )
         .unwrap()
         .unwrap();
-    let receipt = admit(&mut controller, &mut journal, &mut driver, buffer);
-    write(&mut controller, &mut journal, &mut driver, receipt);
-    sync_apply(&mut controller, &mut journal, &mut driver);
+    commit(&mut controller, &mut journal, &mut driver, buffer);
     let request = change(&driver);
     let buffer = prepared(&journal, request);
-    let receipt = admit(&mut controller, &mut journal, &mut driver, buffer);
-    write(&mut controller, &mut journal, &mut driver, receipt);
-    sync_apply(&mut controller, &mut journal, &mut driver);
+    commit(&mut controller, &mut journal, &mut driver, buffer);
     assert_eq!(
         journal
             .images()
@@ -360,9 +346,7 @@ fn source_assignment_preserves_expired_progress_and_new_groups_start_at_retentio
         ..request
     };
     let buffer = prepared(&journal, request);
-    let receipt = admit(&mut controller, &mut journal, &mut driver, buffer);
-    write(&mut controller, &mut journal, &mut driver, receipt);
-    sync_apply(&mut controller, &mut journal, &mut driver);
+    commit(&mut controller, &mut journal, &mut driver, buffer);
     assert_eq!(
         journal
             .images()

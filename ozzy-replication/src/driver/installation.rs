@@ -66,7 +66,7 @@ impl ReplicaDriver {
     pub fn clean_stop(&self) -> Option<CleanStop> {
         let snapshot = self.normal()?.snapshot();
         (snapshot.status == crate::Status::Normal
-            && crate::VoterIndex::primary(snapshot.scope.view) == self.local
+            && self.leads(snapshot.scope.view)
             && !snapshot.journal.faulted
             && snapshot.journal.durable == snapshot.accepted.op)
             .then_some(CleanStop {
@@ -210,7 +210,7 @@ impl ReplicaDriver {
             Ok(installing) => {
                 let ticket = installing.ticket();
                 self.role = Role::Installing(installing);
-                self.election_deadline = self.now.saturating_add(self.election_delay);
+                self.timers.election_deadline = self.now.saturating_add(self.timers.election_delay);
                 // A verified selection or admitted START_VIEW is newer
                 // evidence than a timeout this voter raised before it.
                 // The installation deadline raises suspicion again.
@@ -248,9 +248,10 @@ impl ReplicaDriver {
     pub fn history_progress(&mut self, now: Duration) -> Result<(), DriverError> {
         self.observe_time(now)?;
         if matches!(self.role, Role::ViewChanging(_) | Role::Installing(_)) {
-            self.election_deadline = self
+            self.timers.election_deadline = self
+                .timers
                 .election_deadline
-                .max(now.saturating_add(self.election_delay));
+                .max(now.saturating_add(self.timers.election_delay));
         }
         if let Role::Installing(installing) = &self.role
             && installing.requested_scope() == installing.ticket().scope()
@@ -277,12 +278,8 @@ impl ReplicaDriver {
             InstallOutcome::Normal(normal) => Role::Normal(normal),
             InstallOutcome::ViewChanging(changing) => Role::ViewChanging(changing),
         };
-        self.contact_deadline = now.saturating_add(self.timing.primary_timeout);
-        self.backup_heard_at = now;
-        self.persistence_deadline = now.saturating_add(self.timing.primary_timeout);
-        self.progress_deadline = now.saturating_add(self.progress_timeout());
-        self.election_deadline = now.saturating_add(self.election_delay);
-        self.retry_at = now;
+        self.restart_timeouts(now);
+        self.timers.retry_at = now;
         self.start_pending = changing;
         self.report_pending = changing;
         self.commit_pending = false;
@@ -302,8 +299,8 @@ impl ReplicaDriver {
         self.observe_time(now)?;
         let changing = self.installing_mut()?.complete_abandon(ticket)?;
         self.role = Role::ViewChanging(changing);
-        self.election_deadline = now.saturating_add(self.election_delay);
-        self.retry_at = now;
+        self.timers.election_deadline = now.saturating_add(self.timers.election_delay);
+        self.timers.retry_at = now;
         self.start_pending = true;
         self.report_pending = true;
         self.commit_pending = false;

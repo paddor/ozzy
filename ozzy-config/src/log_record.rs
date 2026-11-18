@@ -3,6 +3,16 @@ use uuid::Uuid;
 
 use crate::ConfigError;
 
+/// The directory below a device root that holds the records and the stores
+/// of runtime logs.
+pub const LOG_DIRECTORY: &str = "logs";
+
+/// The name of log `id` on disk: its store directory below
+/// [`LOG_DIRECTORY`], and the stem of the files beside it.
+pub fn log_label(id: Uuid) -> String {
+    id.simple().to_string()
+}
+
 /// One broker's durable record of a log created at run time. It is written
 /// before the store is formatted and kept after the log is deleted, so a
 /// log ID is formatted at most once on a broker.
@@ -56,6 +66,15 @@ impl LogRecord {
             && self.members == other.members
             && (self.segment_bytes, self.max_append_bytes)
                 == (other.segment_bytes, other.max_append_bytes)
+    }
+
+    /// This record in `state`.
+    #[must_use]
+    pub fn with_state(&self, state: LogState) -> Self {
+        Self {
+            state,
+            ..self.clone()
+        }
     }
 
     /// Encode a checksummed record.

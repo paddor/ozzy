@@ -40,7 +40,7 @@ impl ReplicaActor {
             return Ok(true);
         }
         let end = batch.end().op;
-        let consumed = self.receive_prepare(self.configuration.voters()[voter], batch, now)?;
+        let consumed = self.receive_prepare(self.peer(voter), batch, now)?;
         if publication && !consumed {
             self.work.flow.pending_publication = Some(end);
         }

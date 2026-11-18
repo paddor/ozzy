@@ -136,7 +136,7 @@ impl Journal {
         }
         crate::codec::validate_segment_capacity(capacity)?;
         let mut segment = boundary.active.segment_id;
-        self.interrupted = true;
+        self.run.interrupted = true;
         for _ in 0..max_probes {
             segment = segment
                 .checked_add(1)
@@ -172,8 +172,8 @@ impl Journal {
             self.writer.transfer_buffers_to(&mut writer);
             self.install_selected(next).await?;
             self.writer = writer;
-            self.active_prefix = None;
-            self.interrupted = false;
+            self.run.active_prefix = None;
+            self.run.interrupted = false;
             return Ok(());
         }
         Err(DirectoryError::RollProbeLimit { limit: max_probes })

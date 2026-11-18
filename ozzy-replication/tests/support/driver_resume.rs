@@ -2,40 +2,43 @@
 
 use super::*;
 use ozzy_replication::driver::CleanStop;
-use ozzy_replication::{LogSource, PrepareOk, StartView};
+use ozzy_replication::{InstallTicket, LogSource, PrepareOk, StartView};
 
-/// The disk of a copy that last installed view 4, which node 1 leads, with
-/// one accepted, uncommitted operation.
-fn recovered() -> RecoveredState {
-    RecoveredState {
-        scope: Scope {
-            view: 4,
-            ..configuration().scope()
-        },
-        log: FrozenLog {
-            last_normal_view: 4,
-            accepted: operation().prefix(),
-            committed: Prefix::GENESIS,
-        },
+/// Node 1 restarted on `found`, with evidence that it stopped cleanly with
+/// `committed`.
+fn resumed(found: RecoveredState, committed: Prefix) -> ReplicaDriver {
+    let mut changing = recover(1, found);
+    assert!(changing.resume_primary(JournalGeneration(101), found, committed));
+    restarted(changing)
+}
+
+/// The resumed `primary` installs its own log in the view it led: it
+/// validates `suffix`, if any, and completes with `applied`.
+fn reinstall(
+    primary: &mut ReplicaDriver,
+    suffix: &[PreparedOperation],
+    applied: Prefix,
+    now: Duration,
+) -> InstallTicket {
+    let ticket = primary
+        .begin_rejoin_install(JournalGeneration(102))
+        .unwrap();
+    if !suffix.is_empty() {
+        primary.validate_install_suffix(suffix).unwrap();
     }
+    primary.complete_installation(ticket, applied, now).unwrap();
+    ticket
 }
 
-fn recover(local: u8, recovered: RecoveredState) -> ViewChange {
-    ViewChange::recover_intact(
-        configuration(),
-        node(local),
-        JournalGeneration(101),
-        recovered,
-        PipelineLimits {
-            max_operations: 8,
-            max_body_bytes: 1024,
+/// The recovered disk with [`second`] accepted after the first operation.
+fn recovered_two() -> RecoveredState {
+    RecoveredState {
+        log: FrozenLog {
+            accepted: second().prefix(),
+            ..recovered().log
         },
-    )
-    .unwrap()
-}
-
-fn restarted(changing: ViewChange) -> ReplicaDriver {
-    ReplicaDriver::from_view_change(changing, Duration::ZERO, timing()).unwrap()
+        ..recovered()
+    }
 }
 
 /// With evidence of a clean stop, the restarted primary installs its own
@@ -44,19 +47,11 @@ fn restarted(changing: ViewChange) -> ReplicaDriver {
 #[test]
 fn a_primary_that_stopped_cleanly_resumes_its_view() {
     let now = Duration::from_millis(5);
-    let mut changing = recover(1, recovered());
-    assert!(changing.resume_primary(JournalGeneration(101), recovered(), Prefix::GENESIS));
-    let mut primary = restarted(changing);
+    let mut primary = resumed(recovered(), Prefix::GENESIS);
     assert!(primary.rejoin_pending());
     assert_eq!(primary.poll(now).unwrap(), None, "no promise of view 5");
-    let ticket = primary
-        .begin_rejoin_install(JournalGeneration(102))
-        .unwrap();
+    let ticket = reinstall(&mut primary, &[operation()], Prefix::GENESIS, now);
     assert_eq!(ticket.scope().view, 4);
-    primary.validate_install_suffix(&[operation()]).unwrap();
-    primary
-        .complete_installation(ticket, Prefix::GENESIS, now)
-        .unwrap();
     let normal = primary.normal().unwrap();
     let scope = normal.scope();
     assert_eq!(scope.view, 4);
@@ -157,22 +152,7 @@ fn clean_stop_evidence_needs_a_primary_with_a_durable_log() {
 
 /// The operation after [`operation`].
 fn second() -> PreparedOperation {
-    let body = OperationBody::Barrier(Barrier {
-        operation_id: OperationId::from_bytes([11; 16]),
-    });
-    let bytes = encode_operation_body(&body, OperationLimits::default()).unwrap();
-    PreparedOperation::from_verified(
-        &CanonicalOperation {
-            group_id: configuration().scope().group_id,
-            configuration_epoch: 1,
-            original_view: 0,
-            op_number: 2,
-            previous_digest: operation().prefix().digest,
-            kind: body.kind(),
-            body: &bytes,
-        },
-        canonical_body_digest(&bytes),
-    )
+    barrier(2, 11, operation().prefix().digest)
 }
 
 /// A backup that lacks the end of the resumed primary's log acknowledges
@@ -182,25 +162,9 @@ fn second() -> PreparedOperation {
 #[test]
 fn a_resumed_primary_waits_for_a_backup_that_lacks_the_end_of_its_log() {
     let now = Duration::from_millis(5);
-    let found = RecoveredState {
-        log: FrozenLog {
-            accepted: second().prefix(),
-            ..recovered().log
-        },
-        ..recovered()
-    };
-    let mut changing = recover(1, found);
-    assert!(changing.resume_primary(JournalGeneration(101), found, Prefix::GENESIS));
-    let mut primary = restarted(changing);
-    let ticket = primary
-        .begin_rejoin_install(JournalGeneration(102))
-        .unwrap();
-    primary
-        .validate_install_suffix(&[operation(), second()])
-        .unwrap();
-    primary
-        .complete_installation(ticket, Prefix::GENESIS, now)
-        .unwrap();
+    let mut primary = resumed(recovered_two(), Prefix::GENESIS);
+    let suffix = [operation(), second()];
+    reinstall(&mut primary, &suffix, Prefix::GENESIS, now);
     let scope = primary.normal().unwrap().scope();
     let mut acknowledge = |durable: Prefix| {
         let ack = PrepareOk { scope, durable };
@@ -221,23 +185,9 @@ fn a_resumed_primary_waits_for_a_backup_that_lacks_the_end_of_its_log() {
 #[test]
 fn a_resumed_primary_with_a_committed_log_needs_only_a_backup_in_its_view() {
     let now = Duration::from_millis(5);
-    let found = RecoveredState {
-        log: FrozenLog {
-            accepted: second().prefix(),
-            ..recovered().log
-        },
-        ..recovered()
-    };
-    let mut changing = recover(1, found);
-    assert!(changing.resume_primary(JournalGeneration(101), found, second().prefix()));
-    let mut primary = restarted(changing);
-    let ticket = primary
-        .begin_rejoin_install(JournalGeneration(102))
-        .unwrap();
+    let mut primary = resumed(recovered_two(), second().prefix());
+    let ticket = reinstall(&mut primary, &[], second().prefix(), now);
     assert_eq!(ticket.committed(), second().prefix());
-    primary
-        .complete_installation(ticket, second().prefix(), now)
-        .unwrap();
     let scope = primary.normal().unwrap().scope();
     assert!(primary.begin_activation().is_err(), "no backup yet");
     let ack = PrepareOk {

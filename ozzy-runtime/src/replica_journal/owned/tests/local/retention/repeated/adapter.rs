@@ -24,9 +24,7 @@ fn local_retention_drains_eligible_debt_at_fixed_time_and_confirms_foreground_wo
             &encode_operation_body(&body, journal.limits.operations).unwrap(),
         )
         .unwrap();
-    let receipt = admit(&mut controller, &mut journal, &mut driver, buffer);
-    write(&mut controller, &mut journal, &mut driver, receipt);
-    sync_apply(&mut controller, &mut journal, &mut driver);
+    commit(&mut controller, &mut journal, &mut driver, buffer);
     let before = driver.snapshot().applied;
     let mut actor = LocalActor::new(
         journal,
@@ -105,9 +103,7 @@ fn automatic_retention_reuses_a_checkpoint_without_an_intervening_append() {
             &encode_operation_body(&body, journal.limits.operations).unwrap(),
         )
         .unwrap();
-    let receipt = admit(&mut controller, &mut journal, &mut driver, buffer);
-    write(&mut controller, &mut journal, &mut driver, receipt);
-    sync_apply(&mut controller, &mut journal, &mut driver);
+    commit(&mut controller, &mut journal, &mut driver, buffer);
     let ticket = driver.begin_validation().unwrap();
     let selected = retire(&mut controller, &mut journal, ticket, 92, &[1]);
     let mut adapter = journal

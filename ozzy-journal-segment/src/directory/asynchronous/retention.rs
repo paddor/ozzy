@@ -132,7 +132,7 @@ impl Journal {
             if !seen.insert(id) {
                 return Err(RetentionError::DuplicateSegment.into());
             }
-            leases.push(self.pins.protect_prepared_segment(id)?);
+            leases.push(self.run.pins.protect_prepared_segment(id)?);
             sources.push(crate::directory::sealed_source(
                 self.manifest.identity.group_id,
                 &reference,
@@ -241,7 +241,11 @@ impl Journal {
                 break;
             }
             bytes += capacity;
-            leases.push(self.pins.protect_prepared_segment(reference.segment_id)?);
+            leases.push(
+                self.run
+                    .pins
+                    .protect_prepared_segment(reference.segment_id)?,
+            );
             candidates.push(Candidate::Scan(Box::new(self.group_scope(reference)?)));
         }
         Ok(RetirementScan {

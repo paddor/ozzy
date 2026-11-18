@@ -152,10 +152,8 @@ async fn restart_during_unfinished_recovery_resumes_the_nonvoting_store() {
             .partitions
             .iter()
             .all(|partition| {
-                image
-                    .bytes(&partition.directory.join("CONFIGURATION"), false)
-                    .unwrap()
-                    .starts_with(b"OZYRECOV")
+                let configuration = image.bytes(&partition.directory.join("CONFIGURATION"), false);
+                ozzy_journal_segment::is_recovery_marker(configuration.unwrap())
             }),
         "both donor barriers must keep all target partitions nonvoting"
     );

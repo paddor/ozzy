@@ -120,7 +120,7 @@ impl ReplicaActor {
         predecessor: Prefix,
         end: Prefix,
     ) -> Result<Result<PacketRoute, PacketSend>, ActorError> {
-        let to = self.configuration.voters()[voter];
+        let to = self.peer(voter);
         let Some(session) = self.session(to) else {
             return Ok(Err(PacketSend::Wait));
         };
@@ -192,7 +192,7 @@ impl ReplicaActor {
             packet.part_slice(2).map_or(0, <[u8]>::len) as u64,
         );
         self.outbox
-            .try_enqueue(self.configuration.voters()[voter], SendClass::Data, packet)
+            .try_enqueue(self.peer(voter), SendClass::Data, packet)
             .map_err(|(error, _)| ActorError::Enqueue(error))?;
         Ok(())
     }

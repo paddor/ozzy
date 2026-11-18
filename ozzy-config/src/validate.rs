@@ -226,14 +226,26 @@ fn validate_logs(config: &Deployment) -> Result<(), ConfigError> {
         "logs.max_logs",
         "log count must be nonzero and fit max_partitions beside the topics",
     )?;
+    validate_sizes(
+        (logs.max_append_bytes, "logs.max_append_bytes"),
+        (logs.segment_bytes, "logs.segment_bytes"),
+    )
+}
+
+/// The append bound and segment size of a topic or of the log class, each
+/// with the path a refusal names.
+fn validate_sizes(
+    (max_append_bytes, append_path): (u64, &str),
+    (segment_bytes, segment_path): (u64, &str),
+) -> Result<(), ConfigError> {
     require(
-        logs.max_append_bytes > 0 && logs.max_append_bytes <= MAX_APPEND_BYTES,
-        "logs.max_append_bytes",
+        max_append_bytes > 0 && max_append_bytes <= MAX_APPEND_BYTES,
+        append_path,
         "max_append_bytes must be at most 8 MiB",
     )?;
     require(
-        logs.segment_fits(logs.segment_bytes),
-        "logs.segment_bytes",
+        crate::schema::segment_fits(segment_bytes, max_append_bytes),
+        segment_path,
         "segment must be aligned and leave framing space beyond max_append_bytes",
     )
 }
@@ -252,17 +264,9 @@ fn validate_topics(config: &Deployment, ids: &mut BTreeSet<Uuid>) -> Result<(), 
             &path,
             "partition count must be nonzero and fit aggregate max_partitions",
         )?;
-        require(
-            topic.max_append_bytes > 0 && topic.max_append_bytes <= MAX_APPEND_BYTES,
-            &path,
-            "max_append_bytes must be at most 8 MiB",
-        )?;
-        require(
-            topic.segment_bytes >= 1024 * 1024
-                && topic.segment_bytes % 4096 == 0
-                && topic.max_append_bytes <= topic.segment_bytes / 2,
-            &path,
-            "segment must be aligned and leave framing space beyond max_append_bytes",
+        validate_sizes(
+            (topic.max_append_bytes, &path),
+            (topic.segment_bytes, &path),
         )?;
         require(
             topic

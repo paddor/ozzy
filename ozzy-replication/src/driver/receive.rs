@@ -86,19 +86,12 @@ impl ReplicaDriver {
     /// primary collects acknowledgments and election reports.
     fn check_role(&self, voter: VoterIndex, message: Control) -> Result<(), DriverError> {
         let primary = VoterIndex::primary(message.scope().view);
-        match message {
-            Control::Commit(_) | Control::Rest { .. } | Control::StartView(_)
-                if voter != primary =>
-            {
-                Err(ReplicationError::WrongRole.into())
-            }
-            Control::PrepareOk { .. } | Control::RestOk { .. } | Control::DoViewChange(_)
-                if self.local != primary =>
-            {
-                Err(ReplicationError::WrongRole.into())
-            }
-            _ => Ok(()),
+        let announces = message.commit().is_some() || matches!(message, Control::StartView(_));
+        let reports = message.ack().is_some() || matches!(message, Control::DoViewChange(_));
+        if (announces && voter != primary) || (reports && !self.leads(message.scope().view)) {
+            return Err(ReplicationError::WrongRole.into());
         }
+        Ok(())
     }
 
     /// Apply a current-view commit, acknowledgment, or installed view to the
@@ -115,28 +108,25 @@ impl ReplicaDriver {
         };
         let committed = normal.snapshot().committed;
         let mut behind = false;
-        match message {
-            Control::Commit(commit) | Control::Rest { commit, .. } => {
-                match normal.receive_commit(from, commit) {
-                    Ok(()) => {}
-                    // A backup behind the commit cannot check it yet, and the
-                    // caller retries it after catch-up. Its primary still
-                    // spoke, so a backup kept behind by a slow uplink does
-                    // not suspect a primary it hears.
-                    Err(ReplicationError::HistoryGap) => behind = true,
-                    Err(error) => return Err(error.into()),
-                }
-                self.contact_deadline = now.saturating_add(self.timing.primary_timeout);
+        if let Some(commit) = message.commit() {
+            match normal.receive_commit(from, commit) {
+                Ok(()) => {}
+                // A backup behind the commit cannot check it yet, and the
+                // caller retries it after catch-up. Its primary still
+                // spoke, so a backup kept behind by a slow uplink does
+                // not suspect a primary it hears.
+                Err(ReplicationError::HistoryGap) => behind = true,
+                Err(error) => return Err(error.into()),
             }
-            Control::PrepareOk { ack, .. } | Control::RestOk { ack, .. } => {
-                normal.receive_ack(from, ack)?;
-                self.backup_heard_at = now;
-            }
-            Control::StartView(start) => {
-                normal.observe_installed_start(from, start)?;
-                self.contact_deadline = now.saturating_add(self.timing.primary_timeout);
-            }
-            _ => return Ok(()),
+            self.timers.contact_deadline = now.saturating_add(self.timing.primary_timeout);
+        } else if let Some(ack) = message.ack() {
+            normal.receive_ack(from, ack)?;
+            self.timers.backup_heard_at = now;
+        } else if let Control::StartView(start) = message {
+            normal.observe_installed_start(from, start)?;
+            self.timers.contact_deadline = now.saturating_add(self.timing.primary_timeout);
+        } else {
+            return Ok(());
         }
         if let Some(prefix) = message.acknowledged()
             && let Some(start) = normal.start_view()?
@@ -148,7 +138,7 @@ impl ReplicaDriver {
             self.activation_pending.insert(voter);
         }
         if normal.snapshot().committed != committed {
-            self.progress_deadline = now.saturating_add(self.progress_timeout());
+            self.timers.progress_deadline = now.saturating_add(self.progress_timeout());
         }
         if behind {
             return Err(ReplicationError::HistoryGap.into());
@@ -191,14 +181,14 @@ impl ReplicaDriver {
             && previous.accepted == previous.committed
             && previous.ready_for_appends
         {
-            self.progress_deadline = now.saturating_add(self.timing.primary_timeout);
+            self.timers.progress_deadline = now.saturating_add(self.timing.primary_timeout);
         }
         if normal.snapshot().accepted != previous.accepted
             && previous.accepted.op == previous.journal.durable
         {
-            self.persistence_deadline = now.saturating_add(self.timing.primary_timeout);
+            self.timers.persistence_deadline = now.saturating_add(self.timing.primary_timeout);
         }
-        self.contact_deadline = now.saturating_add(self.timing.primary_timeout);
+        self.timers.contact_deadline = now.saturating_add(self.timing.primary_timeout);
         Ok(admitted)
     }
 }

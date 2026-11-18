@@ -17,6 +17,19 @@ use uuid::Uuid;
 
 use crate::{ActorSettings, CheckedConfig, StartupError};
 
+/// A generation for one open of a journal, later than every earlier one.
+pub(crate) fn generation() -> JournalGeneration {
+    JournalGeneration(Uuid::now_v7().as_u128())
+}
+
+/// The generations of one nonvoting recovery.
+pub(crate) fn recovery_generations() -> ozzy_runtime::replica_journal::OwnedRecoveryGenerations {
+    ozzy_runtime::replica_journal::OwnedRecoveryGenerations {
+        attempt: generation(),
+        temporary: generation(),
+    }
+}
+
 /// Fully checked construction inputs. No files, worker threads or runtime state.
 #[derive(Debug, Clone)]
 pub struct JournalPlan {

@@ -2,9 +2,9 @@
 //! real files, through `provision_replacement`, with peers that keep the
 //! origin of its stores.
 
-use super::provision::{built_with, joined, local_identity, provisioned};
+use super::provision::{built_with, joined, local_identity, peer_record, provisioned};
 use super::*;
-use ozzy_broker::log::{Log, LogRecord, LogRole};
+use ozzy_broker::log::LogRecord;
 use ozzy_broker::{LogSpec, provision_replacement};
 use ozzy_proto::{GroupId, Offset, PartitionIncarnation};
 
@@ -19,55 +19,33 @@ fn record(id: u8) -> LogRecord {
 
 /// The copy that leads the log, once one does, with its view and end.
 async fn leader(brokers: &[&Broker]) -> (Log, u64, u64) {
-    tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            for broker in brokers {
-                let Some(log) = broker.runtime_log(ID) else {
-                    continue;
-                };
-                let status = *log.status().borrow();
-                if status.role == LogRole::Leader {
-                    return (log, status.view, status.committed_end.get());
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+    let leading = || {
+        let logs = brokers.iter().filter_map(|broker| broker.runtime_log(ID));
+        logs.map(|log| (*log.status().borrow(), log))
+            .find(|(status, _)| status.role == LogRole::Leader)
+    };
+    let mut found = None;
+    eventually("the log gets a leader", || {
+        found = leading();
+        found.is_some()
     })
-    .await
-    .expect("the log gets a leader")
+    .await;
+    let (status, log) = found.unwrap();
+    (log, status.view, status.committed_end.get())
 }
 
 /// Wait until `broker`'s copy of the log votes.
-async fn votes(broker: &Broker) {
-    tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            let role = broker.runtime_log(ID).map(|log| log.status().borrow().role);
-            if matches!(role, Some(LogRole::Leader | LogRole::Follower)) {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("the copy votes");
+async fn voting(broker: &Broker) {
+    eventually("the copy votes", || votes(broker.runtime_log(ID))).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn an_emptied_broker_comes_back_as_a_replacement() {
     let root = tempfile::tempdir().unwrap();
     let runtime = WriterRuntime::new().unwrap();
-    let class = ozzy_config::LogClass {
-        segment_bytes: 2 * 1024 * 1024,
-        max_append_bytes: 256 * 1024,
-        max_logs: 4,
-    };
+    let class = log_class(2 * 1024 * 1024, 256 * 1024, 4);
     let deployment = built_with(root.path(), DeploymentMode::Three, 9, Some(class));
-    let start = async |checked, local| {
-        let context = runtime.context().clone();
-        Broker::start_trusted_with_context(checked, local, context)
-            .await
-            .unwrap()
-    };
+    let start = async |checked, local| start_broker(&runtime, checked, local).await;
     let mut brokers = Vec::new();
     for index in 0..3 {
         let (checked, local) = provisioned(&deployment, root.path(), index).await.unwrap();
@@ -113,15 +91,11 @@ async fn an_emptied_broker_comes_back_as_a_replacement() {
     // Its peers take the new origin, and its copies take their logs.
     joined(&replacement).await;
     for index in 0..2 {
-        let path = root.path().join(format!("broker-{index}/data/OZZY_PEERS"));
-        let record = ozzy_config::PeerRecord::decode(&std::fs::read_to_string(path).unwrap());
-        assert_eq!(
-            record.unwrap().origins[&identity.brokers["broker-2"]],
-            origin
-        );
+        let record = peer_record(root.path(), index);
+        assert_eq!(record.origins[&identity.brokers["broker-2"]], origin);
     }
     replacement.create_log(stream.clone()).await.unwrap();
-    votes(&replacement).await;
+    voting(&replacement).await;
     replacement.end_replacement().unwrap();
     assert!(!replacement.replacing() && !marker.exists());
 
@@ -132,7 +106,7 @@ async fn an_emptied_broker_comes_back_as_a_replacement() {
     assert_eq!(local.origin(), origin);
     let replacement = start(checked, local).await;
     assert!(!replacement.replacing());
-    votes(&replacement).await;
+    voting(&replacement).await;
     brokers.pop().unwrap().shutdown().await.unwrap();
     let (log, view, committed) = leader(&[&brokers[0], &replacement]).await;
     assert!(committed >= end, "the log lost records: {committed} {end}");

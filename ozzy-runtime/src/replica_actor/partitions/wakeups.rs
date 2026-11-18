@@ -31,13 +31,22 @@ struct Visit {
     more: bool,
 }
 
+/// One partition's marks, at its slot.
+#[derive(Debug)]
+struct Mark {
+    woken: Arc<Woken>,
+    waker: Waker,
+    /// The partition's mark number, fixed while it lives in the shard.
+    id: usize,
+    /// The partition's next timer, as of its last visit.
+    deadline: Option<Duration>,
+}
+
 #[derive(Debug)]
 pub(super) struct Wakeups {
     ready: Arc<Ready>,
-    woken: Vec<Arc<Woken>>,
-    wakers: Vec<Waker>,
-    /// Each partition's mark number, fixed while it lives in the shard.
-    ids: Vec<usize>,
+    /// Each partition's marks, by slot.
+    marks: Vec<Mark>,
     /// The slot of each mark number in use.
     slots: Vec<Option<usize>>,
     free: Vec<usize>,
@@ -45,9 +54,7 @@ pub(super) struct Wakeups {
     pending: Bits,
     /// The mark number a turn looks for first.
     first: usize,
-    /// Each partition's next timer, as of its last visit.
-    deadlines: Vec<Option<Duration>>,
-    /// The same timers by mark number, earliest first.
+    /// The partitions' timers by mark number, earliest first.
     timers: BTreeSet<(Duration, usize)>,
     /// Mark numbers of partitions whose role suspected stalled storage at
     /// its last visit. The lane completing a job, for any partition, ends
@@ -67,28 +74,25 @@ pub(super) struct Wakeups {
 impl Wakeups {
     fn new(slots: usize, capacity: usize, sweep: Duration) -> Self {
         let capacity = capacity.max(slots);
-        let ready = Arc::new(Ready::new(capacity));
-        let woken: Vec<_> = (0..slots)
-            .map(|id| Arc::new(Woken::new(ready.clone(), id)))
-            .collect();
-        Self {
-            wakers: woken.iter().cloned().map(Waker::from).collect(),
-            ids: (0..slots).collect(),
-            slots: (0..capacity).map(|id| (id < slots).then_some(id)).collect(),
-            free: (slots..capacity).rev().collect(),
+        let mut wakeups = Self {
+            ready: Arc::new(Ready::new(capacity)),
+            marks: Vec::with_capacity(slots),
+            slots: vec![None; capacity],
+            free: (0..capacity).rev().collect(),
             pending: Bits::new(capacity),
             first: 0,
-            deadlines: vec![None; slots],
             timers: BTreeSet::new(),
             stalled: BTreeSet::new(),
-            woken,
-            ready,
             sweep,
             swept: None,
             cursor: 0,
             missed: 0,
             deferred: false,
+        };
+        for _ in 0..slots {
+            wakeups.grow();
         }
+        wakeups
     }
 
     /// No mark number is left for one more partition.
@@ -102,11 +106,13 @@ impl Wakeups {
             return;
         };
         let woken = Arc::new(Woken::new(self.ready.clone(), id));
-        self.wakers.push(Waker::from(woken.clone()));
-        self.woken.push(woken);
-        self.slots[id] = Some(self.ids.len());
-        self.ids.push(id);
-        self.deadlines.push(None);
+        self.slots[id] = Some(self.marks.len());
+        self.marks.push(Mark {
+            waker: Waker::from(woken.clone()),
+            woken,
+            id,
+            deadline: None,
+        });
         self.ready.wake();
     }
 
@@ -115,19 +121,23 @@ impl Wakeups {
     /// partition that fires later marks a number nobody holds, or its next
     /// holder, which then gets one visit for nothing.
     pub(super) fn swap_remove(&mut self, slot: usize) {
-        let id = self.ids.swap_remove(slot);
-        if let Some(deadline) = self.deadlines.swap_remove(slot) {
+        let Mark { id, deadline, .. } = self.marks.swap_remove(slot);
+        if let Some(deadline) = deadline {
             self.timers.remove(&(deadline, id));
         }
         self.stalled.remove(&id);
         self.pending.clear(id);
         self.slots[id] = None;
         self.free.push(id);
-        self.woken.swap_remove(slot);
-        self.wakers.swap_remove(slot);
-        if let Some(&moved) = self.ids.get(slot) {
-            self.slots[moved] = Some(slot);
+        if let Some(moved) = self.marks.get(slot) {
+            self.slots[moved.id] = Some(slot);
         }
+    }
+
+    /// When the next safety sweep is due.
+    fn sweep_due(&self) -> Duration {
+        self.swept
+            .map_or(Duration::ZERO, |swept| swept.saturating_add(self.sweep))
     }
 
     /// Gather what calls for a visit: marks set since the last turn and
@@ -140,7 +150,7 @@ impl Wakeups {
             }
             self.timers.pop_first();
             if let Some(slot) = self.slots[id] {
-                self.deadlines[slot] = None;
+                self.marks[slot].deadline = None;
             }
             self.pending.set(id);
         }
@@ -155,24 +165,26 @@ impl Wakeups {
 
     /// Something other than the sweep already calls for a visit.
     fn marked(&self, slot: usize) -> bool {
-        self.pending.test(self.ids[slot]) || self.woken[slot].is_set()
+        let mark = &self.marks[slot];
+        self.pending.test(mark.id) || mark.woken.is_set()
     }
 
     /// Keep what a visit of `slot` left: a refused send to retry at the
     /// next turn, the next timer, and whether the role waits for storage.
     fn record(&mut self, slot: usize, refused: bool, deadline: Option<Duration>, stalled: bool) {
-        let id = self.ids[slot];
+        let mark = &mut self.marks[slot];
+        let id = mark.id;
         if refused {
-            self.woken[slot].keep();
+            mark.woken.keep();
         }
-        if self.deadlines[slot] != deadline {
-            if let Some(old) = self.deadlines[slot] {
+        if mark.deadline != deadline {
+            if let Some(old) = mark.deadline {
                 self.timers.remove(&(old, id));
             }
             if let Some(new) = deadline {
                 self.timers.insert((new, id));
             }
-            self.deadlines[slot] = deadline;
+            mark.deadline = deadline;
         }
         if stalled {
             self.stalled.insert(id);
@@ -193,7 +205,7 @@ impl PartitionActors {
             return Err(PartitionError::Limits);
         }
         self.wakeups = Some(Box::new(Wakeups::new(
-            self.actors.len(),
+            self.slots.len(),
             self.maximum,
             sweep,
         )));
@@ -211,9 +223,7 @@ impl PartitionActors {
     /// where the caller polls on its own schedule.
     pub fn next_deadline(&self) -> Option<Duration> {
         let wakeups = self.wakeups.as_ref()?;
-        let sweep = wakeups
-            .swept
-            .map_or(Duration::ZERO, |swept| swept.saturating_add(wakeups.sweep));
+        let sweep = wakeups.sweep_due();
         let timer = wakeups.timers.first().map(|&(deadline, _)| deadline);
         Some(
             timer
@@ -236,7 +246,7 @@ impl PartitionActors {
     /// after a change none of them registered, such as the clock guard
     /// resuming. Without wakeups every poll visits every partition anyway.
     pub fn wake_all(&self) {
-        for slot in 0..self.actors.len() {
+        for slot in 0..self.slots.len() {
             self.touch(slot);
         }
     }
@@ -245,8 +255,8 @@ impl PartitionActors {
     /// the shard to visit it unless a poll is already due.
     pub(super) fn touch(&self, slot: usize) {
         match &self.wakeups {
-            Some(wakeups) if wakeups.deferred => wakeups.woken[slot].keep(),
-            Some(wakeups) => wakeups.wakers[slot].wake_by_ref(),
+            Some(wakeups) if wakeups.deferred => wakeups.marks[slot].woken.keep(),
+            Some(wakeups) => wakeups.marks[slot].waker.wake_by_ref(),
             None => {}
         }
     }
@@ -328,14 +338,11 @@ impl PartitionActors {
         now: Duration,
         try_send: &mut impl FnMut(&mut Context<'_>, Message) -> Result<(), TrySendError>,
     ) -> Result<bool, PartitionError> {
-        if wakeups
-            .swept
-            .is_some_and(|swept| now < swept.saturating_add(wakeups.sweep))
-        {
+        if now < wakeups.sweep_due() {
             return Ok(false);
         }
         wakeups.swept = Some(now);
-        let count = self.actors.len();
+        let count = self.slots.len();
         let mut again = false;
         for _ in 0..self.turn_actors.min(count) {
             let slot = wakeups.cursor % count;
@@ -367,7 +374,7 @@ impl PartitionActors {
     }
 
     fn storage_moved(&self, slot: usize) -> bool {
-        self.actors[slot].storage_moved() == Some(true)
+        self.slots[slot].actor.storage_moved() == Some(true)
     }
 
     /// Visit a partition under its own waker, then record its next timer.
@@ -383,14 +390,14 @@ impl PartitionActors {
         try_send: &mut impl FnMut(&mut Context<'_>, Message) -> Result<(), TrySendError>,
     ) -> Result<Visit, PartitionError> {
         let mut refused = false;
-        let mut partition = Context::from_waker(&wakeups.wakers[slot]);
-        let visiting = Visiting::enter(&wakeups.woken[slot]);
+        let mut partition = Context::from_waker(&wakeups.marks[slot].waker);
+        let visiting = Visiting::enter(&wakeups.marks[slot].woken);
         let mut visited = Ok(Visit {
             progressed: false,
             more: false,
         });
         for _ in 0..VISIT_ROUNDS {
-            wakeups.woken[slot].take();
+            wakeups.marks[slot].woken.take();
             let round = self.visit(slot, &mut partition, now, &mut |cx, message| {
                 let sent = try_send(cx, message);
                 refused |= matches!(sent, Err(TrySendError::Full(_)));
@@ -400,7 +407,7 @@ impl PartitionActors {
                 let progress = round?;
                 Ok(Visit {
                     progressed: visit.progressed || progress,
-                    more: progress || wakeups.woken[slot].is_set(),
+                    more: progress || wakeups.marks[slot].woken.is_set(),
                 })
             });
             if !visited.as_ref().is_ok_and(|visit| visit.more) {
@@ -410,21 +417,22 @@ impl PartitionActors {
         drop(visiting);
         // Progress can leave more to observe in the same partition.
         if visited.as_ref().is_ok_and(|visit| visit.more) {
-            wakeups.woken[slot].keep();
+            wakeups.marks[slot].woken.keep();
         }
         let deadline = self.slot_deadline(slot, now);
-        let stalled = self.actors[slot].storage_moved().is_some();
+        let stalled = self.slots[slot].actor.storage_moved().is_some();
         wakeups.record(slot, refused, deadline, stalled);
         visited
     }
 
     /// The partition actor's timers and its group coordinator's.
     fn slot_deadline(&self, slot: usize, now: Duration) -> Option<Duration> {
-        let coordinator = self.coordinators[slot]
+        let coordinator = self.slots[slot]
+            .coordinator
             .as_ref()
             .and_then(|service| service.coordinator.next_deadline(now));
         Earliest::after(now)
-            .at(self.actors[slot].next_deadline(now))
+            .at(self.slots[slot].actor.next_deadline(now))
             .at(coordinator)
             .get()
     }
@@ -434,6 +442,11 @@ impl PartitionActors {
 mod tests {
     use super::Wakeups;
     use std::time::Duration;
+
+    /// Each slot's mark number.
+    fn ids(wakeups: &Wakeups) -> Vec<usize> {
+        wakeups.marks.iter().map(|mark| mark.id).collect()
+    }
 
     const fn at(millis: u64) -> Duration {
         Duration::from_millis(millis)
@@ -462,7 +475,8 @@ mod tests {
         assert_eq!(pending(&mut wakeups), [] as [usize; 0]);
         wakeups.collect(at(30));
         assert_eq!(pending(&mut wakeups), [0]);
-        assert_eq!(wakeups.deadlines, [None, Some(at(40)), None]);
+        let deadlines: Vec<_> = wakeups.marks.iter().map(|mark| mark.deadline).collect();
+        assert_eq!(deadlines, [None, Some(at(40)), None]);
         assert_eq!(wakeups.timers.first(), Some(&(at(40), 1)));
     }
 
@@ -471,11 +485,11 @@ mod tests {
         let mut wakeups = Wakeups::new(3, 3, at(100));
         wakeups.collect(at(0));
         pending(&mut wakeups);
-        for woken in &wakeups.woken {
-            woken.take();
+        for mark in &wakeups.marks {
+            mark.woken.take();
         }
         wakeups.record(2, true, None, false);
-        wakeups.wakers[0].wake_by_ref();
+        wakeups.marks[0].waker.wake_by_ref();
         assert!(wakeups.marked(0) && !wakeups.marked(1) && wakeups.marked(2));
         wakeups.collect(at(0));
         assert_eq!(pending(&mut wakeups), [0, 2]);
@@ -489,10 +503,10 @@ mod tests {
         pending(&mut wakeups);
         wakeups.record(0, false, Some(at(10)), true);
         wakeups.record(2, false, Some(at(20)), true);
-        let gone = wakeups.wakers[0].clone();
+        let gone = wakeups.marks[0].waker.clone();
         wakeups.swap_remove(0);
         // The last partition took slot 0 with its number, timer and stall.
-        assert_eq!(wakeups.ids, [2, 1]);
+        assert_eq!(ids(&wakeups), [2, 1]);
         assert_eq!(wakeups.slots, [None, Some(1), Some(0)]);
         assert_eq!(wakeups.timers.iter().collect::<Vec<_>>(), [&(at(20), 2)]);
         assert_eq!(wakeups.stalled.iter().collect::<Vec<_>>(), [&2]);
@@ -504,7 +518,7 @@ mod tests {
         // The next partition takes the free number and starts marked.
         assert!(!wakeups.full());
         wakeups.grow();
-        assert_eq!(wakeups.ids, [2, 1, 0]);
+        assert_eq!(ids(&wakeups), [2, 1, 0]);
         wakeups.collect(at(0));
         assert_eq!(pending(&mut wakeups), [0]);
         assert_eq!(wakeups.rotate(), 1);

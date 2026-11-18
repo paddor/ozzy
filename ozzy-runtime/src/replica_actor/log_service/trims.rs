@@ -1,9 +1,9 @@
 //! The owner's trim: check the floor it expects, propose the `Trim` on the
 //! log's lane, and publish the new floor once it commits.
 
-use super::{LogService, Term};
-use crate::log::{LogRole, LogStatus, TrimError, TrimRequest};
-use crate::replica_actor::{PartitionActor, PendingProposal, ProposalOutcome};
+use super::{LogService, Term, settle};
+use crate::log::{LogStatus, TrimError, TrimRequest};
+use crate::replica_actor::{PartitionActor, PendingProposal, response};
 use crate::replica_journal::{AppendAdmissionError, JournalError};
 use ozzy_core::state::{CanonicalImagesError, StateError};
 use ozzy_journal::operation::Trim;
@@ -44,19 +44,10 @@ impl LogService {
         actor: &PartitionActor,
         request: &TrimRequest,
     ) -> Poll<Result<(Term, Trim), TrimError>> {
-        let term = match self.term {
-            Some(term) if term.scope.view == request.view => term,
-            Some(term) => {
-                return Poll::Ready(Err(TrimError::View {
-                    named: request.view,
-                    current: term.scope.view,
-                }));
-            }
-            None => return Poll::Ready(Err(TrimError::NotLeader)),
+        let term = match self.admitting(request.view) {
+            Ok(term) => term,
+            Err(fenced) => return Poll::Ready(Err(fenced.into())),
         };
-        if self.stepping.is_some() || self.port.published().role == LogRole::Doubt {
-            return Poll::Ready(Err(TrimError::NotLeader));
-        }
         if self.trim.is_some() {
             return Poll::Pending;
         }
@@ -107,29 +98,21 @@ impl LogService {
             return Some(request);
         };
         if buffer
-            .prepare_owner_trim(term.authority(), trim, lane.operations)
+            .prepare_owner_trim(response::authority(term.scope), trim, lane.operations)
             .is_err()
         {
-            buffer.clear();
-            lane.arenas.push(buffer);
+            lane.recycle(buffer);
             return refuse(request, TrimError::Invalid);
         }
-        match lane.submitter.try_submit(buffer) {
-            Ok(pending) => {
-                self.trim = Some(TrimFlight {
-                    pending: Box::pin(pending),
-                    reply: request.reply,
-                    floor: request.floor,
-                });
-                None
-            }
-            Err(unsubmitted) => {
-                let mut buffer = unsubmitted.buffer;
-                buffer.clear();
-                lane.arenas.push(buffer);
-                refuse(request, TrimError::NotLeader)
-            }
-        }
+        let Some(pending) = lane.submit(buffer) else {
+            return refuse(request, TrimError::NotLeader);
+        };
+        self.trim = Some(TrimFlight {
+            pending: Box::pin(pending),
+            reply: request.reply,
+            floor: request.floor,
+        });
+        None
     }
 
     /// Answer the trim once its outcome is known and reuse its arena.
@@ -147,12 +130,7 @@ impl LogService {
             flight.unknown();
             return true;
         };
-        let answer = match reply.outcome {
-            ProposalOutcome::Committed { .. } => Ok(()),
-            ProposalOutcome::NotAdmitted => Err(TrimError::NotLeader),
-            ProposalOutcome::Unknown => Err(TrimError::Unknown),
-            ProposalOutcome::Invalid(error) => Err(refusal(&error)),
-        };
+        let answer = settle(reply.outcome, TrimError::Unknown, refusal);
         if answer.is_ok() {
             let published = self.port.published();
             if published.lead.is_some() && flight.floor > published.retained_from {
@@ -164,9 +142,7 @@ impl LogService {
         }
         let _ = flight.reply.send(answer);
         if let Some(lane) = &mut self.lane {
-            let mut buffer = reply.buffer;
-            buffer.clear();
-            lane.arenas.push(buffer);
+            lane.recycle(reply.buffer);
         }
         true
     }

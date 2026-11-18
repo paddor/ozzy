@@ -21,6 +21,25 @@ pub struct ShardEpoch {
     pub epoch: u64,
 }
 
+impl ShardEpoch {
+    /// The wire form: the number, then the epoch, both big-endian.
+    pub const fn to_bytes(self) -> [u8; SHARD_BYTES] {
+        let mut bytes = [0; SHARD_BYTES];
+        let (shard, epoch) = bytes.split_at_mut(4);
+        shard.copy_from_slice(&self.shard.to_be_bytes());
+        epoch.copy_from_slice(&self.epoch.to_be_bytes());
+        bytes
+    }
+
+    /// Read the wire form back.
+    pub const fn from_bytes([a, b, c, d, epoch @ ..]: [u8; SHARD_BYTES]) -> Self {
+        Self {
+            shard: u32::from_be_bytes([a, b, c, d]),
+            epoch: u64::from_be_bytes(epoch),
+        }
+    }
+}
+
 /// Encode one uncorrelated, payload-free beat into `metadata`, which is
 /// cleared first.
 pub fn encode(
@@ -36,8 +55,7 @@ pub fn encode(
     let header = envelope.encode_header(shards.len().saturating_mul(SHARD_BYTES), 0, limits)?;
     metadata.clear();
     for shard in shards {
-        metadata.extend_from_slice(&shard.shard.to_be_bytes());
-        metadata.extend_from_slice(&shard.epoch.to_be_bytes());
+        metadata.extend_from_slice(&shard.to_bytes());
     }
     Ok(header)
 }
@@ -58,10 +76,7 @@ pub fn decode(
         return Err(CodecError::Length);
     }
     let (shards, _) = packet.metadata.as_chunks::<SHARD_BYTES>();
-    Ok(shards.iter().map(|&[a, b, c, d, epoch @ ..]| ShardEpoch {
-        shard: u32::from_be_bytes([a, b, c, d]),
-        epoch: u64::from_be_bytes(epoch),
-    }))
+    Ok(shards.iter().copied().map(ShardEpoch::from_bytes))
 }
 
 fn check(envelope: Envelope) -> Result<(), CodecError> {

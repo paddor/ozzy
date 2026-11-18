@@ -20,7 +20,7 @@ pub struct Receiver {
 impl Receiver {
     /// Give the unused part of the reserved window back. It grows again as
     /// operations arrive. For a replica that expects to stay idle.
-    pub fn trim(&mut self) {
+    pub fn shrink(&mut self) {
         self.retained.shrink_to_fit();
     }
 

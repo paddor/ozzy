@@ -80,6 +80,7 @@ impl Journal {
             self.sealed_record_source(id)?
         };
         let lease = self
+            .run
             .pins
             .protect_prepared_segment(id)
             .map_err(DirectoryError::from)?;

@@ -111,6 +111,30 @@ fn write(
     }
 }
 
+/// Admit `buffer`, write it, then sync and apply it.
+fn commit(
+    controller: &mut Controller,
+    journal: &mut OwnedJournal,
+    driver: &mut Driver,
+    buffer: ProposalBuffer,
+) {
+    let receipt = admit(controller, journal, driver, buffer);
+    write(controller, journal, driver, receipt);
+    sync_apply(controller, journal, driver);
+}
+
+/// Commit one encoded operation body.
+fn commit_body(
+    controller: &mut Controller,
+    journal: &mut OwnedJournal,
+    driver: &mut Driver,
+    body: &(ozzy_journal::operation::OperationKind, Vec<u8>),
+) {
+    let mut buffer = journal.lease_proposal_buffer().unwrap();
+    buffer.push(body.0, &body.1).unwrap();
+    commit(controller, journal, driver, buffer);
+}
+
 fn sync_apply(controller: &mut Controller, journal: &mut OwnedJournal, driver: &mut Driver) {
     let ticket = driver.begin_sync().unwrap();
     let work = journal.begin_sync(ticket).unwrap();
@@ -188,9 +212,7 @@ fn initialize_partition(
             )
             .unwrap();
     }
-    let receipt = admit(controller, journal, driver, buffer);
-    write(controller, journal, driver, receipt);
-    sync_apply(controller, journal, driver);
+    commit(controller, journal, driver, buffer);
     ready_spare(controller, journal);
 }
 

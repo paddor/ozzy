@@ -280,17 +280,13 @@ impl Cluster {
         // Device loss can first be observed during journal shutdown. It must
         // not prevent socket and worker cleanup or reactivate an old source.
         let _ = self.brokers.remove(index).shutdown().await;
-        let control = self.controls.remove(index);
-        let image = self.images.remove(index).await.unwrap();
-        self.retired_physical_events += control.physical_events();
-        self.stopped.insert(index, control);
+        let image = self.retire(index).await;
         self.restore(index, image).await;
     }
 
-    /// Stop one owner and retain its image. Remove higher indexes first when
-    /// stopping several brokers, and restore them in increasing index order.
-    pub async fn stop(&mut self, index: usize) -> Image {
-        self.brokers.remove(index).shutdown().await.unwrap();
+    /// Take the device control and image of a broker that shut down, and
+    /// keep the control with the stopped ones.
+    async fn retire(&mut self, index: usize) -> Image {
         let control = self.controls.remove(index);
         let image = self.images.remove(index).await.unwrap();
         self.retired_physical_events += control.physical_events();
@@ -298,11 +294,23 @@ impl Cluster {
         image
     }
 
-    /// Replace one store with a newly formatted, nonvoting recovery target.
-    pub async fn restart_fresh(&mut self, index: usize) {
+    /// Stop one broker and provision newly formatted stores for it.
+    async fn stop_fresh(&mut self, index: usize) -> Image {
         self.stop(index).await;
         let (checked, local) = &self.configs[index];
-        let image = Box::pin(provision_sized(checked, local, true, self.memory_limits)).await;
+        Box::pin(provision_sized(checked, local, true, self.memory_limits)).await
+    }
+
+    /// Stop one owner and retain its image. Remove higher indexes first when
+    /// stopping several brokers, and restore them in increasing index order.
+    pub async fn stop(&mut self, index: usize) -> Image {
+        self.brokers.remove(index).shutdown().await.unwrap();
+        self.retire(index).await
+    }
+
+    /// Replace one store with a newly formatted, nonvoting recovery target.
+    pub async fn restart_fresh(&mut self, index: usize) {
+        let image = self.stop_fresh(index).await;
         self.restore(index, image).await;
     }
 
@@ -328,9 +336,8 @@ impl Cluster {
     /// partitions nonvoting, and every runtime log it is told to create a
     /// nonvoting copy.
     pub async fn replace(&mut self, index: usize) {
-        self.stop(index).await;
-        let (checked, local) = &self.configs[index];
-        let image = Box::pin(provision_sized(checked, local, true, self.memory_limits)).await;
+        let image = self.stop_fresh(index).await;
+        let checked = &self.configs[index].0;
         let selections: Vec<_> = (checked.plan.partitions.iter())
             .map(|partition| RecoverySelection {
                 topic: partition.topic.clone(),
@@ -392,10 +399,7 @@ impl Cluster {
                 .is_err()
         );
         assert!(failed.shutdown().await.is_err());
-        let control = self.controls.remove(index);
-        let image = self.images.remove(index).await.unwrap();
-        self.retired_physical_events += control.physical_events();
-        self.stopped.insert(index, control);
+        let image = self.retire(index).await;
         live_many(
             &self.brokers,
             "confirm with torn writer fenced",

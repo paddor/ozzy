@@ -519,7 +519,7 @@ impl Index {
         let (selection, ids) = self.selection(journal, range, limits.max_records)?;
         let leases = ids
             .into_iter()
-            .map(|id| journal.pins.protect_prepared_segment(id))
+            .map(|id| journal.run.pins.protect_prepared_segment(id))
             .collect::<Result<Vec<_>, _>>()
             .map_err(DirectoryError::from)?;
         self.outstanding.set(self.outstanding.get() + 1);

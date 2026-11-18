@@ -117,13 +117,9 @@ impl Opened {
     fn moved(&self, source: &Path, destination: &Path) {
         let mut state = lock_unpoisoned(&self.state);
         if let Some(origin) = &mut state.origin
-            && let Ok(rest) = origin.path.strip_prefix(source)
+            && let Some(path) = rebased(&origin.path, source, destination)
         {
-            origin.path = if rest.as_os_str().is_empty() {
-                destination.to_path_buf()
-            } else {
-                destination.join(rest)
-            };
+            origin.path = path;
         }
     }
 
@@ -319,11 +315,20 @@ impl Files {
                     opened.moved(source, destination);
                 }
             }
-            let renamed = match path.strip_prefix(source) {
-                Ok(rest) if !rest.as_os_str().is_empty() => destination.join(rest),
-                _ => destination.to_path_buf(),
-            };
+            let renamed =
+                rebased(&path, source, destination).unwrap_or_else(|| destination.to_path_buf());
             self.paths.entry(renamed).or_default().extend(keys);
         }
     }
+}
+
+/// `path` with its leading `source` replaced by `destination`. `None` for a
+/// path that is neither `source` nor below it.
+fn rebased(path: &Path, source: &Path, destination: &Path) -> Option<PathBuf> {
+    let rest = path.strip_prefix(source).ok()?;
+    Some(if rest.as_os_str().is_empty() {
+        destination.to_path_buf()
+    } else {
+        destination.join(rest)
+    })
 }

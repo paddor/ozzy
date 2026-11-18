@@ -4,6 +4,7 @@ mod cluster;
 mod load;
 
 use clap::{Parser, ValueEnum};
+use ozzy_bench::measure::percentile;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -100,14 +101,6 @@ pub(crate) struct Report {
     pub full: bool,
 }
 
-fn percentile(sorted: &[u32], per_mille: usize) -> u32 {
-    let last = sorted.len().saturating_sub(1);
-    sorted
-        .get((last * per_mille).div_ceil(1000))
-        .copied()
-        .unwrap_or(0)
-}
-
 fn print(options: &Options, mut report: Report) {
     report.micros.sort_unstable();
     let seconds = report.elapsed.as_secs_f64();
@@ -134,12 +127,13 @@ fn print(options: &Options, mut report: Report) {
         report.cpu.as_secs_f64() / seconds,
         if report.full { " log_full=true" } else { "" },
     );
+    let at = |per_mille| percentile(&report.micros, per_mille).unwrap_or(0);
     println!(
         "latency_us p50={} p90={} p99={} p999={} max={}",
-        percentile(&report.micros, 500),
-        percentile(&report.micros, 900),
-        percentile(&report.micros, 990),
-        percentile(&report.micros, 999),
+        at(500),
+        at(900),
+        at(990),
+        at(999),
         report.micros.last().copied().unwrap_or(0),
     );
 }

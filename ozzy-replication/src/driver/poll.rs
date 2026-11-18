@@ -41,7 +41,7 @@ impl ReplicaDriver {
             }
         } else if self.rejoin_wait(now) {
             return Ok(None);
-        } else if now >= self.election_deadline && !self.promise_pending() {
+        } else if now >= self.timers.election_deadline && !self.promise_pending() {
             // A voter still waiting on its own promise has no evidence about
             // the view. With stalled storage it would keep helping a peer's
             // timeout end views the others are installing.
@@ -50,10 +50,10 @@ impl ReplicaDriver {
         if let Some(action) = self.exit_action() {
             return Ok(Some(action));
         }
-        if now >= self.retry_at {
+        if now >= self.timers.retry_at {
             self.start_pending = true;
             self.report_pending = true;
-            self.retry_at = now.saturating_add(self.timing.retransmit);
+            self.timers.retry_at = now.saturating_add(self.timing.retransmit);
         }
         self.poll_election()
     }
@@ -68,11 +68,11 @@ impl ReplicaDriver {
         if !changing.rejoinable() {
             return false;
         }
-        if now < self.election_deadline {
+        if now < self.timers.election_deadline {
             return true;
         }
         changing.decline_rejoin();
-        self.election_deadline = now.saturating_add(self.election_delay);
+        self.timers.election_deadline = now.saturating_add(self.timers.election_delay);
         false
     }
 
@@ -80,7 +80,7 @@ impl ReplicaDriver {
         if let Some(action) = self.exit_echo_action() {
             return Ok(Some(action));
         }
-        if now >= self.election_deadline {
+        if now >= self.timers.election_deadline {
             self.request_exit()?;
         }
         // Suspicion can travel, but publication must settle before a promise.
@@ -95,9 +95,9 @@ impl ReplicaDriver {
     ) -> Result<Option<Action>, DriverError> {
         self.withdraw_exit();
         if snapshot.accepted == snapshot.committed && snapshot.ready_for_appends {
-            self.progress_deadline = now.saturating_add(self.timing.primary_timeout);
+            self.timers.progress_deadline = now.saturating_add(self.timing.primary_timeout);
         }
-        if VoterIndex::primary(snapshot.scope.view) != self.local {
+        if !self.leads(snapshot.scope.view) {
             return Ok(None);
         }
         if self.commit_pending {
@@ -107,10 +107,10 @@ impl ReplicaDriver {
         if let Some(action) = self.activation_action()? {
             return Ok(Some(action));
         }
-        if self.resting() || now < self.retry_at {
+        if self.resting() || now < self.timers.retry_at {
             return Ok(None);
         }
-        self.retry_at = now.saturating_add(self.timing.heartbeat);
+        self.timers.retry_at = now.saturating_add(self.timing.heartbeat);
         if let Some(start) = self.require_normal()?.start_view()? {
             self.commit_pending = true;
             return Ok(Some(Action::Broadcast(Control::StartView(start))));

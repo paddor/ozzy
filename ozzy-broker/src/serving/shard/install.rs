@@ -1,22 +1,21 @@
 //! A runtime log's journal, open to serve or to recover, and its actor on
 //! the running shard.
 
-use super::logs::{RuntimeLogs, group, stores};
+use super::logs::RuntimeLogs;
+use super::parts::{log_channel, prepare_serving, recovering_actor, serving_actor};
 use super::{Binding, Bootstrap, State, failure};
-use crate::journals::OpenedRecovery;
-use crate::logs::{LogSetup, registry};
+use crate::journals::{OpenedRecovery, generation, recovery_generations};
+use crate::logs::{LogSetup, group, registry};
 use crate::{JournalConfig, OpenedPartition, PartitionJournal, RecoveryIntent, StartupError};
 use ozzy_config::{LogRecord, LogState};
 use ozzy_io::Local;
 use ozzy_proto::GroupId;
-use ozzy_replication::JournalGeneration;
 use ozzy_runtime::{
     frontend::RuntimeRoute,
     log::{Log, LogPort},
-    replica_actor::{ActorIds, LogLane, PartitionActor},
-    replica_journal::OwnedRecoveryGenerations,
+    replica_actor::{LogLane, PartitionActor},
 };
-use std::{collections::BTreeMap, path::Path, time::Duration};
+use std::time::Duration;
 
 /// The journal of a recorded log.
 pub(super) enum Reopened {
@@ -27,21 +26,13 @@ pub(super) enum Reopened {
     Recovering(Box<OpenedRecovery>),
 }
 
-fn generation() -> JournalGeneration {
-    JournalGeneration(uuid::Uuid::now_v7().as_u128())
-}
-
 /// Open `plan` as a nonvoting copy.
 async fn recover(
     io: &Local,
     plan: PartitionJournal,
     intent: RecoveryIntent,
 ) -> Result<Reopened, StartupError> {
-    let generations = OwnedRecoveryGenerations {
-        attempt: generation(),
-        temporary: generation(),
-    };
-    let opened = Box::pin(plan.recover(io.clone(), generations, intent)).await?;
+    let opened = Box::pin(plan.recover(io.clone(), recovery_generations(), intent)).await?;
     Ok(Reopened::Recovering(Box::new(opened)))
 }
 
@@ -62,7 +53,6 @@ pub(super) async fn replace(
 pub(super) async fn reopen(
     io: &Local,
     setup: &LogSetup,
-    directory: &Path,
     record: &LogRecord,
 ) -> Result<Reopened, StartupError> {
     let plan = setup.journal(record)?;
@@ -73,8 +63,7 @@ pub(super) async fn reopen(
     if !matches!(plan.config, JournalConfig::Replicated(_)) {
         return Err(refused);
     }
-    let (store, _) = stores(directory, record);
-    if !registry::holds_directory(io, &store).await? {
+    if !registry::holds_directory(io, &plan.placement.directory).await? {
         return recover(io, plan, RecoveryIntent::Replace).await;
     }
     // Only a store with the marker of an unfinished recovery resumes.
@@ -105,13 +94,7 @@ impl State {
         let id = group(record);
         let plan = runtime.setup.journal(record)?;
         let route = runtime.setup.route(record)?;
-        let body_bytes = match &plan.config {
-            JournalConfig::Local(config) => config.append_limits.max_body_bytes,
-            JournalConfig::Replicated(config) => config.append_limits.max_body_bytes,
-        };
-        let limits = super::super::config::log_limits(body_bytes);
-        let (log, port) = ozzy_runtime::log::log_channel(plan.incarnation, limits)
-            .ok_or_else(|| failure(format!("invalid log limits for log {id}")))?;
+        let (log, port) = log_channel(&plan)?;
         let fitting = Fitting {
             id,
             plan,
@@ -135,29 +118,13 @@ impl State {
         fitting: Fitting,
         live: (&Binding, Duration),
     ) -> Result<(), StartupError> {
-        let mut started = opened.into_actor(
-            &self.data_memory,
-            &BTreeMap::new(),
-            ActorIds::random(self.config.receipt_handles.clone()),
-            self.config.journal_clock(),
-        )?;
-        started
-            .actor
-            .bind_receive_owner(&self.replica_memory)
-            .map_err(failure)?;
-        started.actor.enable_publication();
-        started.prepare_partition()?;
+        let mut started = serving_actor(opened, &self.memory, &self.config)?;
+        prepare_serving(&mut started, &self.memory)?;
         // Most logs idle: each keeps only what it uses.
-        started.actor.trim();
-        started.buffer.trim();
+        started.actor.shrink();
+        started.buffer.shrink();
         let lane = LogLane::new(&mut started.actor, fitting.port.limits()).map_err(failure)?;
-        let bootstrap = Bootstrap {
-            group: fitting.id,
-            submitter: started.proposal,
-            buffer: Some(started.buffer),
-            pending: None,
-            done: false,
-        };
+        let bootstrap = Bootstrap::new(fitting.id, started.proposal, started.buffer);
         let parts = (started.actor, Some(lane), Some(bootstrap));
         self.publish_log(runtime, parts, fitting, live)
     }
@@ -171,14 +138,9 @@ impl State {
         fitting: Fitting,
         live: (&Binding, Duration),
     ) -> Result<(), StartupError> {
-        let mut actor = opened.into_actor(
-            &self.data_memory,
-            &BTreeMap::new(),
-            ActorIds::random(self.config.receipt_handles.clone()),
-            self.config.journal_clock(),
-        )?;
+        let mut actor = recovering_actor(opened, &self.memory, &self.config)?;
         actor
-            .bind_receive_owner(&self.replica_memory)
+            .bind_receive_owner(&self.memory.replica)
             .map_err(failure)?;
         self.publish_log(runtime, (actor, None, None), fitting, live)
     }
@@ -207,10 +169,7 @@ impl State {
             }
             self.sync_group(id, binding, now)?;
         }
-        runtime.table.set(id, LogState::Ready, Some(fitting.log));
-        if let Some(known) = runtime.records.get_mut(&id) {
-            known.state = LogState::Ready;
-        }
+        runtime.mark(id, LogState::Ready, Some(fitting.log));
         Ok(())
     }
 
@@ -227,8 +186,8 @@ impl State {
             }
         }
         self.recoveries.remove(&id);
-        self.sessions.retain(|(group, _), _| *group != id);
-        self.unsynced = self.unsynced.min(self.identities.len());
+        self.synced.sessions.retain(|(group, _), _| *group != id);
+        self.synced.unsynced = self.synced.unsynced.min(self.identities.len());
         Ok(actor)
     }
 }

@@ -2,23 +2,11 @@
 //! its copies come back nonvoting, take the log of the other two, and only
 //! then vote again.
 
-use super::log::{append, appends_and_reads, leader, read_all};
-use super::runtime_logs::{cluster, copy, handles, spec};
+use super::log::{append, leader, read_all};
+use super::runtime_logs::{cluster, copy, handles, led_log};
 use super::*;
-use ozzy_broker::LogSpec;
 use ozzy_broker::log::{Log, LogRole};
 use ozzy_proto::GroupId;
-
-/// A replicated log on every broker with three records, led by `members[0]`.
-async fn led_log(cluster: &broker::Cluster, members: [usize; 3]) -> (LogSpec, u64, u64) {
-    let stream = spec(1, &members.map(|index| cluster.node(index)));
-    for broker in &cluster.brokers {
-        assert_eq!(broker.create_log(stream.clone()).await, Ok(()));
-    }
-    let (index, view, end) = appends_and_reads(&handles(cluster, stream.id)).await;
-    assert_eq!(index, members[0], "the first member leads the first view");
-    (stream, view, end)
-}
 
 /// Wait until the copy behind `log` votes again, as a leader or as a
 /// follower. A copy that recovered asks for the next view, so it may lead
@@ -52,7 +40,7 @@ async fn elects_with(cluster: &broker::Cluster, id: GroupId, view: u64, end: u64
 async fn a_copy_that_lost_its_store_takes_the_log_of_the_other_two() {
     tokio::time::timeout(Duration::from_secs(60), async {
         let mut cluster = cluster(DeploymentMode::Three, 4).await;
-        let (stream, view, end) = led_log(&cluster, [1, 2, 0]).await;
+        let (stream, view, end) = led_log(&cluster, 1, [1, 2, 0]).await;
         let store = cluster.log_store(2, stream.id);
         cluster.restart_without(2, &store).await;
         votes(&copy(&cluster, 2, stream.id).await).await;
@@ -70,7 +58,7 @@ async fn a_copy_that_lost_its_store_takes_the_log_of_the_other_two() {
 async fn a_restart_in_the_middle_of_a_recovery_resumes_it() {
     tokio::time::timeout(Duration::from_secs(60), async {
         let mut cluster = cluster(DeploymentMode::Three, 4).await;
-        let (stream, view, end) = led_log(&cluster, [1, 2, 0]).await;
+        let (stream, view, end) = led_log(&cluster, 1, [1, 2, 0]).await;
         // Alone, the copy cannot finish.
         cluster.isolate(2, true);
         let store = cluster.log_store(2, stream.id);
@@ -80,10 +68,9 @@ async fn a_restart_in_the_middle_of_a_recovery_resumes_it() {
         assert_ne!(recovering.status().borrow().role, LogRole::Leader);
         let image = cluster.stop(2).await;
         assert!(
-            image
-                .bytes(&store.join("CONFIGURATION"), true)
-                .unwrap()
-                .starts_with(b"OZYRECOV"),
+            ozzy_journal_segment::is_recovery_marker(
+                image.bytes(&store.join("CONFIGURATION"), true).unwrap()
+            ),
             "the copy left no marker of its recovery"
         );
         cluster.isolate(2, false);
@@ -103,7 +90,7 @@ async fn a_restart_in_the_middle_of_a_recovery_resumes_it() {
 async fn a_replaced_broker_takes_its_logs_from_the_other_two() {
     tokio::time::timeout(Duration::from_secs(60), async {
         let mut cluster = cluster(DeploymentMode::Three, 4).await;
-        let (stream, view, end) = led_log(&cluster, [2, 1, 0]).await;
+        let (stream, view, end) = led_log(&cluster, 1, [2, 1, 0]).await;
         cluster.replace(1).await;
         assert_eq!(cluster.brokers[1].create_log(stream.clone()).await, Ok(()));
         votes(&copy(&cluster, 1, stream.id).await).await;
@@ -125,7 +112,7 @@ async fn a_replaced_broker_takes_its_logs_from_the_other_two() {
 async fn a_replaced_broker_cannot_help_elect_a_leader_that_lacks_a_record() {
     tokio::time::timeout(Duration::from_secs(90), async {
         let mut cluster = cluster(DeploymentMode::Three, 4).await;
-        let (stream, view, end) = led_log(&cluster, [2, 1, 0]).await;
+        let (stream, view, end) = led_log(&cluster, 1, [2, 1, 0]).await;
         cluster.isolate(0, true);
         let leading = cluster.brokers[2].runtime_log(stream.id).unwrap();
         let committed = append(&leading, view, end, &[7]).await.unwrap().end.get();
@@ -149,12 +136,7 @@ async fn a_replaced_broker_cannot_help_elect_a_leader_that_lacks_a_record() {
         // From here on the broker makes voting copies again.
         cluster.brokers[1].end_replacement().unwrap();
         assert!(!cluster.brokers[1].replacing());
-        let later = spec(2, &[cluster.node(1), cluster.node(2), cluster.node(0)]);
-        for broker in &cluster.brokers {
-            assert_eq!(broker.create_log(later.clone()).await, Ok(()));
-        }
-        let (index, _, _) = appends_and_reads(&handles(&cluster, later.id)).await;
-        assert_eq!(index, 1, "the first member leads the first view");
+        led_log(&cluster, 2, [1, 2, 0]).await;
 
         cluster.stop(2).await;
         elects_with(&cluster, stream.id, view, committed).await;

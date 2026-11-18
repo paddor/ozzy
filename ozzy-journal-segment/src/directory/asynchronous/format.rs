@@ -74,13 +74,7 @@ impl Journal {
             evidence,
             checkpoint: None,
             limits,
-            interrupted: false,
-            cleaning: std::rc::Rc::default(),
-            discard: false,
-            pins: std::rc::Rc::default(),
-            validated_indexes: std::rc::Rc::default(),
-            pack_layouts: std::cell::RefCell::default(),
-            active_prefix: None,
+            run: super::RunState::default(),
         })
     }
 }

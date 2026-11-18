@@ -117,8 +117,8 @@ pub struct ProposalBuffer(pub(crate) AppendBuffer);
 
 impl ProposalBuffer {
     /// Give the unused descriptor capacity back. It grows again with use.
-    pub fn trim(&mut self) {
-        self.0.trim();
+    pub fn shrink(&mut self) {
+        self.0.shrink();
     }
 
     /// Bind an empty startup arena to a shard-owned bounded memory pool.

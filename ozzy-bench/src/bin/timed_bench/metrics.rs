@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use ozzy_bench::measure::cpu;
 use serde_json::{Value, json};
 
 #[derive(Debug)]
@@ -114,12 +115,6 @@ impl Drop for Meter {
             allocation::disable();
         }
     }
-}
-
-fn cpu() -> Duration {
-    // Process CPU time never reads negative, and nanoseconds stay below 1e9.
-    let value = rustix::time::clock_gettime(rustix::time::ClockId::ProcessCPUTime);
-    Duration::new(value.tv_sec as u64, value.tv_nsec as u32)
 }
 
 #[cfg(feature = "allocation-counting")]

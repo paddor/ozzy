@@ -31,9 +31,7 @@ fn initialized(controller: &mut Controller, io: Local) -> (OwnedJournal, Driver)
     initialize(controller, &mut journal, &mut driver);
     let mut buffer = journal.lease_proposal_buffer().unwrap();
     buffer.prepare_append(request(12, 0, 3)).unwrap();
-    let receipt = admit(controller, &mut journal, &mut driver, buffer);
-    write(controller, &mut journal, &mut driver, receipt);
-    sync_apply(controller, &mut journal, &mut driver);
+    commit(controller, &mut journal, &mut driver, buffer);
     let current = assignment();
     let body = OperationBody::Assign(Assign {
         consumer_group_id: current.group,
@@ -52,9 +50,7 @@ fn initialized(controller: &mut Controller, io: Local) -> (OwnedJournal, Driver)
             &encode_operation_body(&body, journal.limits.operations).unwrap(),
         )
         .unwrap();
-    let receipt = admit(controller, &mut journal, &mut driver, buffer);
-    write(controller, &mut journal, &mut driver, receipt);
-    sync_apply(controller, &mut journal, &mut driver);
+    commit(controller, &mut journal, &mut driver, buffer);
     (journal, driver)
 }
 
@@ -198,9 +194,7 @@ fn cumulative_group_progress_resumes_from_selected_checkpoint_after_restart() {
     let (mut controller, io) = setup();
     let (mut journal, mut driver) = initialized(&mut controller, io.clone());
     let buffer = request_progress(&journal, &driver, Some(3), 75);
-    let receipt = admit(&mut controller, &mut journal, &mut driver, buffer);
-    write(&mut controller, &mut journal, &mut driver, receipt);
-    sync_apply(&mut controller, &mut journal, &mut driver);
+    commit(&mut controller, &mut journal, &mut driver, buffer);
     let confirmed = driver.snapshot().accepted;
     drive(
         &mut controller,
@@ -254,9 +248,7 @@ fn group_progress_query_reports_expired_history_without_resetting_its_cursor() {
     let (mut controller, io) = setup();
     let (mut journal, mut driver) = initialized(&mut controller, io);
     let buffer = request_progress(&journal, &driver, Some(1), 78);
-    let receipt = admit(&mut controller, &mut journal, &mut driver, buffer);
-    write(&mut controller, &mut journal, &mut driver, receipt);
-    sync_apply(&mut controller, &mut journal, &mut driver);
+    commit(&mut controller, &mut journal, &mut driver, buffer);
     let buffer = journal
         .retention_proposal(
             partition(),
@@ -266,9 +258,7 @@ fn group_progress_query_reports_expired_history_without_resetting_its_cursor() {
         )
         .unwrap()
         .unwrap();
-    let receipt = admit(&mut controller, &mut journal, &mut driver, buffer);
-    write(&mut controller, &mut journal, &mut driver, receipt);
-    sync_apply(&mut controller, &mut journal, &mut driver);
+    commit(&mut controller, &mut journal, &mut driver, buffer);
     let before = driver.snapshot().accepted;
     let buffer = request_progress(&journal, &driver, None, 80);
     let result = drive(
@@ -295,9 +285,7 @@ fn covered_group_progress_still_requires_current_authority_and_policy() {
     let (mut controller, io) = setup();
     let (mut journal, mut driver) = initialized(&mut controller, io);
     let buffer = request_progress(&journal, &driver, Some(2), 81);
-    let receipt = admit(&mut controller, &mut journal, &mut driver, buffer);
-    write(&mut controller, &mut journal, &mut driver, receipt);
-    sync_apply(&mut controller, &mut journal, &mut driver);
+    commit(&mut controller, &mut journal, &mut driver, buffer);
     let before = driver.snapshot().accepted;
     for policy in [Policy::LocalDurable, Policy::QuorumDurable] {
         let mut request = progress_request(&driver, Some(1), 82);

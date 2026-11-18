@@ -25,10 +25,7 @@ impl ReplicaDriver {
             return Err(ReplicationError::WrongRole.into());
         };
         let snapshot = normal.snapshot();
-        if !snapshot.ready_for_appends
-            || VoterIndex::primary(snapshot.scope.view) != self.local
-            || target == self.local
-        {
+        if !snapshot.ready_for_appends || !self.leads(snapshot.scope.view) || target == self.local {
             return Err(ReplicationError::WrongRole.into());
         }
         if snapshot.accepted != snapshot.committed {

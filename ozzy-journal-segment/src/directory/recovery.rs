@@ -70,13 +70,19 @@ pub fn recovery_unfinished(root: &std::path::Path) -> io::Result<bool> {
             bytes => read += bytes,
         }
     }
-    Ok(&head == MAGIC)
+    Ok(is_recovery_marker(&head))
+}
+
+/// Whether `configuration`, the bytes of a store's `CONFIGURATION` file or
+/// their head, hold the marker of an unfinished nonvoting recovery.
+pub fn is_recovery_marker(configuration: &[u8]) -> bool {
+    configuration.starts_with(MAGIC)
 }
 
 pub(crate) fn recovery_marker(configuration: &[u8]) -> Result<[u8; MARKER_BYTES], DirectoryError> {
     validate_configuration_length(configuration.len())?;
     // Reserve this namespace so a marker cannot itself be the intended config.
-    if configuration.starts_with(MAGIC) {
+    if is_recovery_marker(configuration) {
         return Err(DirectoryError::ConfigurationMismatch);
     }
     let mut marker = [0; MARKER_BYTES];

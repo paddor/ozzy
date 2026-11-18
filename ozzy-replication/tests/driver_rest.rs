@@ -9,47 +9,18 @@
 
 use std::time::Duration;
 
-use ozzy_proto::{GroupId, NodeId};
-use ozzy_replication::driver::{Action, ReplicaDriver, Timing};
+use ozzy_proto::NodeId;
+use ozzy_replication::driver::{Action, ReplicaDriver};
 use ozzy_replication::wire::Control;
-use ozzy_replication::{
-    BeatSource, Configuration, Digest, JournalGeneration, NormalReplica, PipelineLimits, Scope,
-    StartViewChange,
-};
+use ozzy_replication::{BeatSource, Scope, StartViewChange};
 
-fn node(index: u8) -> NodeId {
-    NodeId::from_bytes([index + 1; 16])
-}
+#[path = "support/driver_fixture.rs"]
+mod fixture;
+use fixture::{configuration, node};
 
-fn configuration() -> Configuration {
-    Configuration::new(
-        GroupId::from_bytes([7; 16]),
-        1,
-        Digest::from_bytes([8; 32]),
-        [node(0), node(1), node(2)],
-    )
-    .unwrap()
-}
-
+/// Voter `index` in its first view.
 fn driver(index: u8) -> ReplicaDriver {
-    let normal = NormalReplica::bootstrap(
-        configuration(),
-        node(index),
-        JournalGeneration(u128::from(index) + 1),
-        PipelineLimits {
-            max_operations: 8,
-            max_body_bytes: 1024,
-        },
-    )
-    .unwrap();
-    let timing = Timing {
-        heartbeat: Duration::from_millis(10),
-        primary_timeout: Duration::from_millis(100),
-        retransmit: Duration::from_millis(10),
-        election_timeout: Duration::from_millis(200),
-        max_election_timeout: Duration::from_secs(2),
-    };
-    ReplicaDriver::from_normal(normal, Duration::ZERO, timing).unwrap()
+    fixture::driver(fixture::normal(index))
 }
 
 const SOURCE: BeatSource = BeatSource { shard: 3, epoch: 9 };

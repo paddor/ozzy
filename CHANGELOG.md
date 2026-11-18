@@ -146,6 +146,13 @@
   beat state, and `PartitionActors::with_beats` turns it on for a shard.
   Telemetry counts `replica_rest`, `replica_rest_end`, and
   `shard_epoch_change`.
+- `ozzy_proto::beat::ShardEpoch` has `to_bytes` and `from_bytes`, and
+  `ozzy_replication::BeatSource` is that type under its old name.
+  `ozzy_journal_segment::is_recovery_marker` tells the marker of an
+  unfinished recovery from a group configuration.
+- `ozzy_config::LOG_DIRECTORY` and `ozzy_config::log_label` name where a
+  runtime log lives on a device, and `LogRecord::with_state` copies a
+  record into another state.
 
 ### Changed
 
@@ -166,10 +173,11 @@
   With these, the CPU time of idle replicated logs no longer grows with
   their count.
 - A runtime log reserves its pipeline at first use, not at start. The
-  broker trims each log actor it installs (`ReplicaActor::trim`,
-  `ScheduledReplica::trim`, `PartitionActor::trim`, `ProposalBuffer::trim`,
-  `AppendBuffer::trim`, and `trim` on the `ozzy_replication` driver, normal
-  replica, flow transmitter and receiver): queues, ledgers and arena
+  broker shrinks each log actor it installs (`ReplicaActor::shrink`,
+  `ScheduledReplica::shrink`, `PartitionActor::shrink`,
+  `ProposalBuffer::shrink`, `AppendBuffer::shrink`, and `shrink` on the
+  `ozzy_replication` driver, normal replica, flow transmitter and
+  receiver): queues, ledgers and arena
   descriptors sized for a full pipeline are given back and grow again
   with use, so the first writes to a log allocate. Topics still reserve
   at start. A log reserves its read descriptors at its first read.

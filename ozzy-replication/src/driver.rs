@@ -17,6 +17,7 @@ mod receive;
 mod rest;
 mod step_down;
 mod storage;
+mod timers;
 mod validation;
 
 pub use installation::{ActivationTicket, CleanStop};
@@ -113,16 +114,7 @@ pub struct ReplicaDriver {
     local: VoterIndex,
     timing: Timing,
     now: Duration,
-    contact_deadline: Duration,
-    /// When a backup of this view last acknowledged, or when the role began.
-    backup_heard_at: Duration,
-    progress_deadline: Duration,
-    persistence_deadline: Duration,
-    /// When busy local storage last completed work; `None` while idle.
-    storage_busy_since: Option<Duration>,
-    election_deadline: Duration,
-    election_delay: Duration,
-    retry_at: Duration,
+    timers: timers::Timers,
     start_pending: bool,
     report_pending: bool,
     commit_pending: bool,
@@ -155,9 +147,9 @@ pub struct ReplicaDriver {
 impl ReplicaDriver {
     /// Give a normal replica's unused reserved capacity back. It grows again
     /// with use. For a replica that expects to stay idle.
-    pub fn trim(&mut self) {
+    pub fn shrink(&mut self) {
         if let Role::Normal(replica) = &mut self.role {
-            replica.trim();
+            replica.shrink();
         }
     }
 
@@ -201,30 +193,23 @@ impl ReplicaDriver {
         let changing = matches!(role, Role::ViewChanging(_));
         let activating =
             matches!(&role, Role::Normal(normal) if !normal.snapshot().ready_for_appends);
+        let progress = if activating {
+            timing.election_timeout
+        } else {
+            timing.primary_timeout
+        };
+        let retry = if changing {
+            timing.retransmit
+        } else {
+            timing.heartbeat
+        };
         Ok(Self {
             role,
             configuration,
             local,
             timing,
             now,
-            contact_deadline: now.saturating_add(timing.primary_timeout),
-            backup_heard_at: now,
-            persistence_deadline: now.saturating_add(timing.primary_timeout),
-            storage_busy_since: None,
-            progress_deadline: now
-                + if activating {
-                    timing.election_timeout
-                } else {
-                    timing.primary_timeout
-                },
-            election_deadline: now.saturating_add(timing.election_timeout),
-            election_delay: timing.election_timeout,
-            retry_at: now
-                + if changing {
-                    timing.retransmit
-                } else {
-                    timing.heartbeat
-                },
+            timers: timers::Timers::new(now, timing, progress, retry),
             start_pending: changing,
             report_pending: changing,
             commit_pending: false,
@@ -246,13 +231,8 @@ impl ReplicaDriver {
     /// nothing: no peer was heard or asked yet.
     pub fn begin_timing(&mut self, now: Duration) -> Result<(), DriverError> {
         self.observe_time(now)?;
-        let timing = self.timing;
-        self.contact_deadline = now.saturating_add(timing.primary_timeout);
-        self.backup_heard_at = now;
-        self.persistence_deadline = now.saturating_add(timing.primary_timeout);
-        self.progress_deadline = now.saturating_add(self.progress_timeout());
-        self.election_deadline = now.saturating_add(self.election_delay);
-        self.retry_at = self.retry_at.max(now);
+        self.restart_timeouts(now);
+        self.timers.retry_at = self.timers.retry_at.max(now);
         Ok(())
     }
 
@@ -360,6 +340,17 @@ impl ReplicaDriver {
         Ok(())
     }
 
+    /// Whether the local voter is the primary of `view`.
+    fn leads(&self, view: u64) -> bool {
+        VoterIndex::primary(view) == self.local
+    }
+
+    /// Restart every timeout of the current role at `now`.
+    fn restart_timeouts(&mut self, now: Duration) {
+        let progress = self.progress_timeout();
+        self.timers.restart(now, self.timing, progress);
+    }
+
     fn progress_timeout(&self) -> Duration {
         if self
             .normal()
@@ -367,7 +358,7 @@ impl ReplicaDriver {
         {
             self.timing.primary_timeout
         } else {
-            self.election_delay
+            self.timers.election_delay
         }
     }
 
@@ -378,22 +369,22 @@ impl ReplicaDriver {
         now: Duration,
     ) {
         if current.committed != previous.committed {
-            self.progress_deadline = now.saturating_add(self.progress_timeout());
+            self.timers.progress_deadline = now.saturating_add(self.progress_timeout());
         }
         if current.journal.durable > previous.journal.durable {
-            self.persistence_deadline = now.saturating_add(self.timing.primary_timeout);
+            self.timers.persistence_deadline = now.saturating_add(self.timing.primary_timeout);
         }
     }
 
     fn normal_timed_out(&self, snapshot: &ReplicaSnapshot) -> bool {
-        let primary = VoterIndex::primary(snapshot.scope.view) == self.local;
+        let primary = self.leads(snapshot.scope.view);
         let outstanding = snapshot.accepted != snapshot.committed || !snapshot.ready_for_appends;
         (!primary
             && !self.primary_covered(VoterIndex::primary(snapshot.scope.view))
-            && self.now >= self.contact_deadline)
-            || (outstanding && self.now >= self.progress_deadline)
+            && self.now >= self.timers.contact_deadline)
+            || (outstanding && self.now >= self.timers.progress_deadline)
             || (snapshot.accepted.op > snapshot.journal.durable
-                && self.now >= self.persistence_deadline)
+                && self.now >= self.timers.persistence_deadline)
             || self.storage_timed_out()
     }
 
@@ -428,8 +419,8 @@ impl ReplicaDriver {
         // view it would ask others to leave.
         self.fence_answers = VoterSet::EMPTY;
         self.stale_answers = VoterSet::EMPTY;
-        self.election_deadline = self.now.saturating_add(self.election_delay);
-        self.retry_at = self.now.saturating_add(self.timing.retransmit);
+        self.timers.election_deadline = self.now.saturating_add(self.timers.election_delay);
+        self.timers.retry_at = self.now.saturating_add(self.timing.retransmit);
         self.start_pending = true;
         self.report_pending = true;
         self.commit_pending = false;

@@ -134,9 +134,9 @@ impl Journal {
         self.healthy()?;
         let (reference, source) = self.index_source(segment)?;
         let scope = self.group_scope(reference)?;
-        self.interrupted = true;
+        self.run.interrupted = true;
         let index = Box::pin(build(scope, self.index_builder(), source, limits, repair)).await?;
-        self.interrupted = false;
+        self.run.interrupted = false;
         Ok(index)
     }
 
@@ -167,16 +167,16 @@ impl Journal {
                 &pair[0],
                 &pair[1],
             )?;
-            if self.validated_indexes.holds(source) {
+            if self.run.validated_indexes.holds(source) {
                 continue;
             }
-            self.validated_indexes.running.set(Some(source));
+            self.run.validated_indexes.running.set(Some(source));
             return Ok(Some(IndexJob {
                 scope: self.group_scope(pair[0])?,
                 builder: self.index_builder(),
                 source,
                 limits,
-                running: RunningBuild(self.validated_indexes.clone()),
+                running: RunningBuild(self.run.validated_indexes.clone()),
             }));
         }
         Ok(None)

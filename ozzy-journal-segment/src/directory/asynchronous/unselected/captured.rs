@@ -19,10 +19,10 @@ impl Journal {
     /// publication in flight, every later publication is newer than it.
     pub fn capture_unselected(&self) -> Result<UnselectedFiles, DirectoryError> {
         self.healthy()?;
-        if self.cleaning.replace(true) {
+        if self.run.cleaning.replace(true) {
             return Err(DirectoryError::CleanupBusy);
         }
-        let slot = CleanupSlot(self.cleaning.clone());
+        let slot = CleanupSlot(self.run.cleaning.clone());
         let active = self
             .manifest
             .segments
@@ -32,11 +32,11 @@ impl Journal {
             access: self.access.clone(),
             root: self.root().to_path_buf(),
             limits: self.limits,
-            pins: self.pins.clone(),
+            pins: self.run.pins.clone(),
             manifest: self.manifest.clone(),
             current: self.current,
             active,
-            discard: self.discard,
+            discard: self.run.discard,
             source: None,
             _slot: slot,
         })
@@ -46,7 +46,7 @@ impl Journal {
     pub(in crate::directory::asynchronous) fn require_no_cleanup(
         &self,
     ) -> Result<(), DirectoryError> {
-        if self.cleaning.get() {
+        if self.run.cleaning.get() {
             return Err(DirectoryError::CleanupBusy);
         }
         Ok(())

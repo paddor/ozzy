@@ -289,7 +289,7 @@ impl ReplicaActor {
         }
         if self.pinned.is_none()
             && self.application_ready()
-            && self.configuration.primary(self.driver.scope().view) == self.local
+            && self.primary() == self.local
             && request.source.voter == self.local
             && request.scope == self.driver.scope()
             && self.pending.is_none()

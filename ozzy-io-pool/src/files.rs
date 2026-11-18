@@ -81,13 +81,16 @@ impl Files {
     }
 
     fn key(&self, handle: &Handle) -> io::Result<u64> {
-        self.owner.key(handle).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "handle belongs to another backend",
-            )
-        })
+        self.owner.key(handle).ok_or_else(foreign_handle)
     }
+}
+
+/// The error for a handle another backend issued.
+fn foreign_handle() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "handle belongs to another backend",
+    )
 }
 
 /// The descriptor of an open handle, and whether it does direct I/O. A
@@ -95,10 +98,7 @@ impl Files {
 fn get(shared: &Shared, handle: &Handle) -> io::Result<(Arc<OwnedFile>, bool)> {
     let owner = &shared.handles;
     if owner.key(handle).is_none() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "handle belongs to another backend",
-        ));
+        return Err(foreign_handle());
     }
     let opened = owner
         .resource::<Opened>(handle)

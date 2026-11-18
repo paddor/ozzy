@@ -2,7 +2,8 @@
 //! between their brokers. They speak again for work, fail over when the
 //! leader's broker falls silent, and agree again after a view change.
 
-use super::log::{append, appends_and_reads, leader};
+use super::log::{append, appends_and_reads, keep_orders, leader, order_cluster, order_logs};
+use super::runtime_logs::{class, spec};
 use super::*;
 use ozzy_broker::log::{Log, LogRole};
 use ozzy_runtime::profiling::{Event, totals};
@@ -19,20 +20,41 @@ fn held() -> u64 {
     count(Event::ReplicaRest) - count(Event::ReplicaRestEnd)
 }
 
-async fn until_resting() {
-    while held() != ALL {
+async fn until_held(all: u64) {
+    while held() != all {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
+async fn until_resting() {
+    until_held(ALL).await;
+}
+
+/// Wait until `all` agreements stand and none starts or ends, and no voter
+/// leaves a view, for a second and a half. Returns the agreements that
+/// ended and the epoch changes so far.
+async fn quiet(all: u64) -> (u64, u64) {
+    let counts = || {
+        let ended = count(Event::ReplicaRestEnd);
+        (
+            count(Event::ReplicaRest),
+            ended,
+            count(Event::ShardEpochChange),
+        )
+    };
+    loop {
+        until_held(all).await;
+        let before = counts();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        if counts() == before {
+            break (before.1, before.2);
+        }
+    }
+}
+
 async fn cluster() -> (broker::Cluster, Vec<Log>) {
-    let cluster = broker::Cluster::configured(DeploymentMode::Three, None, |config| {
-        config.topics.get_mut("orders").unwrap().retention = ozzy_config::TopicRetention::default();
-    })
-    .await;
-    let logs = (cluster.brokers.iter())
-        .map(|broker| broker.log("orders", 0).unwrap())
-        .collect();
+    let cluster = order_cluster(DeploymentMode::Three).await;
+    let logs = order_logs(&cluster);
     (cluster, logs)
 }
 
@@ -43,22 +65,7 @@ async fn idle_partitions_rest_until_an_append_makes_them_speak() {
         let (index, view, end) = appends_and_reads(&logs).await;
         // Startup work, such as a late bootstrap record, can still end a
         // rest. After that nothing does while nothing happens.
-        let counts = || {
-            let ended = count(Event::ReplicaRestEnd);
-            (
-                count(Event::ReplicaRest),
-                ended,
-                count(Event::ShardEpochChange),
-            )
-        };
-        let (_, ended, epochs) = loop {
-            until_resting().await;
-            let before = counts();
-            tokio::time::sleep(Duration::from_millis(1500)).await;
-            if counts() == before {
-                break before;
-            }
-        };
+        let (ended, epochs) = quiet(ALL).await;
         assert_eq!(logs[index].status().borrow().role, LogRole::Leader);
         // The leader and both followers of the partition speak again.
         let appended = append(&logs[index], view, end, &[7]).await.unwrap();
@@ -138,30 +145,19 @@ async fn a_step_down_changes_the_epoch_and_every_partition_rests_again() {
 /// logs of the other parts stay at rest.
 #[tokio::test(flavor = "current_thread")]
 async fn a_step_down_ends_the_rest_of_its_part_of_the_shard_only() {
-    use ozzy_broker::LogSpec;
-    use ozzy_proto::{GroupId, PartitionIncarnation};
+    use ozzy_proto::GroupId;
     use ozzy_runtime::frontend::Beats;
     const LOGS: u8 = 24;
     tokio::time::timeout(Duration::from_secs(120), async {
         let cluster = broker::Cluster::configured(DeploymentMode::Three, None, |config| {
-            config.topics.get_mut("orders").unwrap().retention =
-                ozzy_config::TopicRetention::default();
-            config.logs = Some(ozzy_config::LogClass {
-                segment_bytes: 4 * 1024 * 1024,
-                max_append_bytes: 1024 * 1024,
-                max_logs: usize::from(LOGS),
-            });
+            keep_orders(config);
+            config.logs = Some(class(usize::from(LOGS)));
         })
         .await;
         let nodes = [cluster.node(0), cluster.node(1), cluster.node(2)];
         let id = |index: u8| GroupId::from_bytes([index; 16]);
         for index in 1..=LOGS {
-            let spec = LogSpec {
-                id: id(index),
-                incarnation: PartitionIncarnation::from_bytes([index + 100; 16]),
-                members: nodes.to_vec(),
-                segment_bytes: None,
-            };
+            let spec = spec(index, &nodes);
             for broker in &cluster.brokers {
                 broker.create_log(spec.clone()).await.unwrap();
             }
@@ -180,20 +176,7 @@ async fn a_step_down_ends_the_rest_of_its_part_of_the_shard_only() {
         let (index, status) = leader(&logs, None).await;
         // Every partition and every log holds four agreements.
         let all = ALL + 4 * u64::from(LOGS);
-        let rested = || async {
-            loop {
-                while held() != all {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-                let before = count(Event::ReplicaRestEnd);
-                tokio::time::sleep(Duration::from_millis(1500)).await;
-                if count(Event::ReplicaRestEnd) == before && held() == all {
-                    break before;
-                }
-            }
-        };
-        let ended = rested().await;
-        let epochs = count(Event::ShardEpochChange);
+        let (ended, epochs) = quiet(all).await;
         let target = (index + 1) % 3;
         logs[index]
             .step_down(status.view, cluster.node(target))
@@ -205,7 +188,7 @@ async fn a_step_down_ends_the_rest_of_its_part_of_the_shard_only() {
         while count(Event::ShardEpochChange) == epochs {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let ended = rested().await - ended;
+        let ended = quiet(all).await.0 - ended;
         // The logs that share the part may speak again, and so may the
         // four partitions. The other logs must not, and they are most.
         assert!(sharing <= 4, "{sharing} logs share the part");

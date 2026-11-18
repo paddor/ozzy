@@ -14,10 +14,7 @@ use super::{Class, Kind, NodeId, ReceiveError, Service, routed};
 use crate::signal::StateSignal;
 use arc_swap::ArcSwapOption;
 use bytes::Bytes;
-use ozzy_proto::{
-    Envelope, EnvelopeLimits, GroupId, LinkSessionId, Opcode,
-    beat::{self, ShardEpoch},
-};
+use ozzy_proto::{Envelope, EnvelopeLimits, GroupId, LinkSessionId, Opcode, beat};
 use ozzy_replication::BeatSource;
 use std::{
     sync::{
@@ -62,7 +59,7 @@ struct Peer {
 struct Said {
     session: LinkSessionId,
     /// By source number.
-    sources: Vec<ShardEpoch>,
+    sources: Vec<BeatSource>,
 }
 
 struct Shared {
@@ -152,6 +149,11 @@ impl Beats {
         }))
     }
 
+    /// The time on the beats' clock.
+    fn now(&self) -> Duration {
+        (self.0.clock)()
+    }
+
     /// The timing these beats run on.
     pub fn timing(&self) -> BeatTiming {
         self.0.timing
@@ -171,9 +173,7 @@ impl Beats {
         if let Some(local) = self.local(shard) {
             // Only this shard's thread writes, and readers need no order
             // with other state.
-            local
-                .turned
-                .store(stamp((self.0.clock)()), Ordering::Relaxed);
+            local.turned.store(stamp(self.now()), Ordering::Relaxed);
         }
     }
 
@@ -213,7 +213,7 @@ impl Beats {
         };
         // Published by the dispatcher after `said`; a stale reading only
         // delays or hastens the answer by one beat.
-        let heard = age(state.heard.load(Ordering::Acquire), (self.0.clock)());
+        let heard = age(state.heard.load(Ordering::Acquire), self.now());
         heard.is_some_and(|heard| heard < self.0.timing.timeout)
             && state.said.load().as_deref().is_some_and(|said| {
                 let named = (said.sources).binary_search_by_key(&source.shard, |named| named.shard);
@@ -225,7 +225,7 @@ impl Beats {
     /// How long ago `peer`'s last beat arrived. `None` before the first.
     pub fn heard(&self, peer: NodeId) -> Option<Duration> {
         let state = self.peer(peer)?;
-        age(state.heard.load(Ordering::Acquire), (self.0.clock)())
+        age(state.heard.load(Ordering::Acquire), self.now())
     }
 
     /// Capture before reading, then wait with [`Self::changed_after`].
@@ -244,21 +244,19 @@ impl Beats {
         &self,
         peer: NodeId,
         session: LinkSessionId,
-        shards: impl IntoIterator<Item = ShardEpoch>,
+        sources: impl IntoIterator<Item = BeatSource>,
     ) {
         let Some(state) = self.peer(peer) else {
             return;
         };
-        let mut sources: Vec<ShardEpoch> = shards.into_iter().collect();
+        let mut sources: Vec<BeatSource> = sources.into_iter().collect();
         sources.sort_unstable_by_key(|named| named.shard);
         let said = Said { session, sources };
         let changed = state.said.load().as_deref() != Some(&said);
         if changed {
             state.said.store(Some(Arc::new(said)));
         }
-        state
-            .heard
-            .store(stamp((self.0.clock)()), Ordering::Release);
+        state.heard.store(stamp(self.now()), Ordering::Release);
         state.silent.store(false, Ordering::Relaxed);
         if changed {
             self.0.changed.notify_changed();
@@ -268,7 +266,7 @@ impl Beats {
     /// Tell the shards once about each peer that fell silent, as the
     /// dispatcher does on every tick.
     pub fn age_out(&self) {
-        let now = (self.0.clock)();
+        let now = self.now();
         for state in &self.0.peers {
             let stale = age(state.heard.load(Ordering::Acquire), now)
                 .is_some_and(|heard| heard >= self.0.timing.timeout);
@@ -281,8 +279,8 @@ impl Beats {
 
     /// The sources a beat names now: every part of the shards that turned
     /// within half the timeout.
-    pub fn report(&self, sources: &mut Vec<ShardEpoch>) {
-        let now = (self.0.clock)();
+    pub fn report(&self, sources: &mut Vec<BeatSource>) {
+        let now = self.now();
         sources.clear();
         let live = self.0.shards.iter().filter(|local| {
             age(local.turned.load(Ordering::Relaxed), now)
@@ -292,7 +290,7 @@ impl Beats {
             for (part, epoch) in (0..Self::PARTS).zip(&local.epochs) {
                 if let Some(shard) = number(local.shard, part) {
                     let epoch = epoch.load(Ordering::Acquire);
-                    sources.push(ShardEpoch { shard, epoch });
+                    sources.push(BeatSource { shard, epoch });
                 }
             }
         }
@@ -304,7 +302,8 @@ impl Beats {
 pub(super) struct BeatSchedule {
     beats: Beats,
     next: Duration,
-    shards: Vec<ShardEpoch>,
+    /// The sources the last beat named.
+    sources: Vec<BeatSource>,
     metadata: Vec<u8>,
 }
 
@@ -315,7 +314,7 @@ impl Service {
         self.beats = Some(BeatSchedule {
             beats,
             next: Duration::ZERO,
-            shards: Vec::new(),
+            sources: Vec::new(),
             metadata: Vec::new(),
         });
     }
@@ -332,11 +331,11 @@ impl Service {
         let Some(mut schedule) = self.beats.take() else {
             return;
         };
-        let now = (schedule.beats.0.clock)();
+        let now = schedule.beats.now();
         if now >= schedule.next {
-            schedule.next = now.saturating_add(schedule.beats.0.timing.interval);
+            schedule.next = now.saturating_add(schedule.beats.timing().interval);
             schedule.beats.age_out();
-            schedule.beats.report(&mut schedule.shards);
+            schedule.beats.report(&mut schedule.sources);
             self.send_beats(&mut schedule);
         }
         self.beats = Some(schedule);
@@ -357,7 +356,7 @@ impl Service {
             };
             let limits = EnvelopeLimits::default();
             if let Ok(header) =
-                beat::encode(envelope, &schedule.shards, limits, &mut schedule.metadata)
+                beat::encode(envelope, &schedule.sources, limits, &mut schedule.metadata)
             {
                 let frames = vec![
                     Bytes::copy_from_slice(&header),
@@ -377,7 +376,7 @@ impl Service {
         packet: ozzy_proto::Packet<'_>,
         limits: EnvelopeLimits,
     ) -> Result<(), ReceiveError> {
-        let shards = beat::decode(packet, limits).map_err(|_| ReceiveError::Peer)?;
+        let sources = beat::decode(packet, limits).map_err(|_| ReceiveError::Peer)?;
         let session = self.links.get(peer).map(|link| link.binding.session);
         let Some(session) = session.filter(|_| kind == Kind::Broker) else {
             return Err(ReceiveError::Peer);
@@ -386,7 +385,7 @@ impl Service {
             return Err(ReceiveError::Peer);
         }
         if let Some(schedule) = &self.beats {
-            schedule.beats.observe(peer, session, shards);
+            schedule.beats.observe(peer, session, sources);
         }
         Ok(())
     }
@@ -425,8 +424,8 @@ mod tests {
         *time.lock().unwrap() += by;
     }
 
-    fn named(shard: u32, epoch: u64) -> ShardEpoch {
-        ShardEpoch { shard, epoch }
+    fn named(shard: u32, epoch: u64) -> BeatSource {
+        BeatSource { shard, epoch }
     }
 
     #[test]

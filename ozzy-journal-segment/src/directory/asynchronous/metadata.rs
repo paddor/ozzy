@@ -56,7 +56,7 @@ impl Journal {
     }
 
     pub(super) async fn install_selected(&mut self, next: Manifest) -> Result<(), DirectoryError> {
-        self.interrupted = true;
+        self.run.interrupted = true;
         super::opening::validate_headers(
             &self.access,
             self.root(),
@@ -75,7 +75,7 @@ impl Journal {
         self.access.retain_read_handles(&next.segments);
         self.manifest = next;
         self.current = current;
-        self.interrupted = false;
+        self.run.interrupted = false;
         Ok(())
     }
 
@@ -122,10 +122,10 @@ impl Journal {
             return Ok(());
         }
         let (record, first) = evidence.next(&self.manifest, accepted)?;
-        self.interrupted = true;
+        self.run.interrupted = true;
         self.directory.overwrite_evidence(first, &record).await?;
         self.evidence = Some(evidence::Copies::new(&[record; 2], &self.manifest)?);
-        self.interrupted = false;
+        self.run.interrupted = false;
         Ok(())
     }
 

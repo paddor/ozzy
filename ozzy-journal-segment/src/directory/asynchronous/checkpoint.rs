@@ -246,13 +246,13 @@ impl Journal {
         state: &[u8],
     ) -> Result<CheckpointFiles, DirectoryError> {
         let plan = self.prepare_checkpoint(id, schema, chunk_bytes, state.len() as u64)?;
-        self.interrupted = true;
+        self.run.interrupted = true;
         let mut writer = plan.start().await?;
         for fragment in state.chunks(writer.fragment_bytes()) {
             writer.push(fragment).await?;
         }
         let checkpoint = writer.finish().await?;
-        self.interrupted = false;
+        self.run.interrupted = false;
         Ok(checkpoint)
     }
 
@@ -310,7 +310,7 @@ impl Journal {
                 self.limits.directory_name_bytes,
             ),
         };
-        let lease = self.pins.acquire_checkpoint_lease(
+        let lease = self.run.pins.acquire_checkpoint_lease(
             id,
             spec.source_manifest_generation,
             self.group_lock()?,
@@ -333,7 +333,7 @@ impl Journal {
         &self,
         checkpoint: Checkpoint,
     ) -> Result<CheckpointFiles, DirectoryError> {
-        let lease = self.pins.acquire_checkpoint_lease(
+        let lease = self.run.pins.acquire_checkpoint_lease(
             checkpoint.manifest.checkpoint_id,
             checkpoint.manifest.source_manifest_generation,
             self.group_lock()?,

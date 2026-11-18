@@ -249,7 +249,7 @@ impl ReplicaActor {
                 None
             })
         };
-        let admitted = if self.configuration.primary(self.driver.scope().view) == self.local {
+        let admitted = if self.primary() == self.local {
             self.driver
                 .select(&mut get)
                 .and_then(|_| self.driver.begin_primary_install(generation))
